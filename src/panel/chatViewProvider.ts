@@ -284,6 +284,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.restoreLastOrActive();
           this.postActiveFile();
+          this.prewarm();
+          break;
+        case "warm":
+          this.prewarm();
           break;
         case "send":
           await this.handleSend(m.text, m.context, m.images, m.files);
@@ -622,6 +626,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // -- Process management --------------------------------------------------
+
+  /** Spawn + initialize the CLI ahead of the first message (cold start ≈ 1–2s)
+   *  so sending feels instant. Fire-and-forget; no-op if already up/starting. */
+  private prewarm(): void {
+    if (this.proc || this.starting) return;
+    void this.ensureProcess().catch(() => {
+      /* errors surface on the real send */
+    });
+  }
 
   private ensureProcess(): Promise<ClaudeProcess | undefined> {
     if (this.proc) return Promise.resolve(this.proc);

@@ -349,8 +349,19 @@ export class ClaudeProcess {
   }
 
   private handleStreamEvent(ev: StreamEvent): void {
-    const e = ev.event;
+    const e = ev.event as any;
     switch (e.type) {
+      case "message_start": {
+        const out = e.message?.usage?.output_tokens;
+        if (typeof out === "number") this.hooks.emit({ kind: "tokens", output: out });
+        return;
+      }
+      case "message_delta": {
+        // Cumulative output tokens for the current assistant message.
+        const out = e.usage?.output_tokens;
+        if (typeof out === "number") this.hooks.emit({ kind: "tokens", output: out });
+        return;
+      }
       case "content_block_start": {
         const t = e.content_block?.type;
         if (t === "text" || t === "thinking") {

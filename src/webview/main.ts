@@ -15,8 +15,9 @@ const vscode = acquireVsCodeApi();
 const send = (m: FromWebview) => vscode.postMessage(m);
 
 // ---------------------------------------------------------------------------
-// Markdown (rendered once per block, with syntax highlighting)
+// Markdown (fast = per-line while streaming; full = finalized w/ highlighting)
 // ---------------------------------------------------------------------------
+const mdFast = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const mdFull = new MarkdownIt({ html: false, linkify: true, breaks: true });
 
 const COLLAPSE_THRESHOLD = 6; // code blocks longer than this collapse to a 3-line preview
@@ -125,11 +126,15 @@ const fileChips = $("file-chips");
 interface LiveBlock {
   type: "text";
   raw: string; // full text received so far (target)
-  shown: number; // chars currently displayed (typewriter cursor)
-  el: HTMLElement;
+  shown: number; // chars currently revealed (typewriter cursor)
+  el: HTMLElement; // the .text-seg wrapper
+  committedEl: HTMLElement; // rendered markdown for complete lines
+  lineEl: HTMLElement; // the current line being typed (plain text)
+  committedLen: number; // chars already committed (rendered as markdown)
 }
 let assistantEl: HTMLElement | null = null;
 let liveBlock: LiveBlock | null = null;
+let typewriterRAF = 0;
 let pinnedToBottom = true;
 let isBusy = false;
 let lastUserEl: HTMLElement | null = null;
@@ -179,6 +184,7 @@ function finalizeTurn() {
   removeWorking();
   if (assistantEl) {
     assistantEl.classList.remove("streaming-turn");
+    assistantEl.querySelector(".rail .thread-active")?.remove(); // stop the progress pulse
     const body = assistantEl.querySelector(".msg-body");
     if (body && body.children.length === 0) {
       assistantEl.remove();
@@ -212,20 +218,96 @@ function endTimelineAtLastNode(msg: HTMLElement) {
   line.style.height = Math.max(0, endY - lineTop) + "px";
 }
 
-/**
- * Render the accumulated text block all at once (with full highlighting) when
- * the block finishes — we intentionally do NOT render mid-stream, so output
- * appears per-task instead of janky character-by-character streaming.
- */
+/** Reveal the live text with a typewriter: complete lines are rendered as
+ *  markdown (committed once each newline arrives), and the current line types
+ *  out char-by-char as plain text. Cheap — markdown only re-renders per line. */
+function renderLive() {
+  if (!liveBlock) return;
+  const shownText = liveBlock.raw.slice(0, liveBlock.shown);
+  const lastNl = shownText.lastIndexOf("\n");
+  const commitLen = lastNl >= 0 ? lastNl + 1 : 0;
+  if (commitLen > liveBlock.committedLen) {
+    liveBlock.committedLen = commitLen;
+    liveBlock.committedEl.innerHTML = mdFast.render(liveBlock.raw.slice(0, commitLen));
+  }
+  liveBlock.lineEl.textContent = shownText.slice(liveBlock.committedLen);
+  updateActiveLine();
+  maybeScroll();
+}
+
+function startTypewriter() {
+  if (typewriterRAF) return;
+  const tick = () => {
+    typewriterRAF = 0;
+    if (!liveBlock) return;
+    const target = liveBlock.raw.length;
+    if (liveBlock.shown < target) {
+      const remaining = target - liveBlock.shown;
+      const step = Math.max(2, Math.ceil(remaining / 8)); // accelerate when far behind
+      liveBlock.shown = Math.min(target, liveBlock.shown + step);
+      renderLive();
+    }
+    if (liveBlock && liveBlock.shown < liveBlock.raw.length) typewriterRAF = requestAnimationFrame(tick);
+  };
+  typewriterRAF = requestAnimationFrame(tick);
+}
+
+/** Snap the live block to its full text, rendered with syntax highlighting. */
 function finalizeLive() {
+  if (typewriterRAF) {
+    cancelAnimationFrame(typewriterRAF);
+    typewriterRAF = 0;
+  }
   if (!liveBlock) return;
   liveBlock.el.innerHTML = mdFull.render(liveBlock.raw);
   linkifyRefs(liveBlock.el);
   removeWorking(); // the text block is done — drop the "Thinking" pill
+  updateActiveLine();
+  maybeScroll();
 }
 
-// -- Shared 1s ticker: updates the "Thinking · Ns" pill -----------------------
+/** Position the pulsing "active" progress segment so it starts at the last
+ *  timeline node (dot) and runs down to the current bottom of the thread. */
+function updateActiveLine() {
+  if (!assistantEl || !assistantEl.classList.contains("streaming-turn")) return;
+  const rail = assistantEl.querySelector(".rail") as HTMLElement | null;
+  const line = assistantEl.querySelector(".thread-line") as HTMLElement | null;
+  if (!rail || !line) return;
+  let active = rail.querySelector(".thread-active") as HTMLElement | null;
+  if (!active) {
+    active = el("div", "thread-active");
+    rail.appendChild(active);
+  }
+  const railTop = rail.getBoundingClientRect().top;
+  // Last node = the last visible step dot, else the avatar (first node).
+  const dots = assistantEl.querySelectorAll(".msg-body .step .step-dot");
+  let startY: number;
+  const visibleDots = Array.from(dots).filter((d) => (d as HTMLElement).offsetParent !== null);
+  if (visibleDots.length) {
+    const r = (visibleDots[visibleDots.length - 1] as HTMLElement).getBoundingClientRect();
+    startY = r.top + r.height / 2 - railTop;
+  } else {
+    const av = rail.querySelector(".avatar") as HTMLElement;
+    const r = av.getBoundingClientRect();
+    startY = r.top + r.height / 2 - railTop;
+  }
+  const endY = line.getBoundingClientRect().bottom - railTop;
+  active.style.top = `${startY}px`;
+  active.style.height = `${Math.max(0, endY - startY)}px`;
+}
+
+// -- Shared 1s ticker: updates the "Thinking · Ns · N tokens" pill ------------
 let tickTimer = 0;
+let turnTokens = 0; // running output-token count for the current turn
+function fmtTokens(n: number): string {
+  return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
+}
+function onTokens(output: number) {
+  // output_tokens is cumulative per assistant message; keep the max this turn.
+  turnTokens = Math.max(turnTokens, output);
+  const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
+  if (tk) tk.textContent = turnTokens > 0 ? `${fmtTokens(turnTokens)} tokens` : "";
+}
 function startTick() {
   if (tickTimer) return;
   tickTimer = window.setInterval(() => {
@@ -270,7 +352,10 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       onTextDelta(m.text);
       break;
     case "thinking_delta":
-      break; // thinking is not displayed
+      break; // thinking text is not displayed (only its token count, via "tokens")
+    case "tokens":
+      onTokens(m.output);
+      break;
     case "tool_input":
       updateToolInput(m.toolId, m.name, m.input);
       break;
@@ -344,17 +429,21 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
     return;
   }
   finalizeLive(); // finalize previous text block with full highlighting
+  removeWorking(); // text is starting — drop the "Thinking" pill
   const seg = el("div", "md text-seg");
+  const committedEl = el("div", "live-committed");
+  const lineEl = el("span", "live-line");
+  seg.append(committedEl, lineEl);
   body.appendChild(seg);
-  liveBlock = { type: "text", raw: "", shown: 0, el: seg };
-  showWorking(); // keep "Thinking · Ns" until this text block is complete
+  liveBlock = { type: "text", raw: "", shown: 0, el: seg, committedEl, lineEl, committedLen: 0 };
   maybeScroll();
 }
 
 function onTextDelta(text: string) {
+  removeWorking();
   if (!liveBlock) onBlockStart("text");
   liveBlock!.raw += text;
-  // No mid-stream render — the whole block is rendered at once in finalizeLive().
+  startTypewriter(); // typewriter reveal, committing each line as it completes
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +472,7 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
   step.append(el("div", "step-dot"), card);
   parent.appendChild(step);
   toolCards.set(toolId, card);
+  updateActiveLine(); // the new dot becomes the active progress start
   maybeScroll();
   return card;
 }
@@ -518,10 +608,13 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
 function resolvePermission(requestId: string, behavior: "allow" | "deny") {
   const bar = messagesEl.querySelector(`.perm-bar[data-request-id="${requestId}"]`) as HTMLElement;
   if (!bar) return;
-  bar.classList.add("resolved");
-  bar.innerHTML = `<span class="perm-label ${behavior}">${behavior === "allow" ? "✓ 已允许" : "✕ 已拒绝"}</span>`;
-  const card = bar.closest(".tool-card");
-  card?.classList.remove("needs-approval");
+  bar.closest(".tool-card")?.classList.remove("needs-approval");
+  if (behavior === "allow") {
+    bar.remove(); // authorized — just proceed, no result shown
+  } else {
+    bar.classList.add("resolved");
+    bar.innerHTML = `<span class="perm-label deny">已拒绝</span>`;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -902,6 +995,7 @@ function doSend() {
     pendingImages.map((p) => p.uri),
   );
   finalizeTurn();
+  turnTokens = 0; // reset token counter for the new turn
   isBusy = true;
   showWorking(); // instant feedback (the busy event confirms it a moment later)
   if (assistantEl) assistantEl.classList.add("streaming-turn");
@@ -926,6 +1020,15 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 inputEl.addEventListener("input", autoResize);
+// Warm up the CLI process as soon as the user engages the input, so the first
+// message doesn't pay the cold-start cost.
+let warmed = false;
+inputEl.addEventListener("focus", () => {
+  if (!warmed) {
+    warmed = true;
+    send({ type: "warm" });
+  }
+});
 function autoResize() {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
@@ -1419,11 +1522,13 @@ function showWorking(label = "Thinking") {
     w.dataset.start = String(performance.now());
     w.innerHTML =
       `<span class="typing"><span></span><span></span><span></span></span>` +
-      `<span class="wk-label"></span><span class="wk-time">0s</span>`;
+      `<span class="wk-label"></span><span class="wk-time">0s</span><span class="wk-tokens"></span>`;
     body.appendChild(w);
   }
   const lbl = w.querySelector(".wk-label") as HTMLElement;
   if (lbl) lbl.textContent = label;
+  const tk = w.querySelector(".wk-tokens") as HTMLElement;
+  if (tk) tk.textContent = turnTokens > 0 ? `${fmtTokens(turnTokens)} tokens` : "";
   // Always keep the pill as the last element so it sits below the latest output.
   if (body.lastElementChild !== w) body.appendChild(w);
   startTick();

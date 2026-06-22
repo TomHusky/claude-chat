@@ -47,6 +47,7 @@ export type ToWebview =
       suggestions: PermissionSuggestionView[];
     }
   | { kind: "permission_resolved"; requestId: string; behavior: "allow" | "deny"; auto?: boolean }
+  | { kind: "tokens"; output: number }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
@@ -117,6 +118,7 @@ export type TimelineItem =
 
 export type FromWebview =
   | { type: "ready" }
+  | { type: "warm" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }

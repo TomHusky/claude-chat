@@ -121,6 +121,7 @@ html, body {
 .msg.assistant { justify-content: flex-start; align-items: stretch; }
 .msg.assistant .rail {
   flex: 0 0 auto;
+  position: relative;
   display: flex; flex-direction: column; align-items: center;
   width: 22px;
 }
@@ -136,19 +137,15 @@ html, body {
   border-radius: 2px;
   background: var(--vscode-panel-border, rgba(128,128,128,.35));
 }
-/* While streaming, the line is a solid accent (completed steps don't flash);
-   only the active tip at the bottom pulses to show the current step. */
-.msg.assistant.streaming-turn .thread-line {
-  position: relative;
-  background: var(--vscode-panel-border, rgba(128,128,128,.35));
-  overflow: hidden;
-}
-.msg.assistant.streaming-turn .thread-line::after {
-  content: ""; position: absolute; left: 0; right: 0; bottom: 0;
-  height: 46px; border-radius: 2px;
-  background: linear-gradient(180deg, rgba(217,119,87,0) 0%, #d97757 100%);
+/* Completed segments stay gray; a separate overlay (positioned by JS to start
+   at the last node) pulses to show the active progress region. */
+.msg.assistant.streaming-turn .thread-line { background: var(--vscode-panel-border, rgba(128,128,128,.35)); }
+.thread-active {
+  position: absolute; left: 11px; transform: translateX(-50%);
+  width: 2px; border-radius: 2px; pointer-events: none;
+  background: linear-gradient(180deg, #d97757 0%, rgba(217,119,87,.12) 50%, #d97757 100%);
   background-size: 100% 200%;
-  animation: thread-flow 1.1s linear infinite;
+  animation: thread-flow 1.05s linear infinite;
 }
 @keyframes thread-flow { from { background-position: 0 200%; } to { background-position: 0 0; } }
 /* closing node: a dot at the start of the final summary text — same as a normal step dot */
@@ -272,12 +269,16 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 }
 .text-seg { margin-top: 2px; }
 
-/* Streaming caret — sits inline at the end of the last line while typing */
-.text-seg.streaming > :last-child::after {
+/* Live typewriter: committed (markdown) lines + the current typing line. */
+.live-committed > :first-child { margin-top: 0; }
+.live-committed > :last-child { margin-bottom: 0; }
+.live-line { white-space: pre-wrap; }
+/* Blinking caret at the end of the line currently being typed. */
+.live-line:not(:empty)::after {
   content: "";
   display: inline-block;
   width: 6px; height: 1.05em;
-  margin-left: 2px;
+  margin-left: 1px;
   vertical-align: text-bottom;
   border-radius: 1px;
   background: var(--vscode-foreground);
@@ -313,6 +314,8 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   opacity: .7;
 }
 .working-pill .wk-time::before { content: "· "; }
+.working-pill .wk-tokens { font-variant-numeric: tabular-nums; opacity: .7; }
+.working-pill .wk-tokens:not(:empty)::before { content: "· "; }
 
 /* Gentle entrance for messages & tool cards */
 .msg, .tool-card { animation: fade-in .18s ease both; }
@@ -409,7 +412,7 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 }
 .tool-card.running { border-color: var(--vscode-progressBar-background, #3794ff); }
 .tool-card.error { border-color: var(--vscode-errorForeground, #f14c4c); }
-.tool-card.needs-approval { border-color: var(--vscode-editorWarning-foreground, #cca700); box-shadow: 0 0 0 1px var(--vscode-editorWarning-foreground, #cca700) inset; }
+.tool-card.needs-approval { border-color: var(--vscode-focusBorder, #d97757); }
 
 /* Timeline step: a node dot on the left rail for each tool action */
 .step { position: relative; margin: 6px 0; }
@@ -426,7 +429,6 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .tool-head {
   display: flex; align-items: center; gap: 6px;
   padding: 5px 8px;
-  background: rgba(128,128,128,.10);
   font-size: 12px;
 }
 .tool-name { font-weight: 600; }
@@ -504,23 +506,24 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 
 /* ---- Permission bar ---- */
 .perm-bar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
-  margin-top: 8px; padding: 8px;
-  background: var(--vscode-inputValidation-warningBackground, rgba(204,167,0,.12));
-  border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
-  border-radius: 5px;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 8px; padding: 4px 0 2px;
 }
-.perm-label { flex: 1; font-size: 12px; }
-.perm-label.allow { color: var(--vscode-testing-iconPassed, #73c991); }
+.perm-label { flex: 1; font-size: 12px; color: var(--vscode-descriptionForeground); }
 .perm-label.deny { color: var(--vscode-errorForeground, #f14c4c); }
 .perm-bar button {
-  border: none; border-radius: 4px; cursor: pointer;
-  padding: 4px 10px; font-size: 12px;
+  border: 1px solid transparent; border-radius: 5px; cursor: pointer;
+  padding: 3px 12px; font-size: 12px; line-height: 18px;
 }
 .perm-allow { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-.perm-deny { background: var(--vscode-button-secondaryBackground, rgba(128,128,128,.3)); color: var(--vscode-button-secondaryForeground, inherit); }
-.perm-always { background: transparent; color: var(--vscode-textLink-foreground); text-decoration: underline; }
-.perm-bar.resolved { background: transparent; border-style: dashed; }
+.perm-allow:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+.perm-deny {
+  background: transparent; color: var(--vscode-descriptionForeground);
+  border-color: var(--vscode-panel-border, rgba(128,128,128,.4));
+}
+.perm-deny:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.15)); }
+.perm-always { background: transparent; color: var(--vscode-textLink-foreground); padding: 3px 6px; }
+.perm-always:hover { text-decoration: underline; }
 
 /* ---- Notices ---- */
 .notice { font-size: 12px; padding: 6px 10px; border-radius: 5px; text-align: center; }

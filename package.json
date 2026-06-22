@@ -1,0 +1,198 @@
+{
+  "name": "claude-chat",
+  "displayName": "ClaudeCopilot",
+  "description": "Copilot-style chat panel powered by your local Claude Code CLI",
+  "version": "0.1.55",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "ai",
+    "chat",
+    "copilot"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onWebviewPanel:claude-chat.editor"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-chat",
+          "title": "ClaudeCopilot",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claude-chat": [
+        {
+          "id": "claude-chat.chatView",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claude-chat.newSession",
+        "title": "Claude: New Chat Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claude-chat.showSessions",
+        "title": "Claude: Show Session History",
+        "icon": "$(history)"
+      },
+      {
+        "command": "claude-chat.stop",
+        "title": "Claude: Stop Current Turn",
+        "icon": "$(stop-circle)"
+      },
+      {
+        "command": "claude-chat.focusInput",
+        "title": "Claude: Focus Chat Input"
+      },
+      {
+        "command": "claude-chat.addSelectionToChat",
+        "title": "Claude: Add Selection to Chat"
+      },
+      {
+        "command": "claude-chat.moveToRight",
+        "title": "Claude: 移到右侧栏 (不挡代码)",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
+        "command": "claude-chat.openInEditor",
+        "title": "Claude: 在编辑器右侧打开",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "claude-chat.open",
+        "title": "Claude Chat",
+        "icon": "media/icon.svg"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "claude-chat.openInEditor",
+          "when": "view == claude-chat.chatView",
+          "group": "navigation@0"
+        },
+        {
+          "command": "claude-chat.moveToRight",
+          "when": "view == claude-chat.chatView",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "claude-chat.open",
+          "when": "resourceScheme == file",
+          "group": "navigation@9"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "claude-chat.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "claude@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "claude-chat.focusInput",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "claude-chat.addSelectionToChat",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l",
+        "when": "editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Claude Chat",
+      "properties": {
+        "claudeChat.claudePath": {
+          "type": "string",
+          "default": "claude",
+          "description": "Path to the `claude` CLI executable. Use an absolute path if it is not on your PATH."
+        },
+        "claudeChat.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model to use (e.g. opus, sonnet, fable, or a full model id). Leave empty for the CLI default."
+        },
+        "claudeChat.permissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "bypassPermissions"
+          ],
+          "default": "default",
+          "enumDescriptions": [
+            "Ask before each sensitive tool use (shows approval cards).",
+            "Auto-approve file edits; still ask for other tools.",
+            "Plan first, then ask to execute.",
+            "Automatically choose the best permission mode per task.",
+            "Skip all permission checks (dangerous)."
+          ],
+          "description": "Initial permission mode for new sessions."
+        },
+        "claudeChat.effort": {
+          "type": "string",
+          "enum": [
+            "",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "",
+          "description": "Reasoning effort level. Leave empty for the CLI default."
+        },
+        "claudeChat.snapshotFilesForRestore": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before each file edit, snapshot the file so restore points can revert workspace changes."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "check-types": "tsc --noEmit",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23.0",
+    "highlight.js": "^11.10.0",
+    "markdown-it": "^14.1.0",
+    "typescript": "^5.5.0"
+  }
+}

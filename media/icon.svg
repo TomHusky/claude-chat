@@ -1,0 +1,16 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g stroke-width="2.2" stroke-linecap="round">
+    <line x1="16.00" y1="12.00" x2="23.00" y2="12.00" stroke="#e74c3c"/>
+    <line x1="15.46" y1="14.00" x2="21.53" y2="17.50" stroke="#e67e22"/>
+    <line x1="14.00" y1="15.46" x2="17.50" y2="21.53" stroke="#f1c40f"/>
+    <line x1="12.00" y1="16.00" x2="12.00" y2="23.00" stroke="#2ecc71"/>
+    <line x1="10.00" y1="15.46" x2="6.50" y2="21.53" stroke="#27ae60"/>
+    <line x1="8.54" y1="14.00" x2="2.47" y2="17.50" stroke="#1abc9c"/>
+    <line x1="8.00" y1="12.00" x2="1.00" y2="12.00" stroke="#00bcd4"/>
+    <line x1="8.54" y1="10.00" x2="2.47" y2="6.50" stroke="#3498db"/>
+    <line x1="10.00" y1="8.54" x2="6.50" y2="2.47" stroke="#5b6cf0"/>
+    <line x1="12.00" y1="8.00" x2="12.00" y2="1.00" stroke="#8e44ad"/>
+    <line x1="14.00" y1="8.54" x2="17.50" y2="2.47" stroke="#c0399b"/>
+    <line x1="15.46" y1="10.00" x2="21.53" y2="6.50" stroke="#e84393"/>
+  </g>
+</svg>

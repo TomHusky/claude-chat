@@ -112,7 +112,6 @@ const sessionsList = $("sessions-list");
 const overlay = $("overlay");
 const changedFiles = $("changed-files");
 const cfList = $("cf-list");
-const cfCount = $("cf-count");
 const cfStat = $("cf-stat");
 const cfHeader = $("cf-header");
 const lightbox = $("lightbox");
@@ -291,9 +290,12 @@ function updateActiveLine() {
     const r = av.getBoundingClientRect();
     startY = r.top + r.height / 2 - railTop;
   }
-  const endY = line.getBoundingClientRect().bottom - railTop;
+  // Anchor the bottom to the rail's end (which grows with the message) so the
+  // active segment always reaches the very bottom of the line, even when more
+  // content (e.g. a permission box) is added after the last node.
   active.style.top = `${startY}px`;
-  active.style.height = `${Math.max(0, endY - startY)}px`;
+  active.style.bottom = "2px";
+  active.style.removeProperty("height");
 }
 
 // -- Shared 1s ticker: updates the "Thinking · Ns · N tokens" pill ------------
@@ -590,17 +592,22 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
   host.classList.add("needs-approval");
   const bar = el("div", "perm-bar");
   bar.dataset.requestId = m.requestId;
-  const label = el("span", "perm-label", `需要确认：${m.displayName || m.toolName}`);
+  const label = el("div", "perm-label");
+  const strong = el("b");
+  strong.textContent = m.displayName || m.toolName;
+  label.append(el("span", "perm-ico", "⚠"), document.createTextNode(" 需要你的确认 · "), strong);
+  const actions = el("div", "perm-actions");
   const allow = el("button", "perm-allow", "允许");
   const deny = el("button", "perm-deny", "拒绝");
   allow.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "allow" });
   deny.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "deny" });
-  bar.append(label, allow, deny);
+  actions.append(allow, deny);
   for (const s of m.suggestions || []) {
     const b = el("button", "perm-always", s.label);
     b.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "allow", suggestionId: s.id });
-    bar.appendChild(b);
+    actions.appendChild(b);
   }
+  bar.append(label, actions);
   (host.querySelector(".tool-body") as HTMLElement).appendChild(bar);
   scrollToBottom();
 }
@@ -836,9 +843,7 @@ function renderChangedFiles(
     return;
   }
   changedFiles.classList.remove("hidden");
-  cfCount.textContent = String(files.length);
   cfStat.innerHTML =
-    `<span class="add">+${totalAdded}</span> <span class="del">-${totalRemoved}</span>` +
     `<button class="cf-all accept" data-cf="acceptAll" title="同意全部改动（保留）">✓ 全部</button>` +
     `<button class="cf-all revert" data-cf="revertAll" title="回滚全部改动">↩ 全部</button>`;
   cfList.innerHTML = "";
@@ -1014,7 +1019,9 @@ function doSend() {
 sendBtn.onclick = doSend;
 stopBtn.onclick = () => send({ type: "interrupt" });
 inputEl.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
+  // Ignore Enter while an IME composition is active (e.g. confirming a pinyin
+  // candidate) — `isComposing`/keyCode 229 means it's not a real "send".
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
     e.preventDefault();
     doSend();
   }
@@ -1224,13 +1231,6 @@ function buildModeMenu() {
       `<span class="pick-text"><span class="pick-title">${m.title}</span><span class="pick-desc">${m.desc}</span></span>` +
       `<span class="pick-check">${m.id === currentMode ? "✓" : ""}</span></button>`;
   }
-  // Effort row (dots)
-  const idx = EFFORTS.indexOf(currentEffort);
-  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度 ${currentEffort ? `(${currentEffort})` : "(默认)"}</span><span class="effort-dots">`;
-  EFFORTS.forEach((e, i) => {
-    html += `<span class="effort-dot ${idx >= 0 && i <= idx ? "on" : ""}" data-effort="${e}" title="${e}"></span>`;
-  });
-  html += `</span></div>`;
   modeMenu.innerHTML = html;
 }
 
@@ -1242,6 +1242,13 @@ function buildModelMenu() {
       `<span class="pick-text"><span class="pick-title">${m.label}</span>${m.desc ? `<span class="pick-desc">${m.desc}</span>` : ""}</span>` +
       `<span class="pick-check">${m.id === currentModel ? "✓" : ""}</span></button>`;
   }
+  // Reasoning-effort row (dots) — lives in the model settings.
+  const idx = EFFORTS.indexOf(currentEffort);
+  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度 ${currentEffort ? `(${currentEffort})` : "(默认)"}</span><span class="effort-dots">`;
+  EFFORTS.forEach((e, i) => {
+    html += `<span class="effort-dot ${idx >= 0 && i <= idx ? "on" : ""}" data-effort="${e}" title="${e}"></span>`;
+  });
+  html += `</span></div>`;
   modelMenu.innerHTML = html;
 }
 
@@ -1268,15 +1275,7 @@ modelTrigger.onclick = (e) => {
 pickBackdrop.onclick = closePickers;
 
 modeMenu.addEventListener("click", (e) => {
-  const t = e.target as HTMLElement;
-  const dot = t.closest("[data-effort]") as HTMLElement | null;
-  if (dot) {
-    currentEffort = dot.dataset.effort || "";
-    send({ type: "setEffort", effort: currentEffort });
-    buildModeMenu(); // keep menu open, update dots
-    return;
-  }
-  const row = t.closest("[data-mode]") as HTMLElement | null;
+  const row = (e.target as HTMLElement).closest("[data-mode]") as HTMLElement | null;
   if (row) {
     currentMode = row.dataset.mode || "default";
     send({ type: "setPermissionMode", mode: currentMode });
@@ -1285,7 +1284,15 @@ modeMenu.addEventListener("click", (e) => {
   }
 });
 modelMenu.addEventListener("click", (e) => {
-  const row = (e.target as HTMLElement).closest("[data-model]") as HTMLElement | null;
+  const t = e.target as HTMLElement;
+  const dot = t.closest("[data-effort]") as HTMLElement | null;
+  if (dot) {
+    currentEffort = dot.dataset.effort || "";
+    send({ type: "setEffort", effort: currentEffort });
+    buildModelMenu(); // keep menu open, update dots
+    return;
+  }
+  const row = t.closest("[data-model]") as HTMLElement | null;
   if (!row) return;
   currentModel = row.dataset.model || "";
   send({ type: "setModel", model: currentModel });
@@ -1434,7 +1441,7 @@ function enterEditMode(msg: HTMLElement) {
     submitEdit(msg, checkpointId, t);
   };
   ta.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
       e.preventDefault();
       sendB.click();
     } else if (e.key === "Escape") {

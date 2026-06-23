@@ -140,14 +140,17 @@ html, body {
 /* Completed segments stay gray; a separate overlay (positioned by JS to start
    at the last node) pulses to show the active progress region. */
 .msg.assistant.streaming-turn .thread-line { background: var(--vscode-panel-border, rgba(128,128,128,.35)); }
+/* The active segment (last node → end of line) gently breathes in brightness. */
 .thread-active {
   position: absolute; left: 11px; transform: translateX(-50%);
   width: 2px; border-radius: 2px; pointer-events: none;
-  background: linear-gradient(180deg, #d97757 0%, rgba(217,119,87,.12) 50%, #d97757 100%);
-  background-size: 100% 200%;
-  animation: thread-flow 1.05s linear infinite;
+  background: #d97757;
+  animation: thread-breathe 1.9s ease-in-out infinite;
 }
-@keyframes thread-flow { from { background-position: 0 200%; } to { background-position: 0 0; } }
+@keyframes thread-breathe {
+  0%, 100% { opacity: .28; box-shadow: 0 0 0 rgba(217,119,87,0); }
+  50%      { opacity: 1;   box-shadow: 0 0 6px rgba(217,119,87,.45); }
+}
 /* closing node: a dot at the start of the final summary text — same as a normal step dot */
 .text-seg.summary-node { position: relative; }
 .text-seg.summary-node::before {
@@ -412,7 +415,7 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 }
 .tool-card.running { border-color: var(--vscode-progressBar-background, #3794ff); }
 .tool-card.error { border-color: var(--vscode-errorForeground, #f14c4c); }
-.tool-card.needs-approval { border-color: var(--vscode-focusBorder, #d97757); }
+.tool-card.needs-approval { border-color: var(--vscode-panel-border, rgba(128,128,128,.5)); }
 
 /* Timeline step: a node dot on the left rail for each tool action */
 .step { position: relative; margin: 6px 0; }
@@ -504,26 +507,34 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .diff .add { background: rgba(115,201,145,.12); border-left: 3px solid #73c991; }
 .tool-result summary { cursor: pointer; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
 
-/* ---- Permission bar ---- */
+/* ---- Permission box (grouped with the operation, calm gray styling) ---- */
 .perm-bar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  margin-top: 8px; padding: 4px 0 2px;
+  display: flex; flex-direction: column; gap: 10px;
+  margin-top: 8px; padding: 11px 13px;
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
+  border-radius: 8px;
+  background: rgba(128,128,128,.06);
 }
-.perm-label { flex: 1; font-size: 12px; color: var(--vscode-descriptionForeground); }
+.perm-label { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--vscode-foreground); }
+.perm-label b { font-weight: 600; }
+.perm-ico { color: var(--vscode-descriptionForeground); font-size: 13px; }
 .perm-label.deny { color: var(--vscode-errorForeground, #f14c4c); }
+.perm-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .perm-bar button {
-  border: 1px solid transparent; border-radius: 5px; cursor: pointer;
-  padding: 3px 12px; font-size: 12px; line-height: 18px;
+  border: 1px solid transparent; border-radius: 6px; cursor: pointer;
+  padding: 3px 14px; font-size: 12px; line-height: 16px;
+  transition: background .12s, border-color .12s, color .12s;
 }
-.perm-allow { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-.perm-allow:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+/* Allow = calm green confirm (no blue); Deny = ghost outline; Always = quiet link */
+.perm-allow { background: #3a9d5d; color: #fff; font-weight: 600; }
+.perm-allow:hover { background: #318650; }
 .perm-deny {
-  background: transparent; color: var(--vscode-descriptionForeground);
-  border-color: var(--vscode-panel-border, rgba(128,128,128,.4));
+  background: transparent; color: var(--vscode-foreground);
+  border-color: var(--vscode-panel-border, rgba(128,128,128,.45));
 }
-.perm-deny:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.15)); }
-.perm-always { background: transparent; color: var(--vscode-textLink-foreground); padding: 3px 6px; }
-.perm-always:hover { text-decoration: underline; }
+.perm-deny:hover { background: rgba(128,128,128,.14); }
+.perm-always { background: transparent; color: var(--vscode-descriptionForeground); padding: 5px 10px; }
+.perm-always:hover { color: var(--vscode-foreground); background: rgba(128,128,128,.12); }
 
 /* ---- Notices ---- */
 .notice { font-size: 12px; padding: 6px 10px; border-radius: 5px; text-align: center; }

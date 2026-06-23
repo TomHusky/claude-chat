@@ -1,7 +1,19 @@
-# Claude Chat — VS Code 插件
+# ClaudeCopilot — VS Code 插件
 
 一个对标 GitHub Copilot Chat 的侧边栏聊天插件，**底层直接驱动你本机的 `claude` CLI**（Claude Code）。
 你已有的 Claude 订阅 / 登录态会被直接复用 —— 插件不需要 API Key，所有请求都通过本地 `claude` 进程发出。
+
+## ⚡ 安装
+
+仓库内已附带打包好的安装包，**无需自己构建**。在仓库根目录执行：
+
+```bash
+code --install-extension release/claude-chat.vsix --force
+```
+
+然后 Reload Window 即可。完整步骤（含 `code` 命令未安装、图形界面安装、从源码构建等）见 **[INSTALL.md](INSTALL.md)**。
+
+> 前置条件：本机已安装并登录 `claude` CLI（`claude --version` 可用）。
 
 ## 功能
 

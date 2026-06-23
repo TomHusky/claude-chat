@@ -318,12 +318,20 @@ export class ClaudeProcess {
 
   private normalizeSuggestions(req: { permission_suggestions?: unknown[] }): PermissionSuggestionView[] {
     const out: PermissionSuggestionView[] = [];
+    const seen = new Set<string>();
     for (const s of req.permission_suggestions ?? []) {
       const sug = s as { type?: string; mode?: string };
+      let item: PermissionSuggestionView | undefined;
       if (sug.type === "setMode" && sug.mode) {
-        out.push({ id: `setMode:${sug.mode}`, label: `本会话总是允许 (${sug.mode})` });
+        item = { id: `setMode:${sug.mode}`, label: `本会话总是允许 (${sug.mode})` };
       } else if (sug.type === "addRules") {
-        out.push({ id: "addRules", label: "总是允许此类操作" });
+        item = { id: "addRules", label: "总是允许此类操作" };
+      }
+      // The CLI may send several variants (different scopes) that we surface
+      // identically — de-dupe so the user doesn't see two identical buttons.
+      if (item && !seen.has(item.id)) {
+        seen.add(item.id);
+        out.push(item);
       }
     }
     return out;

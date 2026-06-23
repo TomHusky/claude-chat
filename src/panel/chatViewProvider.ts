@@ -950,13 +950,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private cwd(): string {
     const folders = vscode.workspace.workspaceFolders;
     if (folders && folders.length > 0) return folders[0].uri.fsPath;
+    // No folder opened (just a loose file): walk up to the project root so
+    // Claude can access the whole project, not only the file's own folder.
     const active = vscode.window.activeTextEditor?.document.uri;
-    if (active && active.scheme === "file") return path.dirname(active.fsPath);
+    if (active && active.scheme === "file") return this.findProjectRoot(path.dirname(active.fsPath));
     return os.homedir();
   }
 
+  /** Nearest ancestor (incl. start) that looks like a project root. */
+  private findProjectRoot(start: string): string {
+    const markers = [".git", "package.json", "pom.xml", "build.gradle", "settings.gradle", "go.mod", "Cargo.toml", "pyproject.toml", "tsconfig.json", ".hg", ".svn"];
+    let dir = start;
+    for (let i = 0; i < 40; i++) {
+      for (const m of markers) {
+        try {
+          if (fs.existsSync(path.join(dir, m))) return dir;
+        } catch {
+          /* ignore */
+        }
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return start;
+  }
+
+  /** All directories Claude may access — every workspace folder. */
   private workspaceDirs(): string[] {
-    return (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    const dirs = (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath);
+    // Ensure the chosen cwd is always included (covers the loose-file case).
+    const root = this.cwd();
+    if (root && !dirs.includes(root)) dirs.push(root);
+    return dirs;
   }
 
   private storageDir(): string {
@@ -1173,7 +1199,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="changed-files" class="changed-files hidden">
         <div class="cf-header" id="cf-header">
           <span class="cf-caret">▾</span>
-          <span class="cf-title">已更改 <span id="cf-count">0</span> 个文件</span>
+          <span class="cf-title">已更改文件</span>
           <span id="cf-stat" class="cf-stat"></span>
         </div>
         <div id="cf-list" class="cf-list"></div>

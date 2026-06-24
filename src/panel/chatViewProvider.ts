@@ -1195,6 +1195,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="context-chips"></div>
       <div id="file-chips"></div>
       <div id="image-previews"></div>
+      <div id="queue-hint" class="queue-hint hidden"><span class="qh-key">↵</span> 任务进行中 · 回车将内容加入<b>等待队列</b></div>
       <div class="input-wrap">
         <textarea id="input" rows="1" placeholder="给 Claude 发消息…  (Enter 发送 / Shift+Enter 换行 · 📎 或拖拽附加文件)"></textarea>
         <div class="composer-bottom">

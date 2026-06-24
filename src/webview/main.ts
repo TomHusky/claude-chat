@@ -96,6 +96,9 @@ const messagesEl = $("messages");
 const inputEl = $<HTMLTextAreaElement>("input");
 const sendBtn = $<HTMLButtonElement>("btn-send");
 const stopBtn = $<HTMLButtonElement>("btn-stop");
+const queueHint = $("queue-hint");
+const PLACEHOLDER_IDLE = inputEl.placeholder;
+const PLACEHOLDER_BUSY = "任务进行中 · 回车将内容加入等待队列";
 const statusLine = $("status-line");
 const sessionTitle = $("session-title");
 const modeTrigger = $("mode-trigger");
@@ -1056,6 +1059,7 @@ function clearComposer() {
   attachedFiles = [];
   autoDismissed = false;
   onActiveFile(autoPath);
+  refreshComposerHint();
 }
 
 function doSend() {
@@ -1133,7 +1137,29 @@ inputEl.addEventListener("keydown", (e) => {
     doSend();
   }
 });
-inputEl.addEventListener("input", autoResize);
+inputEl.addEventListener("input", () => {
+  autoResize();
+  refreshComposerHint();
+});
+
+/** While a turn is running, hint that typing + Enter queues the message; also
+ *  toggle send/stop buttons accordingly. */
+function refreshComposerHint() {
+  const hasContent = inputEl.value.trim().length > 0 || pendingImages.length > 0;
+  if (isBusy) {
+    stopBtn.classList.remove("hidden");
+    sendBtn.classList.toggle("hidden", !hasContent); // clickable "add to queue" when there's content
+    sendBtn.title = "加入等待队列";
+    inputEl.placeholder = PLACEHOLDER_BUSY;
+    queueHint.classList.toggle("hidden", !hasContent);
+  } else {
+    sendBtn.classList.remove("hidden");
+    sendBtn.title = "发送";
+    stopBtn.classList.add("hidden");
+    inputEl.placeholder = PLACEHOLDER_IDLE;
+    queueHint.classList.add("hidden");
+  }
+}
 function autoResize() {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
@@ -1606,8 +1632,7 @@ function clearContextChips() {
 
 function setBusy(busy: boolean) {
   isBusy = busy;
-  sendBtn.classList.toggle("hidden", busy);
-  stopBtn.classList.toggle("hidden", !busy);
+  refreshComposerHint(); // toggles send/stop + the "加入等待队列" hint
   if (busy) {
     showWorking();
     if (assistantEl) assistantEl.classList.add("streaming-turn");

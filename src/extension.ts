@@ -29,6 +29,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.open", () => provider.openInEditor()),
   );
 
+  // Auto-check for updates once on startup (silent — only prompts if newer).
+  const updateTimer = setTimeout(() => void provider.checkForUpdate(true), 4000);
+  context.subscriptions.push({ dispose: () => clearTimeout(updateTimer) });
+
   // First run: recommend moving the chat to the right Secondary Side Bar.
   // (A side-bar view — unlike an editor tab — lets you drag files from the
   //  explorer into the input to attach them without VS Code opening them.)

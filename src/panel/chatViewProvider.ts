@@ -799,8 +799,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private static readonly REPO_RAW = "https://raw.githubusercontent.com/TomHusky/claude-chat/main";
 
-  /** Check GitHub for a newer packaged build; if found, download + install it. */
-  async checkForUpdate(): Promise<void> {
+  /** Check GitHub for a newer packaged build; if found, download + install it.
+   *  In `silent` mode (auto-check on startup) it stays quiet unless a newer
+   *  version exists — no "already latest" / error popups. */
+  async checkForUpdate(silent = false): Promise<void> {
     const local = (this.context.extension.packageJSON.version as string) || "0.0.0";
     const bust = `?t=${Date.now()}`;
     let remote = "";
@@ -808,15 +810,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const pkg = await this.httpGetText(`${ChatViewProvider.REPO_RAW}/package.json${bust}`);
       remote = JSON.parse(pkg).version || "";
     } catch (err) {
-      vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
+      if (!silent) vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
       return;
     }
     if (!remote) {
-      vscode.window.showErrorMessage("检查更新失败：无法读取远程版本号");
+      if (!silent) vscode.window.showErrorMessage("检查更新失败：无法读取远程版本号");
       return;
     }
     if (cmpVersion(remote, local) <= 0) {
-      vscode.window.showInformationMessage(`已是最新版本 v${local}`);
+      if (!silent) vscode.window.showInformationMessage(`已是最新版本 v${local}`);
       return;
     }
     const pick = await vscode.window.showInformationMessage(

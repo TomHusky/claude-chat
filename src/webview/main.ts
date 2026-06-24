@@ -1465,6 +1465,7 @@ $("btn-sessions").onclick = () => {
   send({ type: "listSessions" });
   openDrawer(sessionsPanel);
 };
+$("btn-update").onclick = () => send({ type: "checkUpdate" });
 overlay.onclick = closeDrawers;
 document.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = closeDrawers));
 

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as https from "node:https";
 import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
@@ -284,6 +285,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.restoreLastOrActive();
           this.postActiveFile();
+          break;
+        case "checkUpdate":
+          await this.checkForUpdate();
           break;
         case "send":
           await this.handleSend(m.text, m.context, m.images, m.files);
@@ -791,6 +795,105 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (u && u.used > 0) this.post({ kind: "context", used: u.used, total: contextWindowFor(u.model, u.used) });
   }
 
+  // -- Update check --------------------------------------------------------
+
+  private static readonly REPO_RAW = "https://raw.githubusercontent.com/TomHusky/claude-chat/main";
+
+  /** Check GitHub for a newer packaged build; if found, download + install it. */
+  async checkForUpdate(): Promise<void> {
+    const local = (this.context.extension.packageJSON.version as string) || "0.0.0";
+    const bust = `?t=${Date.now()}`;
+    let remote = "";
+    try {
+      const pkg = await this.httpGetText(`${ChatViewProvider.REPO_RAW}/package.json${bust}`);
+      remote = JSON.parse(pkg).version || "";
+    } catch (err) {
+      vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    if (!remote) {
+      vscode.window.showErrorMessage("检查更新失败：无法读取远程版本号");
+      return;
+    }
+    if (cmpVersion(remote, local) <= 0) {
+      vscode.window.showInformationMessage(`已是最新版本 v${local}`);
+      return;
+    }
+    const pick = await vscode.window.showInformationMessage(
+      `发现新版本 v${remote}（当前 v${local}）`,
+      "下载并安装",
+      "取消",
+    );
+    if (pick !== "下载并安装") return;
+    try {
+      const dest = path.join(os.tmpdir(), `claude-chat-${remote}.vsix`);
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `正在下载并安装 v${remote}…` },
+        async () => {
+          await this.httpDownload(`${ChatViewProvider.REPO_RAW}/release/claude-chat.vsix${bust}`, dest);
+          await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(dest));
+        },
+      );
+    } catch (err) {
+      vscode.window.showErrorMessage(`更新失败：${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    const reload = await vscode.window.showInformationMessage(`已更新到 v${remote}，重新加载窗口后生效。`, "重新加载");
+    if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
+  }
+
+  /** GET a text resource over HTTPS (follows redirects). */
+  private httpGetText(url: string, depth = 0): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (depth > 5) return reject(new Error("重定向次数过多"));
+      const req = https.get(url, { headers: { "User-Agent": "claude-chat" } }, (res) => {
+        const code = res.statusCode ?? 0;
+        if (code >= 300 && code < 400 && res.headers.location) {
+          res.resume();
+          resolve(this.httpGetText(res.headers.location, depth + 1));
+          return;
+        }
+        if (code !== 200) {
+          res.resume();
+          reject(new Error(`HTTP ${code}`));
+          return;
+        }
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (data += c));
+        res.on("end", () => resolve(data));
+      });
+      req.on("error", reject);
+      req.setTimeout(15000, () => req.destroy(new Error("请求超时")));
+    });
+  }
+
+  /** Download a binary resource over HTTPS to `dest` (follows redirects). */
+  private httpDownload(url: string, dest: string, depth = 0): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (depth > 5) return reject(new Error("重定向次数过多"));
+      const req = https.get(url, { headers: { "User-Agent": "claude-chat" } }, (res) => {
+        const code = res.statusCode ?? 0;
+        if (code >= 300 && code < 400 && res.headers.location) {
+          res.resume();
+          resolve(this.httpDownload(res.headers.location, dest, depth + 1));
+          return;
+        }
+        if (code !== 200) {
+          res.resume();
+          reject(new Error(`HTTP ${code}`));
+          return;
+        }
+        const file = fs.createWriteStream(dest);
+        res.pipe(file);
+        file.on("finish", () => file.close(() => resolve()));
+        file.on("error", (e) => reject(e));
+      });
+      req.on("error", reject);
+      req.setTimeout(60000, () => req.destroy(new Error("下载超时")));
+    });
+  }
+
   // -- Helpers -------------------------------------------------------------
 
   private async openFile(p: string, line?: number, endLine?: number): Promise<void> {
@@ -1173,6 +1276,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <header id="toolbar">
       <div class="title"><span id="session-title">新对话</span></div>
       <div class="spacer"></div>
+      <button id="btn-update" class="icon-btn" title="检查更新">${ICONS.update}</button>
       <button id="btn-sessions" class="icon-btn" title="历史会话">${ICONS.sessions}</button>
       <button id="btn-new" class="icon-btn" title="新建会话">${ICONS.newChat}</button>
     </header>
@@ -1226,6 +1330,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/** Compare two dotted versions: >0 if a>b, <0 if a<b, 0 if equal. */
+function cmpVersion(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d > 0 ? 1 : -1;
+  }
+  return 0;
 }
 
 /** Git-style added/removed line counts via an LCS line diff. */

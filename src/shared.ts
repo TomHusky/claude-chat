@@ -23,6 +23,7 @@ export const ICONS: Record<string, string> = {
   file: _s('<path d="M4 2.5h4.5L12 6v7.5H4z"/><path d="M8.5 2.5V6H12"/>'),
   copy: _s('<rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/>'),
   play: _s('<path d="M5 3.8v8.4l7-4.2z"/>'),
+  update: _s('<path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/>'),
 };
 
 // ---- Extension host -> webview --------------------------------------------
@@ -132,6 +133,7 @@ export type TimelineItem =
 
 export type FromWebview =
   | { type: "ready" }
+  | { type: "checkUpdate" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }

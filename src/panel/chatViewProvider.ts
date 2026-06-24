@@ -142,13 +142,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     view.webview.html = this.sidebarHtml(view.webview);
     view.webview.onDidReceiveMessage((m: FromWebview) => this.onMessage(m));
     view.onDidChangeVisibility(() => {
-      if (view.visible) this.post2(view.webview, { kind: "sessions", list: this.store.list(), activeId: this.activeSessionId });
+      if (view.visible) {
+        this.post2(view.webview, { kind: "sessions", list: this.store.list(), activeId: this.activeSessionId });
+        this.postUpdateDot();
+      }
     });
   }
 
   /** Post to a specific webview (used to keep the sidebar's session list in sync). */
   private post2(target: vscode.Webview | undefined, e: ToWebview): void {
     target?.postMessage(e);
+  }
+
+  /** Light up the red "update available" dot on the left sidebar's update button. */
+  private postUpdateDot(): void {
+    if (this.updateAvailable) {
+      this.view?.webview.postMessage({ kind: "update_available", version: this.updateAvailable });
+    }
   }
 
   /** Broadcast the session list to both the sidebar manager and the chat panel. */
@@ -286,7 +296,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.restoreLastOrActive();
           this.postActiveFile();
-          if (this.updateAvailable) this.post({ kind: "update_available", version: this.updateAvailable });
           break;
         case "checkUpdate":
           await this.checkForUpdate();
@@ -308,6 +317,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "listSessions":
           this.refreshSessions();
+          this.postUpdateDot();
           break;
         case "switchSession":
           await this.switchSession(m.sessionId);
@@ -824,10 +834,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     // Newer version available.
-    this.updateAvailable = remote; // remembered so the dot re-appears when a webview opens
+    this.updateAvailable = remote; // remembered so the dot re-appears when the sidebar opens
     if (silent) {
-      // Auto-check: just flag the update button with a red dot, no popup.
-      this.post({ kind: "update_available", version: remote });
+      // Auto-check: just flag the left sidebar's update button with a red dot.
+      this.postUpdateDot();
       return;
     }
     const pick = await vscode.window.showInformationMessage(
@@ -1136,6 +1146,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .abtn.primary { color: var(--vscode-button-background); font-weight: 600; }
   .abtn.danger { color: var(--vscode-errorForeground, #e55); }
   .abtn.hidden { display: none; }
+  #upd { position: relative; }
+  #upd svg { width: 14px; height: 14px; vertical-align: -2px; }
+  #upd.has-update::after { content: ""; position: absolute; top: 1px; right: 2px; width: 7px; height: 7px; border-radius: 50%; background: #e5534b; border: 1.5px solid var(--vscode-sideBar-background); }
   .new { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); border-radius: 7px; background: none; color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
   .new:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
   .new svg { width: 15px; height: 15px; }
@@ -1165,6 +1178,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div class="head">
     <span class="ttl">会话</span>
     <span class="sp"></span>
+    <button id="upd" class="abtn" title="检查更新">${ICONS.update}</button>
     <button id="multi" class="abtn" title="多选">多选</button>
     <button id="delsel" class="abtn danger hidden">删除所选</button>
   </div>
@@ -1239,6 +1253,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       render();
     });
     $("delsel").addEventListener("click", () => confirmDel([...sel]));
+    $("upd").addEventListener("click", () => { $("upd").classList.remove("has-update"); vscode.postMessage({ type: "checkUpdate" }); });
 
     window.addEventListener("message", (ev) => {
       const m = ev.data;
@@ -1247,6 +1262,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
         $("delsel").classList.toggle("hidden", sel.size === 0);
         render();
+      } else if (m && m.kind === "update_available") {
+        $("upd").classList.add("has-update");
+        $("upd").title = "发现新版本 v" + m.version + " · 点击更新";
       }
     });
     vscode.postMessage({ type: "listSessions" });
@@ -1288,7 +1306,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <header id="toolbar">
       <div class="title"><span id="session-title">新对话</span></div>
       <div class="spacer"></div>
-      <button id="btn-update" class="icon-btn" title="检查更新">${ICONS.update}</button>
       <button id="btn-sessions" class="icon-btn" title="历史会话">${ICONS.sessions}</button>
       <button id="btn-new" class="icon-btn" title="新建会话">${ICONS.newChat}</button>
     </header>

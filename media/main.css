@@ -46,13 +46,6 @@ html, body {
 }
 .icon-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.2)); }
 .icon-btn { display: inline-flex; align-items: center; justify-content: center; position: relative; }
-/* Red dot on the update button when a newer version is available */
-#btn-update.has-update::after {
-  content: ""; position: absolute; top: 2px; right: 3px;
-  width: 7px; height: 7px; border-radius: 50%;
-  background: #e5534b;
-  border: 1.5px solid var(--vscode-sideBarSectionHeader-background, var(--vscode-sideBar-background, #1e1e1e));
-}
 
 /* unified minimal-line icon sizing across all buttons */
 .icon-btn svg { width: 16px; height: 16px; }

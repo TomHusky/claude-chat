@@ -49,6 +49,7 @@ export type ToWebview =
     }
   | { kind: "permission_resolved"; requestId: string; behavior: "allow" | "deny"; auto?: boolean }
   | { kind: "tokens"; output: number }
+  | { kind: "context"; used: number; total: number }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
@@ -90,6 +91,18 @@ export interface CheckpointSummary {
   createdAt: number;
   userText: string;
   fileCount: number;
+}
+
+/** Context window (tokens) for a given Claude model, used by the usage gauge.
+ *  The CLI doesn't report the window, so map by model id; the 4.x family runs an
+ *  extended 1M context in Claude Code. `used` is a safety floor: if the observed
+ *  prompt already exceeds the mapped window, lift to 1M so we never show >100%. */
+export function contextWindowFor(model?: string, used = 0): number {
+  const m = (model || "").toLowerCase();
+  let win = 200_000;
+  if (/(opus|sonnet|haiku)-4|claude-4|fable/.test(m)) win = 1_000_000;
+  if (used > win) win = 1_000_000;
+  return win;
 }
 
 /** Sentinels wrapping the auto-embedded "attached files" context inside a user

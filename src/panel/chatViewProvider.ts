@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
-import { ChangedFile, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, ToWebview } from "../shared";
+import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, ToWebview } from "../shared";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
@@ -728,6 +728,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const items = this.store.load(sid);
     const title = this.store.list().find((s) => s.id === sid)?.title;
     this.post({ kind: "load_history", items, sessionId: sid, title, checkpoints: this.checkpoints.list() });
+    this.postSessionContext(sid);
     this.refreshSessions();
     this.refreshChangedFiles();
   }
@@ -778,9 +779,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.context.workspaceState.update(LAST_SESSION_KEY, sessionId);
     const items = this.store.load(sessionId);
     this.post({ kind: "load_history", items, sessionId, checkpoints: this.checkpoints.list() });
+    this.postSessionContext(sessionId);
     this.refreshSessions();
     this.refreshChangedFiles();
     this.reveal();
+  }
+
+  /** Post the context-usage gauge value for a loaded session (from its transcript). */
+  private postSessionContext(sid: string): void {
+    const u = this.store.lastContextUsage(sid);
+    if (u && u.used > 0) this.post({ kind: "context", used: u.used, total: contextWindowFor(u.model, u.used) });
   }
 
   // -- Helpers -------------------------------------------------------------
@@ -1202,6 +1210,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <button id="btn-attach-file" class="composer-btn" title="附加文件/目录到会话">${ICONS.attach}</button>
           <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
           <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji">⚡</span><span id="mode-label">Auto</span></button>
+          <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
           <div class="spacer"></div>
           <button id="btn-send" class="composer-send" title="发送">${ICONS.send}</button>
           <button id="btn-stop" class="composer-send stop hidden" title="停止">${ICONS.stop}</button>

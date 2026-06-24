@@ -700,6 +700,28 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 }
 .chip-x { background: transparent; border: none; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; }
 
+/* Circular context-usage gauge (right of the mode picker) */
+.ctx-gauge {
+  flex: 0 0 auto; position: relative; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center; cursor: default;
+}
+.ctx-gauge.hidden { display: none; }
+.cg-ring {
+  position: relative; width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: conic-gradient(var(--cg-color, #d97757) calc(var(--pct, 0) * 1%), rgba(128,128,128,.28) 0);
+}
+.cg-ring::before {
+  content: ""; position: absolute; inset: 2px; border-radius: 50%;
+  background: var(--vscode-input-background, var(--vscode-sideBar-background));
+}
+.cg-pct {
+  position: relative; font-size: 8px; line-height: 1; font-variant-numeric: tabular-nums;
+  color: var(--vscode-descriptionForeground);
+}
+/* warn colors as usage climbs */
+.ctx-gauge { --cg-color: #d97757; }
+
 /* The bordered composer box: textarea on top, controls row beneath */
 .input-wrap {
   display: flex;

@@ -13,7 +13,7 @@ import {
   SystemInitEvent,
   ToolUseBlock,
 } from "./protocol";
-import { PermissionSuggestionView, ToWebview } from "../shared";
+import { contextWindowFor, PermissionSuggestionView, ToWebview } from "../shared";
 
 export interface ClaudeProcessOptions {
   claudePath: string;
@@ -67,6 +67,7 @@ export class ClaudeProcess {
   private currentToolId?: string; // tool_use block currently streaming its input JSON
   private currentToolName?: string;
   private currentToolJson = ""; // accumulated partial input JSON for the live tool
+  private currentModel?: string; // model id from the init event (for context window)
   private busy = false;
   private readonly seenToolIds = new Set<string>();
 
@@ -343,6 +344,7 @@ export class ClaudeProcess {
   private handleSystem(ev: SystemInitEvent): void {
     if (ev.subtype === "init") {
       const resumed = !!this.opts.resumeSessionId;
+      this.currentModel = ev.model;
       this.sessionId = ev.session_id;
       this.hooks.onSessionId(ev.session_id, resumed);
       this.hooks.emit({
@@ -363,8 +365,17 @@ export class ClaudeProcess {
     const e = ev.event as any;
     switch (e.type) {
       case "message_start": {
-        const out = e.message?.usage?.output_tokens;
-        if (typeof out === "number") this.hooks.emit({ kind: "tokens", output: out });
+        const u = e.message?.usage;
+        if (u) {
+          if (typeof u.output_tokens === "number") this.hooks.emit({ kind: "tokens", output: u.output_tokens });
+          // Context size = full prompt this request: fresh input + cached history.
+          const used =
+            (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+          if (used > 0) {
+            const model = e.message?.model || this.currentModel;
+            this.hooks.emit({ kind: "context", used, total: contextWindowFor(model, used) });
+          }
+        }
         return;
       }
       case "message_delta": {

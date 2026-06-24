@@ -313,6 +313,22 @@ function onTokens(output: number) {
   const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
   if (tk) tk.textContent = turnTokens > 0 ? `${fmtTokens(turnTokens)} tokens` : "";
 }
+
+const ctxGauge = $("ctx-gauge");
+/** Circular context-usage gauge next to the mode picker (hidden below 10%). */
+function updateContextGauge(used: number, total: number) {
+  const pct = Math.max(0, Math.min(100, Math.round((used / total) * 100)));
+  if (pct < 10) {
+    ctxGauge.classList.add("hidden");
+    return;
+  }
+  ctxGauge.classList.remove("hidden");
+  ctxGauge.style.setProperty("--pct", String(pct));
+  ctxGauge.style.setProperty("--cg-color", pct >= 85 ? "#e5534b" : pct >= 60 ? "#e0a33e" : "#d97757");
+  const lbl = ctxGauge.querySelector(".cg-pct") as HTMLElement | null;
+  if (lbl) lbl.textContent = String(pct);
+  ctxGauge.title = `上下文使用 ${pct}%（约 ${fmtTokens(used)} / ${fmtTokens(total)} tokens）`;
+}
 function startTick() {
   if (tickTimer) return;
   tickTimer = window.setInterval(() => {
@@ -360,6 +376,9 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break; // thinking text is not displayed (only its token count, via "tokens")
     case "tokens":
       onTokens(m.output);
+      break;
+    case "context":
+      updateContextGauge(m.used, m.total);
       break;
     case "tool_input":
       updateToolInput(m.toolId, m.name, m.input);
@@ -682,6 +701,7 @@ function renderHistory(showAll: boolean) {
   liveBlock = null;
   lastUserEl = null;
   userMsgCount = 0;
+  ctxGauge.classList.add("hidden"); // refreshes from the next turn's usage
 
   // Align checkpoints to the trailing user messages (tracking may start mid-session).
   const userTotal = items.filter((i) => i.type === "user").length;

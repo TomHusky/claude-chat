@@ -140,6 +140,28 @@ export class SessionStore {
     return items;
   }
 
+  /** Approx context used by a session = the last assistant message's full prompt
+   *  (input + cached) plus its output, along with that message's model id (so the
+   *  caller can pick the right context window). Undefined if no usage found. */
+  lastContextUsage(sessionId: string): { used: number; model?: string } | undefined {
+    const file = this.findFile(sessionId);
+    if (!file) return undefined;
+    let result: { used: number; model?: string } | undefined;
+    for (const o of this.readLines(file)) {
+      const msg = (o as any)?.message;
+      const u = msg?.usage;
+      if (o.type === "assistant" && u) {
+        const v =
+          (u.input_tokens || 0) +
+          (u.cache_read_input_tokens || 0) +
+          (u.cache_creation_input_tokens || 0) +
+          (u.output_tokens || 0);
+        if (v > 0) result = { used: v, model: msg?.model };
+      }
+    }
+    return result;
+  }
+
   /** Number of non-empty lines in a session transcript (0 if not yet written). */
   countLines(sessionId: string): number {
     const file = this.findFile(sessionId);

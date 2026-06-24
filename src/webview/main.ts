@@ -380,6 +380,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "context":
       updateContextGauge(m.used, m.total);
       break;
+    case "update_available": {
+      const b = $("btn-update");
+      b.classList.add("has-update");
+      b.title = `发现新版本 v${m.version} · 点击更新`;
+      break;
+    }
     case "tool_input":
       updateToolInput(m.toolId, m.name, m.input);
       break;
@@ -1465,7 +1471,10 @@ $("btn-sessions").onclick = () => {
   send({ type: "listSessions" });
   openDrawer(sessionsPanel);
 };
-$("btn-update").onclick = () => send({ type: "checkUpdate" });
+$("btn-update").onclick = () => {
+  $("btn-update").classList.remove("has-update"); // acting on it clears the dot
+  send({ type: "checkUpdate" });
+};
 overlay.onclick = closeDrawers;
 document.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = closeDrawers));
 

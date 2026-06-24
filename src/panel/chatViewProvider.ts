@@ -29,6 +29,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private webviewReady = false;
   private pendingContext?: string;
   private forceBlank = false; // next panel-ready should show a blank new session
+  private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -285,6 +286,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.restoreLastOrActive();
           this.postActiveFile();
+          if (this.updateAvailable) this.post({ kind: "update_available", version: this.updateAvailable });
           break;
         case "checkUpdate":
           await this.checkForUpdate();
@@ -821,6 +823,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (!silent) vscode.window.showInformationMessage(`已是最新版本 v${local}`);
       return;
     }
+    // Newer version available.
+    this.updateAvailable = remote; // remembered so the dot re-appears when a webview opens
+    if (silent) {
+      // Auto-check: just flag the update button with a red dot, no popup.
+      this.post({ kind: "update_available", version: remote });
+      return;
+    }
     const pick = await vscode.window.showInformationMessage(
       `发现新版本 v${remote}（当前 v${local}）`,
       "下载并安装",
@@ -840,6 +849,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.showErrorMessage(`更新失败：${String((err as Error)?.message ?? err)}`);
       return;
     }
+    this.updateAvailable = undefined; // installed — clear the pending-update flag
     const reload = await vscode.window.showInformationMessage(`已更新到 v${remote}，重新加载窗口后生效。`, "重新加载");
     if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
   }

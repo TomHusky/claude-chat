@@ -163,9 +163,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Broadcast the session list to both the sidebar manager and the chat panel. */
   private refreshSessions(): void {
-    const e: ToWebview = { kind: "sessions", list: this.store.list(), activeId: this.activeSessionId };
+    const list = this.store.list();
+    const e: ToWebview = { kind: "sessions", list, activeId: this.activeSessionId };
     this.view?.webview.postMessage(e);
     this.panel?.webview.postMessage(e);
+    this.setPanelTitle(list.find((s) => s.id === this.activeSessionId)?.title);
+  }
+
+  /** Show the active conversation's title on the editor tab (falls back to brand). */
+  private setPanelTitle(title?: string): void {
+    if (this.panel) this.panel.title = title?.trim() || "ClaudeCopilot";
   }
 
   /** Open the chat as an editor-area panel (like Claude Code) — opens beside the
@@ -697,6 +704,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (e.kind === "result" || (e.kind === "tool_result" && !e.isError)) {
       this.refreshChangedFiles();
     }
+    // After a turn, a new session's title becomes available — sync list + tab title.
+    if (e.kind === "result") this.refreshSessions();
   }
 
   private onPermission(req: PermissionRequest): void {
@@ -762,6 +771,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.activeSessionId = undefined;
     this.checkpoints.clear();
     this.post({ kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+    this.setPanelTitle("新对话");
     this.refreshChangedFiles();
     this.reveal();
   }

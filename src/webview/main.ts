@@ -303,15 +303,32 @@ function updateActiveLine() {
 
 // -- Shared 1s ticker: updates the "Thinking · Ns · N tokens" pill ------------
 let tickTimer = 0;
-let turnTokens = 0; // running output-token count for the current turn
+let turnTokens = 0; // exact output tokens (only arrives at each message's end)
+let turnEst = 0; // live estimate from streamed chars (the CLI doesn't stream counts)
 function fmtTokens(n: number): string {
   return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
 }
-function onTokens(output: number) {
-  // output_tokens is cumulative per assistant message; keep the max this turn.
-  turnTokens = Math.max(turnTokens, output);
+function setPillTokens() {
+  const n = Math.max(turnTokens, Math.round(turnEst));
   const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
-  if (tk) tk.textContent = turnTokens > 0 ? `${fmtTokens(turnTokens)} tokens` : "";
+  if (tk) tk.textContent = n > 0 ? `${fmtTokens(n)} tokens` : "";
+}
+function onTokens(output: number) {
+  // Exact cumulative output tokens for a message — only sent once, at its end.
+  turnTokens = Math.max(turnTokens, output);
+  setPillTokens();
+}
+/** The CLI only reports tokens at message end, so estimate live from streamed
+ *  text (CJK ≈ 1 token/char, latin ≈ 1 token/4 chars) for a growing counter. */
+function addStreamEst(text: string) {
+  let cjk = 0;
+  let other = 0;
+  for (const ch of text) {
+    if ((ch.codePointAt(0) || 0) >= 0x3000) cjk++;
+    else other++;
+  }
+  turnEst += cjk * 1.05 + other / 4;
+  setPillTokens();
 }
 
 const ctxGauge = $("ctx-gauge");
@@ -373,7 +390,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       onTextDelta(m.text);
       break;
     case "thinking_delta":
-      break; // thinking text is not displayed (only its token count, via "tokens")
+      addStreamEst(m.text); // not displayed, but grows the live token estimate
+      break;
     case "tokens":
       onTokens(m.output);
       break;
@@ -467,6 +485,7 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
 }
 
 function onTextDelta(text: string) {
+  addStreamEst(text); // keep the running token estimate growing
   removeWorking();
   if (!liveBlock) onBlockStart("text");
   liveBlock!.raw += text;
@@ -1099,7 +1118,8 @@ function doSend() {
 function performSend(p: QueueItem) {
   appendUser(p.text, p.labels, p.imageUris);
   finalizeTurn();
-  turnTokens = 0; // reset token counter for the new turn
+  turnTokens = 0; // reset token counters for the new turn
+  turnEst = 0;
   isBusy = true;
   showWorking(); // instant feedback (the busy event confirms it a moment later)
   if (assistantEl) assistantEl.classList.add("streaming-turn");

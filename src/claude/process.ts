@@ -64,6 +64,9 @@ export class ClaudeProcess {
   private initialized = false;
   private disposed = false;
   private currentBlockType?: "text" | "thinking" | "tool_use";
+  private currentToolId?: string; // tool_use block currently streaming its input JSON
+  private currentToolName?: string;
+  private currentToolJson = ""; // accumulated partial input JSON for the live tool
   private busy = false;
   private readonly seenToolIds = new Set<string>();
 
@@ -377,6 +380,9 @@ export class ClaudeProcess {
           this.hooks.emit({ kind: "block_start", blockType: t });
         } else if (t === "tool_use") {
           this.currentBlockType = "tool_use";
+          this.currentToolId = e.content_block.id;
+          this.currentToolName = e.content_block.name;
+          this.currentToolJson = "";
           // Card is rendered from the assistant event (has parsed input);
           // announce it now for immediate "running" feedback.
           this.hooks.emit({
@@ -392,10 +398,23 @@ export class ClaudeProcess {
         const d = e.delta;
         if (d.type === "text_delta") this.hooks.emit({ kind: "text_delta", text: d.text });
         else if (d.type === "thinking_delta") this.hooks.emit({ kind: "thinking_delta", text: d.thinking });
+        else if (d.type === "input_json_delta" && this.currentToolId) {
+          // Stream the tool's input JSON so the UI can show the file/lines live.
+          this.currentToolJson += (d as { partial_json?: string }).partial_json ?? "";
+          this.hooks.emit({
+            kind: "tool_input_partial",
+            toolId: this.currentToolId,
+            name: this.currentToolName || "tool",
+            json: this.currentToolJson,
+          });
+        }
         return;
       }
       case "content_block_stop":
         this.currentBlockType = undefined;
+        this.currentToolId = undefined;
+        this.currentToolName = undefined;
+        this.currentToolJson = "";
         return;
       default:
         return;

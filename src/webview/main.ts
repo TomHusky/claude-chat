@@ -361,6 +361,9 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "tool_input":
       updateToolInput(m.toolId, m.name, m.input);
       break;
+    case "tool_input_partial":
+      updateToolPartial(m.toolId, m.name, m.json);
+      break;
     case "tool_result":
       setToolResult(m.toolUseId, m.content, m.isError);
       break;
@@ -502,6 +505,37 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
       (name === "Bash" ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play} 执行</button>` : "") +
       `<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button>`;
   }
+}
+
+/** Live update while a tool's input JSON is still streaming — show the target
+ *  file and a growing line count so an Edit/Write is visible before it finishes. */
+function updateToolPartial(toolId: string, name: string, json: string) {
+  const card = toolCards.get(toolId);
+  if (!card) return;
+  const sub = card.querySelector(".tool-sub") as HTMLElement | null;
+  if (!sub) return;
+  // Tolerant extraction of the target file path (needs its closing quote).
+  const fpm = /"(?:file_path|notebook_path|path)"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(json);
+  if (!fpm) return; // path hasn't fully streamed in yet
+  const fp = fpm[1].replace(/\\(["\\/])/g, "$1");
+  const rel = shortPath(fp);
+  // Live line count of the content being written (new_string for Edit, content for Write).
+  let lines = 0;
+  const key = name === "Write" ? "content" : "new_string";
+  const km = new RegExp(`"${key}"\\s*:\\s*"`).exec(json);
+  if (km) {
+    let body = json.slice(km.index + km[0].length).replace(/"\s*[,}]?\s*$/, "");
+    lines = (body.match(/\\n/g) || []).length + 1;
+  }
+  const extra = lines > 0 ? ` <span class="muted">编辑 ${lines} 行…</span>` : ` <span class="muted">编辑中…</span>`;
+  if (FILE_VIEW_TOOLS.has(name)) {
+    const cls = DIFF_TOOLS.has(name) ? "file-chip diff-chip" : "file-chip";
+    const action = DIFF_TOOLS.has(name) ? "diff" : "open";
+    sub.innerHTML = `<a class="${cls}" data-action="${action}" data-path="${escapeHtml(fp)}">${escapeHtml(rel)}</a>${extra}`;
+  } else {
+    sub.textContent = rel;
+  }
+  maybeScroll();
 }
 
 function setToolResult(toolUseId: string, content: string, isError: boolean) {
@@ -987,24 +1021,32 @@ function onCheckpointMarker(checkpointId: string) {
 // ---------------------------------------------------------------------------
 // Composer
 // ---------------------------------------------------------------------------
-function doSend() {
-  if (isBusy) return; // a turn is in progress; wait or press stop
+interface QueueItem {
+  text: string;
+  context?: string;
+  images: { mediaType: string; data: string }[];
+  files: string[];
+  labels: string[];
+  imageUris: string[];
+}
+const taskQueue: QueueItem[] = [];
+const taskQueueEl = $("task-queue");
+
+/** Snapshot the composer into a sendable payload (null if nothing to send). */
+function readComposer(): QueueItem | null {
   const text = inputEl.value.trim();
-  if (!text && !pendingImages.length) return;
-  const context = pendingContexts.map((c) => c.text).join("\n\n") || undefined;
-  const images = pendingImages.map((p) => ({ mediaType: p.mediaType, data: p.data }));
-  const files = attachedFiles.map((f) => f.path);
-  appendUser(
+  if (!text && !pendingImages.length) return null;
+  return {
     text,
-    [...pendingContexts.map((c) => c.label), ...attachedFiles.map((f) => baseName(f.path))],
-    pendingImages.map((p) => p.uri),
-  );
-  finalizeTurn();
-  turnTokens = 0; // reset token counter for the new turn
-  isBusy = true;
-  showWorking(); // instant feedback (the busy event confirms it a moment later)
-  if (assistantEl) assistantEl.classList.add("streaming-turn");
-  send({ type: "send", text, context, images: images.length ? images : undefined, files: files.length ? files : undefined });
+    context: pendingContexts.map((c) => c.text).join("\n\n") || undefined,
+    images: pendingImages.map((p) => ({ mediaType: p.mediaType, data: p.data })),
+    files: attachedFiles.map((f) => f.path),
+    labels: [...pendingContexts.map((c) => c.label), ...attachedFiles.map((f) => baseName(f.path))],
+    imageUris: pendingImages.map((p) => p.uri),
+  };
+}
+
+function clearComposer() {
   inputEl.value = "";
   autoResize();
   clearContextChips();
@@ -1014,6 +1056,71 @@ function doSend() {
   attachedFiles = [];
   autoDismissed = false;
   onActiveFile(autoPath);
+}
+
+function doSend() {
+  const payload = readComposer();
+  if (!payload) return;
+  clearComposer();
+  if (isBusy) {
+    // A turn is running — queue this one to auto-run after the current finishes.
+    taskQueue.push(payload);
+    renderQueue();
+    return;
+  }
+  performSend(payload);
+}
+
+/** Actually start a turn from a payload (used for live sends and queued ones). */
+function performSend(p: QueueItem) {
+  appendUser(p.text, p.labels, p.imageUris);
+  finalizeTurn();
+  turnTokens = 0; // reset token counter for the new turn
+  isBusy = true;
+  showWorking(); // instant feedback (the busy event confirms it a moment later)
+  if (assistantEl) assistantEl.classList.add("streaming-turn");
+  send({
+    type: "send",
+    text: p.text,
+    context: p.context,
+    images: p.images.length ? p.images : undefined,
+    files: p.files.length ? p.files : undefined,
+  });
+}
+
+/** When the current turn ends, auto-run the next queued task (if any). */
+function flushQueue() {
+  if (isBusy || !taskQueue.length) return;
+  const next = taskQueue.shift()!;
+  renderQueue();
+  performSend(next);
+}
+
+function renderQueue() {
+  if (!taskQueue.length) {
+    taskQueueEl.classList.add("hidden");
+    taskQueueEl.innerHTML = "";
+    return;
+  }
+  taskQueueEl.classList.remove("hidden");
+  taskQueueEl.innerHTML = "";
+  const head = el("div", "tq-head", `排队中 · ${taskQueue.length}`);
+  taskQueueEl.appendChild(head);
+  taskQueue.forEach((item, i) => {
+    const row = el("div", "tq-row");
+    row.append(el("span", "tq-idx", String(i + 1)));
+    const txt = el("span", "tq-text", item.text || "(图片)");
+    row.appendChild(txt);
+    if (item.labels.length) row.appendChild(el("span", "tq-chips", item.labels.join(" · ")));
+    const del = el("button", "tq-del", "×");
+    del.title = "从队列移除";
+    del.onclick = () => {
+      taskQueue.splice(i, 1);
+      renderQueue();
+    };
+    row.appendChild(del);
+    taskQueueEl.appendChild(row);
+  });
 }
 
 sendBtn.onclick = doSend;
@@ -1027,15 +1134,6 @@ inputEl.addEventListener("keydown", (e) => {
   }
 });
 inputEl.addEventListener("input", autoResize);
-// Warm up the CLI process as soon as the user engages the input, so the first
-// message doesn't pay the cold-start cost.
-let warmed = false;
-inputEl.addEventListener("focus", () => {
-  if (!warmed) {
-    warmed = true;
-    send({ type: "warm" });
-  }
-});
 function autoResize() {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
@@ -1515,6 +1613,9 @@ function setBusy(busy: boolean) {
     if (assistantEl) assistantEl.classList.add("streaming-turn");
   } else {
     removeWorking();
+    // Turn finished — kick off the next queued task (slight delay so the result
+    // UI settles and the process is idle before resuming).
+    if (taskQueue.length) setTimeout(flushQueue, 150);
   }
   if (!busy && !statusLine.textContent?.startsWith("完成")) statusLine.textContent = "";
 }

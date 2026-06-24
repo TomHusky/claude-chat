@@ -35,6 +35,7 @@ export type ToWebview =
   | { kind: "text_delta"; text: string }
   | { kind: "thinking_delta"; text: string }
   | { kind: "tool_input"; toolId: string; name: string; displayName?: string; input: Record<string, unknown> }
+  | { kind: "tool_input_partial"; toolId: string; name: string; json: string }
   | { kind: "tool_result"; toolUseId: string; content: string; isError: boolean }
   | {
       kind: "permission_request";
@@ -118,7 +119,6 @@ export type TimelineItem =
 
 export type FromWebview =
   | { type: "ready" }
-  | { type: "warm" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }

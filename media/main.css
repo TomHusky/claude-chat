@@ -507,6 +507,34 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .diff .add { background: rgba(115,201,145,.12); border-left: 3px solid #73c991; }
 .tool-result summary { cursor: pointer; font-size: 11.5px; color: var(--vscode-descriptionForeground); }
 
+/* ---- Task queue (messages waiting to auto-run after the current turn) ---- */
+.task-queue {
+  display: flex; flex-direction: column; gap: 5px;
+  margin-bottom: 8px; padding: 7px 9px;
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.3));
+  border-radius: 8px; background: rgba(128,128,128,.05);
+  max-height: 168px; overflow-y: auto;
+}
+.task-queue.hidden { display: none; }
+.tq-head { font-size: 11px; font-weight: 600; color: var(--vscode-descriptionForeground); }
+.tq-row { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.tq-idx {
+  flex: 0 0 auto; width: 16px; height: 16px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; background: rgba(128,128,128,.25); color: var(--vscode-foreground);
+}
+.tq-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tq-chips {
+  flex: 0 1 auto; max-width: 38%; font-size: 10.5px; color: var(--vscode-descriptionForeground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tq-del {
+  flex: 0 0 auto; background: transparent; border: none; cursor: pointer;
+  color: var(--vscode-descriptionForeground); font-size: 15px; line-height: 1;
+  padding: 0 3px; border-radius: 4px;
+}
+.tq-del:hover { color: var(--vscode-errorForeground, #e55); background: rgba(128,128,128,.15); }
+
 /* ---- Permission box (grouped with the operation, calm gray styling) ---- */
 .perm-bar {
   display: flex; flex-direction: column; gap: 10px;

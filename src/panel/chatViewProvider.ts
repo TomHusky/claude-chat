@@ -420,6 +420,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "openSymbol":
           await this.openSymbol(m.name);
           break;
+        case "validateRefs": {
+          const invalid = m.refs.filter((r) => !this.fileRefExists(r.path)).map((r) => r.id);
+          if (invalid.length) this.post({ kind: "refs_validated", invalid });
+          break;
+        }
         case "copy":
           await vscode.env.clipboard.writeText(m.text);
           break;
@@ -923,6 +928,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // -- Helpers -------------------------------------------------------------
+
+  /** Does a file ref (path, optionally with `:line`) point at a real file? */
+  private fileRefExists(ref: string): boolean {
+    const p = ref.replace(/:\d+(?:-\d+)?$/, "").trim();
+    if (!p) return false;
+    const candidates = path.isAbsolute(p)
+      ? [p]
+      : [path.join(this.cwd(), p), ...this.workspaceDirs().map((d) => path.join(d, p))];
+    return candidates.some((c) => {
+      try {
+        return fs.statSync(c).isFile();
+      } catch {
+        return false;
+      }
+    });
+  }
 
   private async openFile(p: string, line?: number, endLine?: number): Promise<void> {
     try {

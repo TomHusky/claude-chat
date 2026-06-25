@@ -402,6 +402,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "context":
       updateContextGauge(m.used, m.total);
       break;
+    case "refs_validated":
+      for (const id of m.invalid) {
+        const e = messagesEl.querySelector(`[data-ref-id="${id}"]`) as HTMLElement | null;
+        if (e) unlinkRef(e);
+      }
+      break;
     case "tool_input":
       updateToolInput(m.toolId, m.name, m.input);
       break;
@@ -1074,6 +1080,26 @@ function linkifyRefs(container: HTMLElement) {
     if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
     tn.replaceWith(frag);
   }
+  // 3) Verify file refs actually exist — non-existent ones get unlinked so we
+  //    don't show dead "jump to file" links.
+  const fileRefs = container.querySelectorAll<HTMLElement>('.code-ref[data-action="open"]:not([data-ref-id])');
+  if (fileRefs.length) {
+    const refs: { id: string; path: string }[] = [];
+    fileRefs.forEach((e) => {
+      const id = "ref" + refSeq++;
+      e.dataset.refId = id;
+      refs.push({ id, path: e.dataset.path || "" });
+    });
+    send({ type: "validateRefs", refs });
+  }
+}
+
+let refSeq = 0;
+/** Strip the clickable-link affordance from a ref element (keeps plain text/code). */
+function unlinkRef(e: HTMLElement) {
+  e.classList.remove("code-ref");
+  for (const a of ["action", "path", "line", "endline", "symbol", "refId"]) delete e.dataset[a];
+  e.removeAttribute("title");
 }
 
 function renderChangedFiles(

@@ -54,6 +54,7 @@ export type ToWebview =
   | { kind: "tokens"; output: number }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
+  | { kind: "refs_validated"; invalid: string[] }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
@@ -163,5 +164,6 @@ export type FromWebview =
   | { type: "revertAll" }
   | { type: "openFile"; path: string; line?: number; endLine?: number }
   | { type: "openSymbol"; name: string }
+  | { type: "validateRefs"; refs: { id: string; path: string }[] }
   | { type: "runInTerminal"; code: string }
   | { type: "copy"; text: string };

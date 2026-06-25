@@ -420,6 +420,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "permission":
           this.handlePermission(m.requestId, m.behavior, m.suggestionId);
           break;
+        case "answerQuestion":
+          this.proc?.answerQuestion(m.requestId, m.answers);
+          break;
         case "newSession":
           await this.startFreshSession();
           break;

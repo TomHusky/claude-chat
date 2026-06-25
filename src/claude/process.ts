@@ -184,6 +184,20 @@ export class ClaudeProcess {
     this.hooks.emit({ kind: "permission_resolved", requestId, behavior: decision.behavior });
   }
 
+  /** Answer an AskUserQuestion tool: echo the input plus an `answers` map
+   *  (question text -> chosen label / labels) so the CLI returns the selection. */
+  answerQuestion(requestId: string, answers: Record<string, string | string[]>): void {
+    const originalInput = this.pendingPermissions.get(requestId);
+    if (originalInput === undefined) return;
+    this.pendingPermissions.delete(requestId);
+    const response: PermissionDecision = {
+      behavior: "allow",
+      updatedInput: { ...(originalInput as Record<string, unknown>), answers },
+    };
+    this.write({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });
+    this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "allow" });
+  }
+
   /** Interrupt the current turn. */
   async interrupt(): Promise<void> {
     if (!this.proc) return;

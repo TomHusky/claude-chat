@@ -139,6 +139,7 @@ export type FromWebview =
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }
   | { type: "permission"; requestId: string; behavior: "allow" | "deny"; suggestionId?: string }
+  | { type: "answerQuestion"; requestId: string; answers: Record<string, string | string[]> }
   | { type: "newSession" }
   | { type: "listSessions" }
   | { type: "switchSession"; sessionId: string }

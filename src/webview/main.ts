@@ -659,6 +659,10 @@ function shortPath(p: string): string {
 // Permission (待确认) cards
 // ---------------------------------------------------------------------------
 function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>) {
+  if (m.toolName === "AskUserQuestion") {
+    renderQuestion(m);
+    return;
+  }
   let host = m.toolUseId ? toolCards.get(m.toolUseId) : undefined;
   if (!host) {
     host = createToolCard(ensureAssistant(), m.toolUseId || m.requestId, m.toolName);
@@ -684,6 +688,94 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
   }
   bar.append(label, actions);
   (host.querySelector(".tool-body") as HTMLElement).appendChild(bar);
+  scrollToBottom();
+}
+
+/** Render an AskUserQuestion tool as an interactive option picker. */
+function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
+  const body = ensureAssistant();
+  removeWorking();
+  const questions = ((m.input as { questions?: any[] })?.questions || []) as Array<{
+    question: string;
+    header?: string;
+    multiSelect?: boolean;
+    options?: Array<{ label: string; description?: string }>;
+  }>;
+  const wrap = el("div", "ask");
+  wrap.dataset.requestId = m.requestId;
+  const sel = questions.map(() => new Set<string>());
+
+  const submit = el("button", "ask-submit", "提交") as HTMLButtonElement;
+  const updateSubmit = () => (submit.disabled = sel.some((s) => s.size === 0));
+
+  questions.forEach((q, qi) => {
+    const qEl = el("div", "ask-q");
+    if (q.header) qEl.appendChild(el("div", "ask-head", String(q.header)));
+    qEl.appendChild(el("div", "ask-qtext", String(q.question || "")));
+    const opts = el("div", "ask-opts");
+    for (const o of q.options || []) {
+      const b = el("button", "ask-opt");
+      b.appendChild(el("div", "ask-opt-label", String(o.label)));
+      if (o.description) b.appendChild(el("div", "ask-opt-desc", String(o.description)));
+      b.onclick = () => {
+        if (q.multiSelect) {
+          if (sel[qi].has(o.label)) {
+            sel[qi].delete(o.label);
+            b.classList.remove("on");
+          } else {
+            sel[qi].add(o.label);
+            b.classList.add("on");
+          }
+        } else {
+          sel[qi].clear();
+          sel[qi].add(o.label);
+          opts.querySelectorAll(".ask-opt").forEach((x) => x.classList.remove("on"));
+          b.classList.add("on");
+        }
+        updateSubmit();
+      };
+      opts.appendChild(b);
+    }
+    qEl.appendChild(opts);
+    wrap.appendChild(qEl);
+  });
+
+  const replaceWithSummary = (answers: Record<string, string | string[]> | null) => {
+    const sum = el("div", "ask-summary");
+    if (answers) {
+      const parts = questions
+        .map((q) => {
+          const v = answers[q.question];
+          return Array.isArray(v) ? v.join("、") : v;
+        })
+        .filter(Boolean);
+      sum.textContent = "已选择：" + parts.join(" / ");
+    } else {
+      sum.textContent = "已跳过";
+    }
+    wrap.replaceWith(sum);
+  };
+
+  submit.onclick = () => {
+    const answers: Record<string, string | string[]> = {};
+    questions.forEach((q, qi) => {
+      const picks = [...sel[qi]];
+      answers[q.question] = q.multiSelect ? picks : picks[0] || "";
+    });
+    send({ type: "answerQuestion", requestId: m.requestId, answers });
+    replaceWithSummary(answers);
+  };
+  const skip = el("button", "ask-skip", "跳过");
+  skip.onclick = () => {
+    send({ type: "answerQuestion", requestId: m.requestId, answers: {} });
+    replaceWithSummary(null);
+  };
+
+  const actions = el("div", "ask-actions");
+  actions.append(submit, skip);
+  wrap.appendChild(actions);
+  updateSubmit();
+  body.appendChild(wrap);
   scrollToBottom();
 }
 

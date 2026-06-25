@@ -95,11 +95,17 @@ html, body {
 }
 .msg.user .md a { color: var(--vscode-button-foreground); text-decoration: underline; }
 
-/* click the user bubble to edit it */
-.msg.user .msg-body { cursor: pointer; transition: filter .12s; }
-.msg.user .msg-body:hover { filter: brightness(1.1); }
-.msg.user .msg-body.editing { cursor: auto; }
-.msg.user .msg-body.editing:hover { filter: none; }
+/* "重新生成" button at the bottom of an assistant reply */
+.msg-actions { margin-top: 9px; display: flex; gap: 6px; }
+.msg-regen {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: transparent; cursor: pointer;
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.3));
+  color: var(--vscode-descriptionForeground);
+  border-radius: 6px; padding: 3px 10px; font-size: 11.5px;
+}
+.msg-regen:hover { color: var(--vscode-foreground); background: rgba(128,128,128,.12); }
+.msg-regen svg { width: 13px; height: 13px; }
 
 /* inline edit mode — full width, no accent bubble */
 .msg.user .msg-body.editing {

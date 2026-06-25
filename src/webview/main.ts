@@ -197,6 +197,17 @@ function finalizeTurn() {
       const last = segs[segs.length - 1];
       if (last && body.firstElementChild !== last) last.classList.add("summary-node");
       endTimelineAtLastNode(assistantEl); // stop the line at the last node
+      // Footer with a "重新生成" button at the bottom of the reply.
+      if (!body.querySelector(".msg-actions")) {
+        const aEl = assistantEl;
+        const acts = el("div", "msg-actions");
+        const regen = el("button", "msg-regen");
+        regen.innerHTML = `${ICON.update}<span>重新生成</span>`;
+        regen.title = "重新生成这条回复";
+        regen.onclick = () => regenerate(aEl);
+        acts.appendChild(regen);
+        body.appendChild(acts);
+      }
     }
   }
   assistantEl = null;
@@ -1701,14 +1712,6 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
   const msg = el("div", "msg user");
   msg.dataset.rawText = text;
   const body = el("div", "msg-body");
-  body.title = "点击编辑并重发（会回撤其后的对话）";
-  // Click the message to edit it directly (but let links / images / selection through).
-  body.addEventListener("click", (e) => {
-    const t = e.target as HTMLElement;
-    if (t.closest("a") || t.closest("img") || t.closest("button") || t.closest("textarea")) return;
-    if (window.getSelection()?.toString()) return;
-    enterEditMode(msg);
-  });
   if (contextLabels.length) {
     const ctx = el("div", "user-context");
     for (const l of contextLabels) ctx.appendChild(el("span", "ctx-chip", l));
@@ -1732,50 +1735,25 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
   return msg;
 }
 
-/** Click ✎ on a user message: edit it inline. Sending rewinds the conversation
- *  to before that message (truncate + revert files) and resends the new text. */
-function enterEditMode(msg: HTMLElement) {
+/** The user message that prompted a given assistant turn (walks back past dividers). */
+function precedingUserMsg(aEl: HTMLElement): HTMLElement | null {
+  let n = aEl.previousElementSibling as HTMLElement | null;
+  while (n) {
+    if (n.classList?.contains("msg") && n.classList.contains("user")) return n;
+    n = n.previousElementSibling as HTMLElement | null;
+  }
+  return null;
+}
+
+/** Re-run the user message that produced this reply: rewind to before it
+ *  (truncate transcript + revert files) and resend the same text. */
+function regenerate(aEl: HTMLElement) {
   if (isBusy) return;
-  const body = msg.querySelector(".msg-body") as HTMLElement;
-  if (!body || body.classList.contains("editing")) return;
-  const raw = msg.dataset.rawText || "";
-  const checkpointId = msg.dataset.checkpointId || "";
-  const prevHTML = body.innerHTML;
-  body.classList.add("editing");
-  const ta = el("textarea", "edit-area") as HTMLTextAreaElement;
-  ta.value = raw;
-  const bar = el("div", "edit-bar");
-  const cancelB = el("button", "edit-cancel", "取消");
-  const sendB = el("button", "edit-send", "发送");
-  bar.append(cancelB, sendB);
-  body.innerHTML = "";
-  body.append(ta, bar);
-  const grow = () => {
-    ta.style.height = "auto";
-    ta.style.height = Math.min(ta.scrollHeight, 240) + "px";
-  };
-  grow();
-  ta.focus();
-  ta.setSelectionRange(raw.length, raw.length);
-  ta.addEventListener("input", grow);
-  const restore = () => {
-    body.classList.remove("editing");
-    body.innerHTML = prevHTML;
-  };
-  cancelB.onclick = restore;
-  sendB.onclick = () => {
-    const t = ta.value.trim();
-    if (!t) return;
-    submitEdit(msg, checkpointId, t);
-  };
-  ta.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
-      e.preventDefault();
-      sendB.click();
-    } else if (e.key === "Escape") {
-      restore();
-    }
-  });
+  const userMsg = precedingUserMsg(aEl);
+  if (!userMsg) return;
+  const raw = userMsg.dataset.rawText || "";
+  if (!raw) return;
+  submitEdit(userMsg, userMsg.dataset.checkpointId || "", raw);
 }
 
 function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {

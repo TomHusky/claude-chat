@@ -694,7 +694,7 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
   scrollToBottom();
 }
 
-/** Render an AskUserQuestion tool as an interactive option picker. */
+/** Render an AskUserQuestion tool as a compact paginated option picker. */
 function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   const body = ensureAssistant();
   removeWorking();
@@ -704,117 +704,150 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
     multiSelect?: boolean;
     options?: Array<{ label: string; description?: string }>;
   }>;
-  const wrap = el("div", "ask");
+  if (!questions.length) return;
+
+  const sel = questions.map(() => new Set<string>()); // chosen built-in labels per question
+  const custom = questions.map(() => ""); // custom answer text per question
+  let cur = 0;
+  let done = false;
+
+  const wrap = el("div", "askp");
   wrap.dataset.requestId = m.requestId;
-  const sel = questions.map(() => new Set<string>()); // chosen built-in option labels
-  const other = questions.map(() => ({ on: false, text: "" })); // "其他" custom answer
+  const card = el("div", "askp-card");
+  const head = el("div", "askp-head");
+  const qText = el("span", "askp-q");
+  const xBtn = el("button", "askp-x", "×");
+  xBtn.title = "跳过";
+  head.append(qText, xBtn);
+  const optsBox = el("div", "askp-opts");
+  const foot = el("div", "askp-foot");
+  const pager = el("div", "askp-pager");
+  const prev = el("button", "askp-nav", "‹") as HTMLButtonElement;
+  const next = el("button", "askp-nav", "›") as HTMLButtonElement;
+  const idx = el("span", "askp-idx");
+  pager.append(prev, idx, next);
+  const submit = el("button", "askp-submit", "提交") as HTMLButtonElement;
+  foot.append(pager, submit);
+  card.append(head, optsBox, foot);
+  wrap.append(card);
 
-  const submit = el("button", "ask-submit", "提交") as HTMLButtonElement;
-  const answered = (qi: number) => sel[qi].size > 0 || (other[qi].on && other[qi].text.trim().length > 0);
-  const updateSubmit = () => (submit.disabled = questions.some((_, qi) => !answered(qi)));
+  const answered = (qi: number) => sel[qi].size > 0 || custom[qi].trim().length > 0;
+  const updateFoot = () => {
+    const multi = questions.length > 1;
+    pager.style.display = multi ? "" : "none";
+    idx.textContent = `${cur + 1}/${questions.length}`;
+    prev.disabled = cur === 0;
+    next.disabled = cur === questions.length - 1;
+    submit.disabled = !questions.every((_, qi) => answered(qi));
+  };
 
-  questions.forEach((q, qi) => {
-    const qEl = el("div", "ask-q");
-    if (q.header) qEl.appendChild(el("div", "ask-head", String(q.header)));
-    qEl.appendChild(el("div", "ask-qtext", String(q.question || "")));
-    const opts = el("div", "ask-opts");
-
-    // The custom "其他" row (button toggles a text input).
-    const otherBtn = el("button", "ask-opt ask-other");
-    otherBtn.appendChild(el("div", "ask-opt-label", "其他（自己输入）"));
-    const otherInput = el("input", "ask-other-input hidden") as HTMLInputElement;
-    otherInput.type = "text";
-    otherInput.placeholder = "输入你的答案…";
-
-    const clearOption = (b: Element) => b.classList.remove("on");
-    const setOther = (on: boolean) => {
-      other[qi].on = on;
-      otherBtn.classList.toggle("on", on);
-      otherInput.classList.toggle("hidden", !on);
-      if (on) setTimeout(() => otherInput.focus(), 0);
-    };
-
-    for (const o of q.options || []) {
-      const b = el("button", "ask-opt");
-      b.appendChild(el("div", "ask-opt-label", String(o.label)));
-      if (o.description) b.appendChild(el("div", "ask-opt-desc", String(o.description)));
-      b.onclick = () => {
+  function paint() {
+    const q = questions[cur];
+    qText.textContent = q.question || "";
+    optsBox.innerHTML = "";
+    const opts = q.options || [];
+    const rows: HTMLElement[] = [];
+    opts.forEach((o, i) => {
+      const row = el("button", "askp-opt" + (q.multiSelect ? " multi" : ""));
+      if (sel[cur].has(o.label)) row.classList.add("on");
+      row.append(el("span", "askp-n", String(i + 1)));
+      if (q.multiSelect) row.append(el("span", "askp-box")); // checkbox for multi-select
+      const txt = el("span", "askp-txt");
+      txt.append(el("span", "askp-lbl", String(o.label)));
+      if (o.description) txt.append(el("span", "askp-desc", String(o.description)));
+      row.append(txt);
+      if (!q.multiSelect) row.append(el("span", "askp-check", "✓")); // right ✓ for single-select
+      row.onclick = () => {
         if (q.multiSelect) {
-          if (sel[qi].has(o.label)) {
-            sel[qi].delete(o.label);
-            b.classList.remove("on");
+          if (sel[cur].has(o.label)) {
+            sel[cur].delete(o.label);
+            row.classList.remove("on");
           } else {
-            sel[qi].add(o.label);
-            b.classList.add("on");
+            sel[cur].add(o.label);
+            row.classList.add("on");
           }
         } else {
-          sel[qi].clear();
-          sel[qi].add(o.label);
-          opts.querySelectorAll(".ask-opt").forEach(clearOption);
-          b.classList.add("on");
-          setOther(false); // single-select: choosing a built-in option clears "其他"
+          sel[cur].clear();
+          sel[cur].add(o.label);
+          custom[cur] = "";
+          rows.forEach((r) => r.classList.remove("on"));
+          row.classList.add("on");
+          customInput.value = "";
+          customRow.classList.remove("on");
         }
-        updateSubmit();
+        updateFoot();
       };
-      opts.appendChild(b);
-    }
+      rows.push(row);
+      optsBox.append(row);
+    });
 
-    otherBtn.onclick = () => {
-      if (q.multiSelect) {
-        setOther(!other[qi].on);
-      } else {
-        sel[qi].clear();
-        opts.querySelectorAll(".ask-opt").forEach(clearOption);
-        setOther(true);
+    const customRow = el("div", "askp-opt askp-custom");
+    customRow.append(el("span", "askp-n", String(opts.length + 1)));
+    const customInput = el("input", "askp-input") as HTMLInputElement;
+    customInput.type = "text";
+    customInput.placeholder = "输入自定义答案";
+    customInput.value = custom[cur];
+    if (custom[cur].trim()) customRow.classList.add("on");
+    customInput.oninput = () => {
+      custom[cur] = customInput.value;
+      if (!q.multiSelect && customInput.value.trim()) {
+        sel[cur].clear();
+        rows.forEach((r) => r.classList.remove("on"));
       }
-      updateSubmit();
+      customRow.classList.toggle("on", customInput.value.trim().length > 0);
+      updateFoot();
     };
-    otherInput.oninput = () => {
-      other[qi].text = otherInput.value;
-      updateSubmit();
-    };
-    opts.append(otherBtn, otherInput);
-    qEl.appendChild(opts);
-    wrap.appendChild(qEl);
-  });
+    customRow.append(customInput);
+    optsBox.append(customRow);
+    updateFoot();
+  }
 
-  const replaceWithSummary = (answers: Record<string, string | string[]> | null) => {
-    const sum = el("div", "ask-summary");
-    if (answers) {
-      const parts = questions
-        .map((q) => {
-          const v = answers[q.question];
-          return Array.isArray(v) ? v.join("、") : v;
-        })
-        .filter(Boolean);
-      sum.textContent = "已选择：" + parts.join(" / ");
-    } else {
-      sum.textContent = "已跳过";
-    }
+  const finish = (answers: Record<string, string | string[]> | null) => {
+    if (done) return;
+    done = true;
+    const sum = el("div", "askp-summary");
+    sum.textContent = answers
+      ? "已选择：" +
+        questions
+          .map((q) => {
+            const v = answers[q.question];
+            return Array.isArray(v) ? v.join("、") : v;
+          })
+          .filter(Boolean)
+          .join(" / ")
+      : "已跳过";
     wrap.replaceWith(sum);
   };
 
+  prev.onclick = () => {
+    if (cur > 0) {
+      cur--;
+      paint();
+    }
+  };
+  next.onclick = () => {
+    if (cur < questions.length - 1) {
+      cur++;
+      paint();
+    }
+  };
   submit.onclick = () => {
     const answers: Record<string, string | string[]> = {};
     questions.forEach((q, qi) => {
       const picks = [...sel[qi]];
-      if (other[qi].on && other[qi].text.trim()) picks.push(other[qi].text.trim());
+      if (custom[qi].trim()) picks.push(custom[qi].trim());
       answers[q.question] = q.multiSelect ? picks : picks[0] || "";
     });
     send({ type: "answerQuestion", requestId: m.requestId, answers });
-    replaceWithSummary(answers);
+    finish(answers);
   };
-  const skip = el("button", "ask-skip", "跳过");
-  skip.onclick = () => {
+  xBtn.onclick = () => {
     send({ type: "answerQuestion", requestId: m.requestId, answers: {} });
-    replaceWithSummary(null);
+    finish(null);
   };
 
-  const actions = el("div", "ask-actions");
-  actions.append(submit, skip);
-  wrap.appendChild(actions);
-  updateSubmit();
-  body.appendChild(wrap);
+  paint();
+  body.append(wrap);
   scrollToBottom();
 }
 

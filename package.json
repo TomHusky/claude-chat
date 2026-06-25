@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.88",
+  "version": "0.1.90",
   "publisher": "local",
   "license": "MIT",
   "repository": {

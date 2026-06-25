@@ -155,9 +155,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     target?.postMessage(e);
   }
 
-  /** Show/clear the "update available" banner at the top of the sidebar's list. */
+  /** Reflect the "update available" state: a banner atop the sidebar list AND a
+   *  badge on the ClaudeCopilot activity-bar icon. */
   private postUpdateDot(): void {
     this.view?.webview.postMessage({ kind: "update_available", version: this.updateAvailable ?? "" });
+    if (this.view) {
+      this.view.badge = this.updateAvailable
+        ? { value: 1, tooltip: `发现新版本 v${this.updateAvailable}` }
+        : undefined;
+    }
   }
 
   /** Broadcast the session list to both the sidebar manager and the chat panel. */

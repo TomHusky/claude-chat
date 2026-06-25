@@ -76,7 +76,9 @@ export class SessionStore {
       if (o.type === "user" && this.isRealUserText(o)) {
         messageCount++;
         if (!gotTitle && title === "新对话") {
-          title = truncate(this.userText(o), 60);
+          // Strip IDE/attached-context noise so the title is the real first message.
+          const clean = splitAttachedContext(this.userText(o)).text;
+          if (clean) title = truncate(clean, 60);
         }
       }
     }
@@ -109,17 +111,20 @@ export class SessionStore {
         }
         if (this.isRealUserText(o) || images.length) {
           const { text, files } = splitAttachedContext(this.userText(o));
-          items.push({
-            type: "user",
-            text,
-            files: files.length ? files : undefined,
-            images: images.length ? images : undefined,
-          });
+          // Skip pure IDE-context injections (no real text, no images).
+          if (text || images.length) {
+            items.push({
+              type: "user",
+              text,
+              files: files.length ? files : undefined,
+              images: images.length ? images : undefined,
+            });
+          }
         }
       } else if (o.type === "user" && typeof o.message?.content === "string") {
         if (this.isRealUserText(o)) {
           const { text, files } = splitAttachedContext(o.message.content);
-          items.push({ type: "user", text, files: files.length ? files : undefined });
+          if (text) items.push({ type: "user", text, files: files.length ? files : undefined });
         }
       } else if (o.type === "assistant" && Array.isArray(o.message?.content)) {
         for (const b of o.message.content) {
@@ -284,6 +289,28 @@ export class SessionStore {
  */
 function splitAttachedContext(raw: string): { text: string; files: string[] } {
   if (!raw) return { text: "", files: [] };
+  const files: string[] = [];
+  const seen = new Set<string>();
+  const addFile = (p: string) => {
+    const base = (p || "").trim().split(/[\\/]/).pop() || "";
+    if (base && !seen.has(base)) {
+      seen.add(base);
+      files.push(base);
+    }
+  };
+
+  // Strip the official Claude extension's IDE context tags (sessions created
+  // there embed these into user messages). Surface the opened file as a chip.
+  raw = raw.replace(/<ide_opened_file>([\s\S]*?)<\/ide_opened_file>/g, (_m, inner: string) => {
+    const mm = /opened the file\s+(.+?)\s+in the IDE/.exec(inner);
+    if (mm) addFile(mm[1]);
+    return "";
+  });
+  raw = raw.replace(/<ide_[a-z_]+>[\s\S]*?<\/ide_[a-z_]+>/g, ""); // ide_selection, ide_diagnostics, …
+  raw = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "");
+  raw = raw.trim();
+  if (!raw) return { text: "", files };
+
   let block = "";
   let text = raw;
   const open = raw.indexOf(CTX_OPEN);
@@ -297,20 +324,12 @@ function splitAttachedContext(raw: string): { text: string; files: string[] } {
     block = raw;
     text = "";
   } else {
-    return { text: raw, files: [] };
+    return { text: raw, files };
   }
-  const files: string[] = [];
-  const seen = new Set<string>();
   const re = /^(?:文件|目录) (.+?)(?:\/ 包含:|：|:|（|\(|$)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(block))) {
-    const rel = m[1].trim();
-    if (!rel) continue;
-    const base = rel.split(/[\\/]/).pop() || rel;
-    if (!seen.has(base)) {
-      seen.add(base);
-      files.push(base);
-    }
+    if (m[1].trim()) addFile(m[1]);
   }
   return { text, files };
 }

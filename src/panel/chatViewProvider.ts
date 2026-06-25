@@ -252,7 +252,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         resolve(sanitizeTitle(t));
       };
       try {
-        const cp = spawn(claudePath, ["-p", "--model", "haiku", prompt], { cwd: this.cwd() });
+        // --no-session-persistence: don't write a transcript file for this
+        // throwaway call (otherwise every title generation pollutes the session
+        // list with a junk session).
+        const cp = spawn(claudePath, ["-p", "--no-session-persistence", "--model", "haiku", prompt], {
+          cwd: this.cwd(),
+        });
         cp.stdout.on("data", (d) => (out += d.toString()));
         cp.on("close", () => finish(out));
         cp.on("error", () => finish(""));

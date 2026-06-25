@@ -83,6 +83,19 @@ export class SessionStore {
     return { title, messageCount };
   }
 
+  /** The first real user message of a session (context stripped) — used to
+   *  generate a concise AI title. Empty if none. */
+  firstUserText(sessionId: string): string {
+    const file = this.findFile(sessionId);
+    if (!file) return "";
+    for (const o of this.readLines(file)) {
+      if (o.type === "user" && this.isRealUserText(o)) {
+        return splitAttachedContext(this.userText(o)).text || this.userText(o);
+      }
+    }
+    return "";
+  }
+
   /** Rehydrate a full session transcript into renderable timeline items. */
   load(sessionId: string): TimelineItem[] {
     const file = this.findFile(sessionId);

@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.92",
+  "version": "0.1.93",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -188,6 +188,11 @@
           "type": "boolean",
           "default": true,
           "description": "Before each file edit, snapshot the file so restore points can revert workspace changes."
+        },
+        "claudeChat.generateTitles": {
+          "type": "boolean",
+          "default": true,
+          "description": "为会话生成简洁的 AI 标题（用 haiku 轻量模型总结，结果会缓存）。关闭则使用首条消息作为标题。"
         }
       }
     }

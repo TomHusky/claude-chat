@@ -50,6 +50,7 @@ export type ToWebview =
     }
   | { kind: "permission_resolved"; requestId: string; behavior: "allow" | "deny"; auto?: boolean }
   | { kind: "tokens"; output: number }
+  | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
   | { kind: "error"; message: string }

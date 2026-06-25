@@ -155,14 +155,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     target?.postMessage(e);
   }
 
-  /** Show/clear an "update available" badge on the ClaudeCopilot activity-bar
-   *  icon (the native view title button can't take a custom dot). */
+  /** Show/clear the "update available" banner at the top of the sidebar's list. */
   private postUpdateDot(): void {
-    if (this.view) {
-      this.view.badge = this.updateAvailable
-        ? { value: 1, tooltip: `发现新版本 v${this.updateAvailable} · 点工具栏的「检查更新」更新` }
-        : undefined;
-    }
+    this.view?.webview.postMessage({ kind: "update_available", version: this.updateAvailable ?? "" });
   }
 
   /** Broadcast the session list to both the sidebar manager and the chat panel. */
@@ -1164,6 +1159,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .new { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); border-radius: 7px; background: none; color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
   .new:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
   .new svg { width: 15px; height: 15px; }
+  .upd-banner { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px 8px 0; padding: 7px 10px; border: 1px solid #d97757; border-radius: 7px; background: rgba(217,119,87,.12); color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
+  .upd-banner:hover { background: rgba(217,119,87,.22); }
+  .upd-banner.hidden { display: none; }
+  .upd-banner svg { width: 15px; height: 15px; color: #d97757; }
+  .upd-banner b { font-weight: 600; }
   .list { padding: 2px 6px 12px; }
   .empty { opacity: .5; text-align: center; padding: 26px 10px; font-size: 12px; }
   .row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px; cursor: pointer; position: relative; }
@@ -1193,6 +1193,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <button id="multi" class="abtn" title="多选">多选</button>
     <button id="delsel" class="abtn danger hidden">删除所选</button>
   </div>
+  <button id="upd-banner" class="upd-banner hidden">${ICONS.update}<span>发现新版本 <b id="upd-ver"></b> · 点击更新</span></button>
   <button id="new" class="new">${ICONS.add}<span>新建会话</span></button>
   <div id="list" class="list"><div class="empty">暂无会话</div></div>
   <div id="ctx" class="ctx hidden"></div>
@@ -1264,6 +1265,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       render();
     });
     $("delsel").addEventListener("click", () => confirmDel([...sel]));
+    $("upd-banner").addEventListener("click", () => vscode.postMessage({ type: "checkUpdate" }));
 
     window.addEventListener("message", (ev) => {
       const m = ev.data;
@@ -1272,6 +1274,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
         $("delsel").classList.toggle("hidden", sel.size === 0);
         render();
+      } else if (m && m.kind === "update_available") {
+        if (m.version) { $("upd-ver").textContent = "v" + m.version; $("upd-banner").classList.remove("hidden"); }
+        else $("upd-banner").classList.add("hidden");
       }
     });
     vscode.postMessage({ type: "listSessions" });

@@ -3,12 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as https from "node:https";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
-import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, SessionSummary, ToWebview } from "../shared";
+import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, ToWebview } from "../shared";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
@@ -170,110 +169,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Broadcast the session list to both the sidebar manager and the chat panel. */
   private refreshSessions(): void {
     const list = this.store.list();
-    const titles = this.titleCache();
-    for (const s of list) if (titles[s.id]) s.title = titles[s.id]; // prefer the cached AI title
     const e: ToWebview = { kind: "sessions", list, activeId: this.activeSessionId };
     this.view?.webview.postMessage(e);
     this.panel?.webview.postMessage(e);
     this.setPanelTitle(list.find((s) => s.id === this.activeSessionId)?.title);
-    this.queueTitles(list); // generate concise titles for any session lacking one
-  }
-
-  // -- AI session titles (generated + cached, like the official extension) ----
-
-  private titleQueue: string[] = [];
-  private titleBusy = false;
-
-  private titleCache(): Record<string, string> {
-    return this.context.globalState.get<Record<string, string>>("claudeChat.titles", {});
-  }
-
-  /** Enqueue title generation for the most recent sessions that don't have one. */
-  private queueTitles(list: SessionSummary[]): void {
-    if (this.config().get<boolean>("generateTitles", true) === false) return;
-    const cache = this.titleCache();
-    for (const s of list.slice(0, 30)) {
-      if (s.messageCount > 0 && !cache[s.id] && !this.titleQueue.includes(s.id)) {
-        this.titleQueue.push(s.id);
-      }
-    }
-    void this.drainTitles();
-  }
-
-  private async drainTitles(): Promise<void> {
-    if (this.titleBusy) return;
-    this.titleBusy = true;
-    try {
-      while (this.titleQueue.length) {
-        const id = this.titleQueue.shift()!;
-        const cache = this.titleCache();
-        if (cache[id]) continue; // already has a saved title — never regenerate
-        const text = this.store.firstUserText(id);
-        if (!text) continue;
-        const ai = await this.generateTitle(text);
-        // Always persist a title (AI result, or a trimmed-message fallback) so this
-        // session is marked done and won't be generated again.
-        const finalTitle = ai || text.replace(/\s+/g, " ").trim().slice(0, 18);
-        const updated = { ...this.titleCache(), [id]: finalTitle };
-        await this.context.globalState.update("claudeChat.titles", updated);
-        this.broadcastSessions(); // re-post list with the new title (no re-queue loop)
-      }
-    } finally {
-      this.titleBusy = false;
-    }
-  }
-
-  /** Post the session list with cached titles applied (without triggering generation). */
-  private broadcastSessions(): void {
-    const list = this.store.list();
-    const titles = this.titleCache();
-    for (const s of list) if (titles[s.id]) s.title = titles[s.id];
-    const e: ToWebview = { kind: "sessions", list, activeId: this.activeSessionId };
-    this.view?.webview.postMessage(e);
-    this.panel?.webview.postMessage(e);
-    this.setPanelTitle(list.find((s) => s.id === this.activeSessionId)?.title);
-  }
-
-  /** One-shot lightweight model call to summarize a conversation into a short title. */
-  private generateTitle(firstText: string): Promise<string> {
-    return new Promise((resolve) => {
-      const claudePath = this.config().get<string>("claudePath", "claude");
-      const prompt =
-        `为一个「编程 / 代码助手」的会话生成简短标题。要求：\n` +
-        `- 只输出标题本身，不超过14个汉字；\n` +
-        `- 突出涉及的技术主题、功能、模块、文件或操作（偏代码/编程）；\n` +
-        `- 禁止任何解释、反问、引号或句末标点；\n` +
-        `- 如果信息很少，就直接用原文前几个字，同样不要解释。\n\n对话开头：\n${firstText.slice(0, 800)}`;
-      let out = "";
-      let done = false;
-      const finish = (t: string) => {
-        if (done) return;
-        done = true;
-        resolve(sanitizeTitle(t));
-      };
-      try {
-        // --no-session-persistence: don't write a transcript file for this
-        // throwaway call (otherwise every title generation pollutes the session
-        // list with a junk session).
-        const cp = spawn(claudePath, ["-p", "--no-session-persistence", "--model", "haiku", prompt], {
-          cwd: this.cwd(),
-        });
-        cp.stdout.on("data", (d) => (out += d.toString()));
-        cp.on("close", () => finish(out));
-        cp.on("error", () => finish(""));
-        const timer = setTimeout(() => {
-          try {
-            cp.kill();
-          } catch {
-            /* ignore */
-          }
-          finish(out);
-        }, 25000);
-        cp.on("close", () => clearTimeout(timer));
-      } catch {
-        finish("");
-      }
-    });
   }
 
   /** Show the active conversation's title on the editor tab (falls back to brand). */
@@ -1467,20 +1366,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
-}
-
-/** Clean a model-generated title: single line, no quotes/punctuation noise,
- *  capped, and reject rambling/refusal answers (caller falls back). */
-function sanitizeTitle(s: string): string {
-  let t = (s || "").trim();
-  t = (t.split(/\r?\n/).find((l) => l.trim()) || "").trim();
-  t = t.replace(/^["'「『《（(\[]+|["'」』》）)\]。.！!？?]+$/g, "").trim();
-  // Reject clarification/refusal replies (the model rambling instead of a title).
-  if (/我需要|请提供|无法|抱歉|没有(提供|足够)|足够的信息|不够|更多信息/.test(t)) return "";
-  // A real title shouldn't contain sentence punctuation.
-  if (/[。！？，；]/.test(t)) return "";
-  if (t.length > 18) t = t.slice(0, 18);
-  return t;
 }
 
 /** Compare two dotted versions: >0 if a>b, <0 if a<b, 0 if equal. */

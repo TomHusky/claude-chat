@@ -26,6 +26,8 @@ export interface ClaudeProcessOptions {
   /** Force a specific session id for a brand new session. */
   sessionId?: string;
   addDirs?: string[];
+  /** Extra instruction appended to the default system prompt (e.g. reply language). */
+  appendSystemPrompt?: string;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -148,6 +150,7 @@ export class ClaudeProcess {
     if (this.opts.resumeSessionId) a.push("--resume", this.opts.resumeSessionId);
     else if (this.opts.sessionId) a.push("--session-id", this.opts.sessionId);
     for (const dir of this.opts.addDirs ?? []) a.push("--add-dir", dir);
+    if (this.opts.appendSystemPrompt) a.push("--append-system-prompt", this.opts.appendSystemPrompt);
     return a;
   }
 

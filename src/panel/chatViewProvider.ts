@@ -680,6 +680,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         resumeSessionId: isResume ? sessionId : undefined,
         sessionId: isResume ? undefined : sessionId,
         addDirs: this.workspaceDirs(),
+        appendSystemPrompt: this.config().get<string>("appendSystemPrompt", "") || undefined,
       },
       {
         emit: (e) => this.handleEmit(e),

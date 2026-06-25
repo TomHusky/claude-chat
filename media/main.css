@@ -95,17 +95,19 @@ html, body {
 }
 .msg.user .md a { color: var(--vscode-button-foreground); text-decoration: underline; }
 
-/* "重新生成" button at the bottom of an assistant reply */
-.msg-actions { margin-top: 9px; display: flex; gap: 6px; }
-.msg-regen {
-  display: inline-flex; align-items: center; gap: 5px;
-  background: transparent; cursor: pointer;
-  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.3));
-  color: var(--vscode-descriptionForeground);
-  border-radius: 6px; padding: 3px 10px; font-size: 11.5px;
+/* Borderless icon-button row at the bottom of an assistant reply */
+.msg-actions { margin-top: 6px; display: flex; gap: 1px; }
+.msg-act {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 24px; padding: 0; border: none; cursor: pointer;
+  background: transparent; border-radius: 5px;
+  color: var(--vscode-descriptionForeground); opacity: .75;
+  transition: background .12s, opacity .12s, color .12s;
 }
-.msg-regen:hover { color: var(--vscode-foreground); background: rgba(128,128,128,.12); }
-.msg-regen svg { width: 13px; height: 13px; }
+.msg-act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.16)); color: var(--vscode-foreground); opacity: 1; }
+.msg-act.on { color: var(--vscode-foreground); opacity: 1; }
+.msg-act.done { color: #3a9d5d; opacity: 1; }
+.msg-act svg { width: 14px; height: 14px; }
 
 /* inline edit mode — full width, no accent bubble */
 .msg.user .msg-body.editing {

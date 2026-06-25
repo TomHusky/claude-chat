@@ -197,16 +197,9 @@ function finalizeTurn() {
       const last = segs[segs.length - 1];
       if (last && body.firstElementChild !== last) last.classList.add("summary-node");
       endTimelineAtLastNode(assistantEl); // stop the line at the last node
-      // Footer with a "重新生成" button at the bottom of the reply.
+      // Footer: a row of borderless icon buttons under the reply.
       if (!body.querySelector(".msg-actions")) {
-        const aEl = assistantEl;
-        const acts = el("div", "msg-actions");
-        const regen = el("button", "msg-regen");
-        regen.innerHTML = `${ICON.update}<span>重新生成</span>`;
-        regen.title = "重新生成这条回复";
-        regen.onclick = () => regenerate(aEl);
-        acts.appendChild(regen);
-        body.appendChild(acts);
+        body.appendChild(buildReplyActions(assistantEl));
       }
     }
   }
@@ -1743,6 +1736,38 @@ function precedingUserMsg(aEl: HTMLElement): HTMLElement | null {
     n = n.previousElementSibling as HTMLElement | null;
   }
   return null;
+}
+
+/** The icon-button row shown at the bottom of an assistant reply. */
+function buildReplyActions(aEl: HTMLElement): HTMLElement {
+  const acts = el("div", "msg-actions");
+  const mk = (icon: string, title: string, fn: (b: HTMLButtonElement) => void) => {
+    const b = el("button", "msg-act") as HTMLButtonElement;
+    b.innerHTML = icon;
+    b.title = title;
+    b.onclick = () => fn(b);
+    return b;
+  };
+  const regen = mk(ICON.update, "重新生成", () => regenerate(aEl));
+  const copy = mk(ICON.copy, "复制", (b) => {
+    const text = Array.from(aEl.querySelectorAll(".msg-body .text-seg"))
+      .map((e) => (e as HTMLElement).innerText)
+      .join("\n\n")
+      .trim();
+    send({ type: "copy", text });
+    b.classList.add("done");
+    setTimeout(() => b.classList.remove("done"), 1000);
+  });
+  const up = mk(ICON.thumbUp, "赞", (b) => {
+    b.classList.toggle("on");
+    down.classList.remove("on");
+  });
+  const down = mk(ICON.thumbDown, "踩", (b) => {
+    b.classList.toggle("on");
+    up.classList.remove("on");
+  });
+  acts.append(regen, copy, up, down);
+  return acts;
 }
 
 /** Re-run the user message that produced this reply: rewind to before it

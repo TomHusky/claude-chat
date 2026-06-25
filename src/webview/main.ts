@@ -462,7 +462,9 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
   if (type === "tool_use" && toolId) {
     finalizeLive();
     removeWorking();
-    createToolCard(body, toolId, toolName || "tool");
+    // AskUserQuestion is rendered as an interactive picker (from its permission
+    // request), not as a tool card showing the raw JSON config.
+    if (toolName !== "AskUserQuestion") createToolCard(body, toolId, toolName || "tool");
     liveBlock = null;
     return;
   }
@@ -524,6 +526,7 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
 }
 
 function updateToolInput(toolId: string, name: string, input: Record<string, unknown>) {
+  if (name === "AskUserQuestion") return; // rendered as an interactive picker, not a card
   let card = toolCards.get(toolId);
   if (!card) card = createToolCard(ensureAssistant(), toolId, name);
   const sub = card.querySelector(".tool-sub") as HTMLElement;
@@ -703,16 +706,34 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   }>;
   const wrap = el("div", "ask");
   wrap.dataset.requestId = m.requestId;
-  const sel = questions.map(() => new Set<string>());
+  const sel = questions.map(() => new Set<string>()); // chosen built-in option labels
+  const other = questions.map(() => ({ on: false, text: "" })); // "其他" custom answer
 
   const submit = el("button", "ask-submit", "提交") as HTMLButtonElement;
-  const updateSubmit = () => (submit.disabled = sel.some((s) => s.size === 0));
+  const answered = (qi: number) => sel[qi].size > 0 || (other[qi].on && other[qi].text.trim().length > 0);
+  const updateSubmit = () => (submit.disabled = questions.some((_, qi) => !answered(qi)));
 
   questions.forEach((q, qi) => {
     const qEl = el("div", "ask-q");
     if (q.header) qEl.appendChild(el("div", "ask-head", String(q.header)));
     qEl.appendChild(el("div", "ask-qtext", String(q.question || "")));
     const opts = el("div", "ask-opts");
+
+    // The custom "其他" row (button toggles a text input).
+    const otherBtn = el("button", "ask-opt ask-other");
+    otherBtn.appendChild(el("div", "ask-opt-label", "其他（自己输入）"));
+    const otherInput = el("input", "ask-other-input hidden") as HTMLInputElement;
+    otherInput.type = "text";
+    otherInput.placeholder = "输入你的答案…";
+
+    const clearOption = (b: Element) => b.classList.remove("on");
+    const setOther = (on: boolean) => {
+      other[qi].on = on;
+      otherBtn.classList.toggle("on", on);
+      otherInput.classList.toggle("hidden", !on);
+      if (on) setTimeout(() => otherInput.focus(), 0);
+    };
+
     for (const o of q.options || []) {
       const b = el("button", "ask-opt");
       b.appendChild(el("div", "ask-opt-label", String(o.label)));
@@ -729,13 +750,30 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
         } else {
           sel[qi].clear();
           sel[qi].add(o.label);
-          opts.querySelectorAll(".ask-opt").forEach((x) => x.classList.remove("on"));
+          opts.querySelectorAll(".ask-opt").forEach(clearOption);
           b.classList.add("on");
+          setOther(false); // single-select: choosing a built-in option clears "其他"
         }
         updateSubmit();
       };
       opts.appendChild(b);
     }
+
+    otherBtn.onclick = () => {
+      if (q.multiSelect) {
+        setOther(!other[qi].on);
+      } else {
+        sel[qi].clear();
+        opts.querySelectorAll(".ask-opt").forEach(clearOption);
+        setOther(true);
+      }
+      updateSubmit();
+    };
+    otherInput.oninput = () => {
+      other[qi].text = otherInput.value;
+      updateSubmit();
+    };
+    opts.append(otherBtn, otherInput);
     qEl.appendChild(opts);
     wrap.appendChild(qEl);
   });
@@ -760,6 +798,7 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
     const answers: Record<string, string | string[]> = {};
     questions.forEach((q, qi) => {
       const picks = [...sel[qi]];
+      if (other[qi].on && other[qi].text.trim()) picks.push(other[qi].text.trim());
       answers[q.question] = q.multiSelect ? picks : picks[0] || "";
     });
     send({ type: "answerQuestion", requestId: m.requestId, answers });

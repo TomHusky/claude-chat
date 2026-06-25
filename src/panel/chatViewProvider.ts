@@ -207,15 +207,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       while (this.titleQueue.length) {
         const id = this.titleQueue.shift()!;
         const cache = this.titleCache();
-        if (cache[id]) continue;
+        if (cache[id]) continue; // already has a saved title — never regenerate
         const text = this.store.firstUserText(id);
         if (!text) continue;
-        const title = await this.generateTitle(text);
-        if (title) {
-          const updated = { ...this.titleCache(), [id]: title };
-          await this.context.globalState.update("claudeChat.titles", updated);
-          this.broadcastSessions(); // re-post list with the new title (no re-queue loop)
-        }
+        const ai = await this.generateTitle(text);
+        // Always persist a title (AI result, or a trimmed-message fallback) so this
+        // session is marked done and won't be generated again.
+        const finalTitle = ai || text.replace(/\s+/g, " ").trim().slice(0, 18);
+        const updated = { ...this.titleCache(), [id]: finalTitle };
+        await this.context.globalState.update("claudeChat.titles", updated);
+        this.broadcastSessions(); // re-post list with the new title (no re-queue loop)
       }
     } finally {
       this.titleBusy = false;
@@ -238,8 +239,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return new Promise((resolve) => {
       const claudePath = this.config().get<string>("claudePath", "claude");
       const prompt =
-        `请用不超过14个汉字，为下面这段对话生成一个简洁的主题标题。` +
-        `只输出标题本身，不要引号、句号或任何解释。\n\n对话开头：\n${firstText.slice(0, 800)}`;
+        `为一个「编程 / 代码助手」的会话生成简短标题。要求：\n` +
+        `- 只输出标题本身，不超过14个汉字；\n` +
+        `- 突出涉及的技术主题、功能、模块、文件或操作（偏代码/编程）；\n` +
+        `- 禁止任何解释、反问、引号或句末标点；\n` +
+        `- 如果信息很少，就直接用原文前几个字，同样不要解释。\n\n对话开头：\n${firstText.slice(0, 800)}`;
       let out = "";
       let done = false;
       const finish = (t: string) => {
@@ -1457,13 +1461,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-/** Clean a model-generated title: single line, no quotes/punctuation noise, capped. */
+/** Clean a model-generated title: single line, no quotes/punctuation noise,
+ *  capped, and reject rambling/refusal answers (caller falls back). */
 function sanitizeTitle(s: string): string {
   let t = (s || "").trim();
-  // Take the first non-empty line (the model sometimes adds extra lines).
   t = (t.split(/\r?\n/).find((l) => l.trim()) || "").trim();
-  t = t.replace(/^["'「『《（(\[]+|["'」』》）)\]。.]+$/g, "").trim();
-  if (t.length > 24) t = t.slice(0, 24);
+  t = t.replace(/^["'「『《（(\[]+|["'」』》）)\]。.！!？?]+$/g, "").trim();
+  // Reject clarification/refusal replies (the model rambling instead of a title).
+  if (/我需要|请提供|无法|抱歉|没有(提供|足够)|足够的信息|不够|更多信息/.test(t)) return "";
+  // A real title shouldn't contain sentence punctuation.
+  if (/[。！？，；]/.test(t)) return "";
+  if (t.length > 18) t = t.slice(0, 18);
   return t;
 }
 

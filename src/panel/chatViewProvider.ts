@@ -824,18 +824,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // -- Update check --------------------------------------------------------
 
-  private static readonly REPO_RAW = "https://raw.githubusercontent.com/TomHusky/claude-chat/main";
+  // GitHub API (not the raw CDN) so version/vsix reflect the latest commit
+  // immediately — raw.githubusercontent.com is CDN-cached for minutes.
+  private static readonly REPO_API = "https://api.github.com/repos/TomHusky/claude-chat/contents";
 
   /** Check GitHub for a newer packaged build; if found, download + install it.
    *  In `silent` mode (auto-check on startup) it stays quiet unless a newer
    *  version exists — no "already latest" / error popups. */
   async checkForUpdate(silent = false): Promise<void> {
     const local = (this.context.extension.packageJSON.version as string) || "0.0.0";
-    const bust = `?t=${Date.now()}`;
     let remote = "";
     try {
-      const pkg = await this.httpGetText(`${ChatViewProvider.REPO_RAW}/package.json${bust}`);
-      remote = JSON.parse(pkg).version || "";
+      const pkg = await this.fetchRepoFile("package.json");
+      remote = JSON.parse(pkg.toString("utf8")).version || "";
     } catch (err) {
       if (!silent) vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
       return;
@@ -851,8 +852,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Newer version available.
     this.updateAvailable = remote; // remembered so the dot re-appears when the sidebar opens
     if (silent) {
-      // Auto-check: just flag the left sidebar's update button with a red dot.
-      this.postUpdateDot();
+      this.postUpdateDot(); // auto-check: show banner + activity-bar badge, no popup
       return;
     }
     const pick = await vscode.window.showInformationMessage(
@@ -866,7 +866,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `正在下载并安装 v${remote}…` },
         async () => {
-          await this.httpDownload(`${ChatViewProvider.REPO_RAW}/release/claude-chat.vsix${bust}`, dest);
+          const vsix = await this.fetchRepoFile("release/claude-chat.vsix");
+          fs.writeFileSync(dest, vsix);
           await vscode.commands.executeCommand("workbench.extensions.installExtension", vscode.Uri.file(dest));
         },
       );
@@ -880,11 +881,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
   }
 
+  /** Fetch a repo file via the GitHub contents API and return its raw bytes.
+   *  Uses the API (not raw CDN) so it always reflects the latest commit. */
+  private async fetchRepoFile(repoPath: string): Promise<Buffer> {
+    const url = `${ChatViewProvider.REPO_API}/${repoPath}?ref=main`;
+    const json = await this.httpGetText(url);
+    const obj = JSON.parse(json) as { content?: string; encoding?: string };
+    if (!obj.content) throw new Error("响应缺少内容");
+    return Buffer.from(obj.content, (obj.encoding as BufferEncoding) || "base64");
+  }
+
   /** GET a text resource over HTTPS (follows redirects). */
   private httpGetText(url: string, depth = 0): Promise<string> {
     return new Promise((resolve, reject) => {
       if (depth > 5) return reject(new Error("重定向次数过多"));
-      const req = https.get(url, { headers: { "User-Agent": "claude-chat" } }, (res) => {
+      const headers = { "User-Agent": "claude-chat", Accept: "application/vnd.github+json" };
+      const req = https.get(url, { headers }, (res) => {
         const code = res.statusCode ?? 0;
         if (code >= 300 && code < 400 && res.headers.location) {
           res.resume();
@@ -902,33 +914,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         res.on("end", () => resolve(data));
       });
       req.on("error", reject);
-      req.setTimeout(15000, () => req.destroy(new Error("请求超时")));
-    });
-  }
-
-  /** Download a binary resource over HTTPS to `dest` (follows redirects). */
-  private httpDownload(url: string, dest: string, depth = 0): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (depth > 5) return reject(new Error("重定向次数过多"));
-      const req = https.get(url, { headers: { "User-Agent": "claude-chat" } }, (res) => {
-        const code = res.statusCode ?? 0;
-        if (code >= 300 && code < 400 && res.headers.location) {
-          res.resume();
-          resolve(this.httpDownload(res.headers.location, dest, depth + 1));
-          return;
-        }
-        if (code !== 200) {
-          res.resume();
-          reject(new Error(`HTTP ${code}`));
-          return;
-        }
-        const file = fs.createWriteStream(dest);
-        res.pipe(file);
-        file.on("finish", () => file.close(() => resolve()));
-        file.on("error", (e) => reject(e));
-      });
-      req.on("error", reject);
-      req.setTimeout(60000, () => req.destroy(new Error("下载超时")));
+      req.setTimeout(20000, () => req.destroy(new Error("请求超时")));
     });
   }
 

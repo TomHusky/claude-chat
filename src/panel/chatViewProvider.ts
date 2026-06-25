@@ -141,6 +141,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // The left sidebar is a session manager only — chat lives in the editor panel.
     view.webview.html = this.sidebarHtml(view.webview);
     view.webview.onDidReceiveMessage((m: FromWebview) => this.onMessage(m));
+    this.postUpdateDot(); // restore the badge if an update was already detected
     view.onDidChangeVisibility(() => {
       if (view.visible) {
         this.post2(view.webview, { kind: "sessions", list: this.store.list(), activeId: this.activeSessionId });
@@ -154,10 +155,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     target?.postMessage(e);
   }
 
-  /** Light up the red "update available" dot on the left sidebar's update button. */
+  /** Show/clear an "update available" badge on the ClaudeCopilot activity-bar
+   *  icon (the native view title button can't take a custom dot). */
   private postUpdateDot(): void {
-    if (this.updateAvailable) {
-      this.view?.webview.postMessage({ kind: "update_available", version: this.updateAvailable });
+    if (this.view) {
+      this.view.badge = this.updateAvailable
+        ? { value: 1, tooltip: `发现新版本 v${this.updateAvailable} · 点工具栏的「检查更新」更新` }
+        : undefined;
     }
   }
 
@@ -870,6 +874,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.updateAvailable = undefined; // installed — clear the pending-update flag
+    this.postUpdateDot();
     const reload = await vscode.window.showInformationMessage(`已更新到 v${remote}，重新加载窗口后生效。`, "重新加载");
     if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
   }
@@ -1156,9 +1161,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .abtn.primary { color: var(--vscode-button-background); font-weight: 600; }
   .abtn.danger { color: var(--vscode-errorForeground, #e55); }
   .abtn.hidden { display: none; }
-  #upd { position: relative; }
-  #upd svg { width: 14px; height: 14px; vertical-align: -2px; }
-  #upd.has-update::after { content: ""; position: absolute; top: 1px; right: 2px; width: 7px; height: 7px; border-radius: 50%; background: #e5534b; border: 1.5px solid var(--vscode-sideBar-background); }
   .new { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); border-radius: 7px; background: none; color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
   .new:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
   .new svg { width: 15px; height: 15px; }
@@ -1188,7 +1190,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div class="head">
     <span class="ttl">会话</span>
     <span class="sp"></span>
-    <button id="upd" class="abtn" title="检查更新">${ICONS.update}</button>
     <button id="multi" class="abtn" title="多选">多选</button>
     <button id="delsel" class="abtn danger hidden">删除所选</button>
   </div>
@@ -1263,7 +1264,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       render();
     });
     $("delsel").addEventListener("click", () => confirmDel([...sel]));
-    $("upd").addEventListener("click", () => { $("upd").classList.remove("has-update"); vscode.postMessage({ type: "checkUpdate" }); });
 
     window.addEventListener("message", (ev) => {
       const m = ev.data;
@@ -1272,9 +1272,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
         $("delsel").classList.toggle("hidden", sel.size === 0);
         render();
-      } else if (m && m.kind === "update_available") {
-        $("upd").classList.add("has-update");
-        $("upd").title = "发现新版本 v" + m.version + " · 点击更新";
       }
     });
     vscode.postMessage({ type: "listSessions" });

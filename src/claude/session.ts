@@ -63,8 +63,8 @@ export class SessionStore {
         const full = path.join(dir, file);
         try {
           const stat = fs.statSync(full);
-          const { title, messageCount } = this.peek(full);
-          if (messageCount === 0) continue; // skip empty/aborted sessions
+          const { title, messageCount, hasContent } = this.peek(full);
+          if (!hasContent) continue; // skip truly-empty sessions (system-init only)
           out.push({
             id: file.replace(/\.jsonl$/, ""),
             title,
@@ -80,22 +80,29 @@ export class SessionStore {
   }
 
   /** Cheap scan for the list. Title priority mirrors the official UI:
-   *  manual rename (`custom-title`) > AI title (`ai-title`) > first user prompt.
-   *  Both title kinds are persisted in the transcript; the last entry wins
-   *  (titles evolve as the chat grows). Also counts user turns. */
-  private peek(file: string): { title: string; messageCount: number } {
+   *  manual rename (`custom-title`) > AI title (`ai-title`) > first user prompt
+   *  > last prompt. `hasContent` decides visibility — a session counts as real
+   *  if it has any user/assistant turn, a title, or a stored prompt (some
+   *  sessions store the prompt only as a `last-prompt`, with no `user` entry). */
+  private peek(file: string): { title: string; messageCount: number; hasContent: boolean } {
     const lines = this.readLines(file);
     let customTitle: string | null = null; // last custom-title; "" means user cleared it
     let aiTitle = "";
     let firstUserText = "";
-    let messageCount = 0;
+    let lastPrompt = "";
+    let userTurns = 0;
+    let assistantTurns = 0;
     for (const o of lines) {
       if (o.type === "custom-title" && typeof o.customTitle === "string") {
         customTitle = o.customTitle.trim();
       } else if (o.type === "ai-title" && typeof o.aiTitle === "string" && o.aiTitle.trim()) {
         aiTitle = o.aiTitle.trim();
+      } else if (o.type === "last-prompt" && typeof o.lastPrompt === "string" && o.lastPrompt.trim()) {
+        lastPrompt = o.lastPrompt.trim();
+      } else if (o.type === "assistant") {
+        assistantTurns++;
       } else if (o.type === "user" && this.isRealUserText(o)) {
-        messageCount++;
+        userTurns++;
         if (!firstUserText) {
           // Strip IDE/attached-context noise so the title is the real first message.
           const clean = splitAttachedContext(this.userText(o)).text;
@@ -103,7 +110,12 @@ export class SessionStore {
         }
       }
     }
-    return { title: (customTitle || aiTitle || firstUserText || "新对话"), messageCount };
+    const fallbackPrompt = lastPrompt ? truncate(splitAttachedContext(lastPrompt).text || lastPrompt, 60) : "";
+    const title = customTitle || aiTitle || firstUserText || fallbackPrompt || "新对话";
+    const hasContent = userTurns > 0 || assistantTurns > 0 || !!customTitle || !!aiTitle || !!lastPrompt;
+    // Show a sensible count: real user turns, else assistant turns (edge sessions).
+    const messageCount = userTurns > 0 ? userTurns : assistantTurns;
+    return { title, messageCount, hasContent };
   }
 
   /** Rehydrate a full session transcript into renderable timeline items. */

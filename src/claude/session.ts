@@ -62,27 +62,27 @@ export class SessionStore {
     return out.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  /** Cheap scan: first user prompt as title + count of user turns. */
+  /** Cheap scan for the list: prefer Claude Code's own AI-generated title
+   *  (persisted as `ai-title` entries — same one the official UI shows), else
+   *  fall back to the first real user prompt. Also counts user turns. */
   private peek(file: string): { title: string; messageCount: number } {
     const lines = this.readLines(file);
-    let title = "新对话";
+    let aiTitle = ""; // last ai-title wins — the title evolves as the chat grows
+    let firstUserText = "";
     let messageCount = 0;
-    let gotTitle = false;
     for (const o of lines) {
-      if (o.type === "ai-title" && typeof o.title === "string" && !gotTitle) {
-        title = o.title;
-        gotTitle = true;
-      }
-      if (o.type === "user" && this.isRealUserText(o)) {
+      if (o.type === "ai-title" && typeof o.aiTitle === "string" && o.aiTitle.trim()) {
+        aiTitle = o.aiTitle.trim();
+      } else if (o.type === "user" && this.isRealUserText(o)) {
         messageCount++;
-        if (!gotTitle && title === "新对话") {
+        if (!firstUserText) {
           // Strip IDE/attached-context noise so the title is the real first message.
           const clean = splitAttachedContext(this.userText(o)).text;
-          if (clean) title = truncate(clean, 60);
+          if (clean) firstUserText = truncate(clean, 60);
         }
       }
     }
-    return { title, messageCount };
+    return { title: aiTitle || firstUserText || "新对话", messageCount };
   }
 
   /** Rehydrate a full session transcript into renderable timeline items. */

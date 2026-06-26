@@ -44,6 +44,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private lastUsageAt = 0; // throttle for subscription-usage queries
   private usageInFlight = false;
+  private lastUsage?: ToWebview; // most recent usage result, replayed to new tabs
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -468,6 +469,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.loadCtxSession(ctx);
           this.postActiveFile();
+          if (this.lastUsage) this.post(ctx, this.lastUsage); // show cached usage immediately
           this.fetchUsage();
           break;
         case "checkUpdate":
@@ -483,12 +485,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.editMessage(ctx, m.checkpointId, m.text);
           break;
         case "interrupt":
+          ctx.pendingPerm = undefined;
           await ctx.proc?.interrupt();
           break;
         case "permission":
+          ctx.pendingPerm = undefined;
           this.handlePermission(ctx, m.requestId, m.behavior, m.suggestionId);
           break;
         case "answerQuestion":
+          ctx.pendingPerm = undefined;
           ctx.proc?.answerQuestion(m.requestId, m.answers);
           break;
         case "newSession":
@@ -612,10 +617,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postSessionContext(ctx, sid);
     if (ctx.proc?.isBusy) {
       this.post(ctx, { kind: "busy", busy: true });
-      if (ctx.pendingPerm) {
-        this.post(ctx, ctx.pendingPerm);
-        ctx.pendingPerm = undefined;
-      }
+      // Replay an unanswered prompt; keep it stashed in case the tab closes again
+      // before it's answered. It's cleared only when the user actually responds.
+      if (ctx.pendingPerm) this.post(ctx, ctx.pendingPerm);
     }
     this.refreshSessions();
     this.refreshChangedFiles(ctx);
@@ -972,7 +976,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
       const parsed = parseUsage(resultText);
-      if (parsed && this.activeCtx) this.post(this.activeCtx, { kind: "usage", ...parsed, sessionResetAt });
+      if (parsed) {
+        // Remember it so newly-opened tabs can show it immediately, and push it
+        // to every open chat tab (not just the focused one).
+        this.lastUsage = { kind: "usage", ...parsed, sessionResetAt };
+        for (const ctx of this.sessions) this.post(ctx, this.lastUsage);
+      }
     };
 
     try {
@@ -1009,13 +1018,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       description: req.description,
       suggestions: req.suggestions,
     };
-    // This session's tab is closed (running in the background) — stash the prompt
-    // and replay it when the tab is reopened (the process waits in the meantime).
-    if (!this.alive(ctx)) {
-      ctx.pendingPerm = msg;
-      return;
-    }
-    this.post(ctx, msg);
+    // Always remember the latest unanswered prompt so a closed/reopened tab can
+    // replay it (the process keeps waiting in the meantime). Cleared on answer.
+    ctx.pendingPerm = msg;
+    if (this.alive(ctx)) this.post(ctx, msg);
   }
 
   private onSessionId(ctx: SessionCtx, id: string, resumed: boolean): void {

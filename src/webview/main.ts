@@ -309,6 +309,18 @@ function updateActiveLine() {
 let tickTimer = 0;
 let turnTokens = 0; // exact output tokens (only arrives at each message's end)
 let turnEst = 0; // live estimate from streamed chars (the CLI doesn't stream counts)
+// The CLI doesn't stream status text in -p mode, so (like Claude Code's TUI) we
+// cycle through its whimsical "working" verbs locally to show it's alive.
+const THINKING_WORDS = [
+  "Thinking", "Cogitating", "Pondering", "Mulling", "Musing", "Noodling", "Ruminating",
+  "Brewing", "Percolating", "Simmering", "Marinating", "Stewing", "Cooking", "Baking",
+  "Churning", "Crunching", "Computing", "Calculating", "Processing", "Synthesizing",
+  "Conjuring", "Crafting", "Forging", "Generating", "Hatching", "Manifesting",
+  "Considering", "Deliberating", "Determining", "Ideating", "Inferring", "Puzzling",
+  "Reticulating", "Spinning", "Vibing", "Working", "Wrangling", "Tinkering",
+];
+let workingRotate = false; // when true the ticker cycles the pill label
+let workingFixed = ""; // a fixed phase label (e.g. preparing options) — no rotation
 function fmtTokens(n: number): string {
   return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
 }
@@ -389,8 +401,15 @@ function startTick() {
       tickTimer = 0;
       return;
     }
+    const elapsed = Math.round((performance.now() - Number(wk.dataset.start || performance.now())) / 1000);
     const t = wk.querySelector(".wk-time") as HTMLElement | null;
-    if (t) t.textContent = `${Math.round((performance.now() - Number(wk.dataset.start || performance.now())) / 1000)}s`;
+    if (t) t.textContent = `${elapsed}s`;
+    // Cycle the label so the wait feels alive (Claude shows more than one state).
+    if (workingRotate && !workingFixed) {
+      const lbl = wk.querySelector(".wk-label") as HTMLElement | null;
+      const seed = Number(wk.dataset.wseed || 0);
+      if (lbl) lbl.textContent = `${THINKING_WORDS[(seed + Math.floor(elapsed / 3)) % THINKING_WORDS.length]}…`;
+    }
   }, 1000);
 }
 
@@ -442,7 +461,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       updateToolInput(m.toolId, m.name, m.input);
       break;
     case "tool_input_partial":
-      updateToolPartial(m.toolId, m.name, m.json);
+      if (m.name === "AskUserQuestion") updatePreparingQuestions(m.json);
+      else updateToolPartial(m.toolId, m.name, m.json);
       break;
     case "tool_result":
       setToolResult(m.toolUseId, m.content, m.isError);
@@ -508,10 +528,17 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
   const body = ensureAssistant();
   if (type === "tool_use" && toolId) {
     finalizeLive();
+    // AskUserQuestion shows as an interactive picker built from its permission
+    // request (which only arrives after the whole tool input has streamed). Keep
+    // the "Thinking" pill alive until then so it doesn't look frozen — and never
+    // render the raw tool card for it.
+    if (toolName === "AskUserQuestion") {
+      showWorking("准备选项…"); // updated live with a count as the input streams
+      liveBlock = null;
+      return;
+    }
     removeWorking();
-    // AskUserQuestion is rendered as an interactive picker (from its permission
-    // request), not as a tool card showing the raw JSON config.
-    if (toolName !== "AskUserQuestion") createToolCard(body, toolId, toolName || "tool");
+    createToolCard(body, toolId, toolName || "tool");
     liveBlock = null;
     return;
   }
@@ -558,7 +585,7 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
   const icon = compact ? "" : toolIcon(name);
   head.innerHTML =
     `${icon ? `<span class="tool-icon">${icon}</span>` : ""}` +
-    `<span class="tool-name">${escapeHtml(name)}</span><span class="tool-sub"></span>` +
+    `<span class="tool-name">${escapeHtml(name)}</span><span class="tool-why"></span><span class="tool-sub"></span>` +
     `<div class="tool-actions"></div>`;
   const bodyWrap = el("div", "tool-body");
   card.append(head, bodyWrap);
@@ -600,6 +627,22 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
 
 /** Live update while a tool's input JSON is still streaming — show the target
  *  file and a growing line count so an Edit/Write is visible before it finishes. */
+/** Live feedback while the AskUserQuestion input streams in (it can be large
+ *  with many questions/options) — show how many questions/options have arrived
+ *  so the wait for the picker doesn't look frozen. */
+function updatePreparingQuestions(json: string) {
+  const wk = assistantEl?.querySelector(".working-pill") as HTMLElement | null;
+  if (!wk) return;
+  const qs = (json.match(/"question"\s*:/g) || []).length;
+  const opts = (json.match(/"label"\s*:/g) || []).length;
+  let label = "准备选项…";
+  if (qs > 0) label = `准备选项 · ${qs} 个问题` + (opts > 0 ? ` ${opts} 选项…` : "…");
+  workingFixed = label;
+  workingRotate = false;
+  const lbl = wk.querySelector(".wk-label") as HTMLElement | null;
+  if (lbl) lbl.textContent = label;
+}
+
 function updateToolPartial(toolId: string, name: string, json: string) {
   const card = toolCards.get(toolId);
   if (!card) return;
@@ -633,7 +676,16 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const card = toolCards.get(toolUseId);
   if (!card) return;
   card.classList.remove("running");
-  card.classList.toggle("error", isError);
+  // Abnormal endings: mark the node red and show WHY it stopped.
+  const interrupted = /interrupt|中断/i.test(content);
+  const bad = isError || interrupted;
+  card.classList.toggle("error", bad);
+  card.closest(".step")?.classList.toggle("error", bad); // red timeline dot
+  const why = card.querySelector(".tool-why") as HTMLElement | null;
+  if (why) {
+    why.classList.toggle("warn", interrupted && !isError);
+    why.textContent = bad ? (interrupted ? "已中断" : "执行失败") : "";
+  }
   // While the model moves on to the next step, show the thinking pill again.
   if (isBusy) showWorking();
   // File tools (Read/Edit/Write/…) don't show their result body — only errors.
@@ -739,6 +791,35 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
   bar.append(label, actions);
   (host.querySelector(".tool-body") as HTMLElement).appendChild(bar);
   scrollToBottom();
+}
+
+/** Render a previously-answered AskUserQuestion (from history) as a clean card
+ *  titled "AskUserQuestion" with a question→answer list, instead of the raw
+ *  "Your questions have been answered: …" tool output. */
+function renderAnsweredQuestion(parent: HTMLElement, result: string) {
+  const pairs = [...result.matchAll(/"([^"]+)"\s*=\s*"([^"]*)"/g)];
+  const card = el("div", "tool-card askq-card");
+  const head = el("div", "tool-head");
+  head.innerHTML = `<span class="tool-name">AskUserQuestion</span>`;
+  const bodyWrap = el("div", "tool-body");
+  if (pairs.length) {
+    const list = el("div", "askq-summary");
+    for (const [, q, a] of pairs) {
+      const row = el("div", "askq-row");
+      row.append(el("span", "askq-q", q), el("span", "askq-a", a));
+      list.appendChild(row);
+    }
+    bodyWrap.appendChild(list);
+  } else if (result.trim()) {
+    const pre = el("pre", "tool-result-body");
+    pre.textContent = truncateText(result, 4000);
+    bodyWrap.appendChild(pre);
+  }
+  card.append(head, bodyWrap);
+  const step = el("div", "step");
+  step.append(el("div", "step-dot"), card);
+  parent.appendChild(step);
+  maybeScroll();
 }
 
 /** Render an AskUserQuestion tool as a compact paginated option picker. */
@@ -995,6 +1076,11 @@ function renderHistory(showAll: boolean) {
     } else if (it.type === "thinking") {
       // thinking is not displayed
     } else if (it.type === "tool") {
+      if (it.name === "AskUserQuestion") {
+        // Show the answered question as a clean titled card (not the raw output).
+        renderAnsweredQuestion(ensureAssistant(), typeof it.result === "string" ? it.result : "");
+        continue;
+      }
       const body = ensureAssistant();
       createToolCard(body, it.toolId, it.name);
       if (it.input) updateToolInput(it.toolId, it.name, it.input);
@@ -1970,19 +2056,25 @@ function setBusy(busy: boolean) {
 
 /** A live "思考中 · Ns" pill shown whenever the model is working but not
  *  currently writing visible text (turn start, thinking, between tool steps). */
-function showWorking(label = "Thinking") {
+/** Show the live activity pill. With no arg it cycles "thinking" verbs; pass a
+ *  fixed `label` for a specific phase (e.g. preparing the option picker). */
+function showWorking(label?: string) {
   const body = ensureAssistant();
   let w = body.querySelector(".working-pill") as HTMLElement | null;
   if (!w) {
     w = el("div", "working-pill");
     w.dataset.start = String(performance.now());
+    w.dataset.wseed = String(Math.floor(Math.random() * THINKING_WORDS.length)); // varies the starting verb
     w.innerHTML =
       `<span class="typing"><span></span><span></span><span></span></span>` +
       `<span class="wk-label"></span><span class="wk-time">0s</span><span class="wk-tokens"></span>`;
     body.appendChild(w);
   }
+  workingFixed = label ?? "";
+  workingRotate = !label;
   const lbl = w.querySelector(".wk-label") as HTMLElement;
-  if (lbl) lbl.textContent = label;
+  const seed = Number(w.dataset.wseed || 0);
+  if (lbl) lbl.textContent = label ?? `${THINKING_WORDS[seed % THINKING_WORDS.length]}…`;
   const tk = w.querySelector(".wk-tokens") as HTMLElement;
   if (tk) tk.textContent = turnTokens > 0 ? `${fmtTokens(turnTokens)} tokens` : "";
   // Always keep the pill as the last element so it sits below the latest output.
@@ -1992,6 +2084,8 @@ function showWorking(label = "Thinking") {
 }
 function removeWorking() {
   assistantEl?.querySelector(".working-pill")?.remove();
+  workingRotate = false;
+  workingFixed = "";
 }
 
 function openDrawer(panel: HTMLElement) {

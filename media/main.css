@@ -415,15 +415,18 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .thinking-body { margin-top: 4px; }
 
 /* ---- Tool cards ---- */
-.tool-card {
+/* The tool name is its OWN node title (not nested inside the content box);
+   the input/result sits in a boxed body below it. */
+.tool-card { margin: 8px 0; }
+.tool-card .tool-body {
   border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.25));
   border-radius: 6px;
-  margin: 8px 0;
   overflow: hidden;
 }
-.tool-card.running { border-color: var(--vscode-progressBar-background, #3794ff); }
-.tool-card.error { border-color: var(--vscode-errorForeground, #f14c4c); }
-.tool-card.needs-approval { border-color: var(--vscode-panel-border, rgba(128,128,128,.5)); }
+.tool-card.running .tool-body { border-color: var(--vscode-progressBar-background, #3794ff); }
+.tool-card.error .tool-body { border-color: var(--vscode-errorForeground, #f14c4c); }
+.tool-card.needs-approval .tool-body { border-color: var(--vscode-panel-border, rgba(128,128,128,.5)); }
+.tool-body:empty { display: none; }
 
 /* Timeline step: a node dot on the left rail for each tool action */
 .step { position: relative; margin: 6px 0; }
@@ -435,11 +438,23 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   border: 2px solid var(--vscode-sideBar-background);
 }
 .step.edit .step-dot { background: var(--vscode-testing-iconPassed, #3fb950); }
+/* abnormal endings (error / interrupted) get a red node */
+.step.error .step-dot { background: var(--vscode-errorForeground, #f14c4c); }
+/* short reason badge in the card head ("执行失败" / "已中断") */
+.tool-why { flex: 0 0 auto; font-size: 10.5px; line-height: 1; padding: 2px 6px; border-radius: 8px;
+  color: #fff; background: var(--vscode-errorForeground, #f14c4c); }
+.tool-why.warn { background: #d9a23e; }
+.tool-why:empty { display: none; }
+/* answered AskUserQuestion summary (history) */
+.askq-summary { display: flex; flex-direction: column; gap: 4px; padding: 4px 2px; }
+.askq-row { display: flex; gap: 8px; font-size: 12px; }
+.askq-q { flex: 0 0 auto; max-width: 45%; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.askq-a { flex: 1; min-width: 0; font-weight: 600; }
 /* the avatar icon is the first node — don't draw a dot that overlaps it */
 .msg-body > .step:first-child > .step-dot { display: none; }
 .tool-head {
   display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px;
+  padding: 0 0 3px;
   font-size: 12px;
 }
 .tool-name { font-weight: 600; }
@@ -494,7 +509,7 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .tool-card.compact { margin: 0; border: none; background: transparent; overflow: visible; }
 .tool-card.compact .tool-head { background: transparent; padding: 1px 0; }
 .tool-card.compact .tool-name { font-weight: 600; color: var(--vscode-foreground); font-size: 12px; }
-.tool-card.compact .tool-body { padding: 0; }
+.tool-card.compact .tool-body { padding: 0; border: none; }
 .tool-card.compact .tool-body:empty { display: none; }
 
 /* History "show earlier messages" banner */

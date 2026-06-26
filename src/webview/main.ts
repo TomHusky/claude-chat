@@ -808,6 +808,7 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
             sel[cur].add(o.label);
             row.classList.add("on");
           }
+          updateFoot();
         } else {
           sel[cur].clear();
           sel[cur].add(o.label);
@@ -816,8 +817,19 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
           row.classList.add("on");
           customInput.value = "";
           customRow.classList.remove("on");
+          updateFoot();
+          // Single-select: auto-advance to the next question after a brief beat
+          // (so the ✓ feedback is visible). Last question stays for manual submit.
+          const from = cur;
+          if (from < questions.length - 1) {
+            setTimeout(() => {
+              if (!done && cur === from) {
+                cur = from + 1;
+                paint();
+              }
+            }, 320);
+          }
         }
-        updateFoot();
       };
       rows.push(row);
       optsBox.append(row);

@@ -1203,6 +1203,18 @@ function renderSessions(list: SessionItem[], activeId?: string) {
     const titleEl = el("div", "list-title", s.title);
     main.append(titleEl, el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
     row.appendChild(main);
+    // Inline actions: edit (left) then delete (right). No right-click menu.
+    const actions = el("div", "list-actions");
+    const editBtn = el("button", "list-act");
+    editBtn.title = "重命名";
+    editBtn.innerHTML = ICON.edit;
+    editBtn.onclick = (e) => { e.stopPropagation(); startRenameSession(titleEl, s.id, s.title); };
+    const delBtn = el("button", "list-act danger");
+    delBtn.title = "删除";
+    delBtn.innerHTML = ICON.trash;
+    delBtn.onclick = (e) => { e.stopPropagation(); send({ type: "deleteSession", sessionId: s.id }); };
+    actions.append(editBtn, delBtn);
+    row.appendChild(actions);
     row.onclick = () => {
       if (multiSelect) {
         if (selectedSessions.has(s.id)) selectedSessions.delete(s.id);
@@ -1212,13 +1224,6 @@ function renderSessions(list: SessionItem[], activeId?: string) {
         send({ type: "switchSession", sessionId: s.id });
         closeDrawers();
       }
-    };
-    row.oncontextmenu = (e) => {
-      e.preventDefault();
-      showCtxMenu(e.clientX, e.clientY, [
-        { label: "重命名", run: () => startRenameSession(titleEl, s.id, s.title) },
-        { label: "删除会话", danger: true, run: () => send({ type: "deleteSession", sessionId: s.id }) },
-      ]);
     };
     sessionsList.appendChild(row);
   }

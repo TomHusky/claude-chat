@@ -1014,6 +1014,16 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   outline: none;
 }
 .list-meta { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 2px; }
+.list-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; opacity: 0; }
+.list-row:hover .list-actions { opacity: 1; }
+.list-act {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; border: none; border-radius: 4px;
+  background: transparent; color: var(--vscode-foreground); cursor: pointer; opacity: .7;
+}
+.list-act svg { width: 14px; height: 14px; }
+.list-act:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.2)); }
+.list-act.danger:hover { color: var(--vscode-errorForeground); }
 .list-del, .list-restore {
   background: transparent; border: 1px solid transparent; cursor: pointer;
   color: var(--vscode-foreground); border-radius: 4px; padding: 2px 8px; font-size: 11px;

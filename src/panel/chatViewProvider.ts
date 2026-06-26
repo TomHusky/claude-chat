@@ -15,7 +15,6 @@ const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const ORIG_SCHEME = "claude-orig";
 /** workspaceState key: id of the last active session (restored on open). */
 const LAST_SESSION_KEY = "claudeChat.lastSession";
-const TITLE_OVERRIDES_KEY = "claudeChat.titleOverrides"; // sessionId -> user-set title
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "claude-chat.chatView";
@@ -42,7 +41,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
   ) {
     this.store = new SessionStore(this.cwd());
-    this.store.setTitleOverrides(this.context.globalState.get<Record<string, string>>(TITLE_OVERRIDES_KEY, {}));
     this.checkpoints = new CheckpointManager(this.storageDir());
 
     // Serve baseline (pre-edit) content so the native diff editor can show
@@ -885,15 +883,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.refreshSessions();
   }
 
-  /** Set (or clear, when blank) a user-defined title for a session. Stored in
-   *  the extension's own globalState — Claude Code's transcript is never touched. */
+  /** Set (or clear, when blank) a user-defined title. Persisted as a
+   *  `custom-title` entry in the transcript — the same mechanism the official
+   *  Claude UI uses, so renames stay in sync both ways. */
   private renameSession(sessionId: string, title: string): void {
-    const map = { ...this.context.globalState.get<Record<string, string>>(TITLE_OVERRIDES_KEY, {}) };
     const clean = (title || "").trim().slice(0, 80);
-    if (clean) map[sessionId] = clean;
-    else delete map[sessionId]; // empty -> revert to AI title / first message
-    void this.context.globalState.update(TITLE_OVERRIDES_KEY, map);
-    this.store.setTitleOverrides(map);
+    if (!this.store.setCustomTitle(sessionId, clean)) {
+      vscode.window.showWarningMessage("重命名失败：找不到该会话的记录文件。");
+      return;
+    }
     this.refreshSessions();
   }
 
@@ -1242,6 +1240,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ].join("; ");
     const TRASH =
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/></svg>';
+    const PENCIL =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3.2H3.6a1 1 0 0 0-1 1v7.2a1 1 0 0 0 1 1h7.2a1 1 0 0 0 1-1V7.5"/><path d="M11 2.6a1.1 1.1 0 0 1 1.6 1.6L7.8 9 5.6 9.6 6.2 7.4z"/></svg>';
 
     return /* html */ `<!DOCTYPE html>
 <html lang="zh">
@@ -1282,16 +1282,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .rename { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; padding: 1px 4px;
     border: 1px solid var(--vscode-focusBorder, #3794ff); border-radius: 4px; outline: none;
     background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
-  .row .del { flex: 0 0 auto; opacity: 0; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 2px; border-radius: 4px; }
-  .row:hover .del { opacity: .65; }
+  .row .edit, .row .del { flex: 0 0 auto; opacity: 0; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 2px; border-radius: 4px; }
+  .row:hover .edit, .row:hover .del { opacity: .65; }
+  .row .edit:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25)); }
   .row .del:hover { opacity: 1; color: var(--vscode-errorForeground, #e55); }
-  .row .del svg { width: 14px; height: 14px; }
-  body.multi .row .del { display: none; }
-  .ctx { position: fixed; z-index: 50; background: var(--vscode-menu-background, #2a2a2a); border: 1px solid var(--vscode-menu-border, rgba(127,127,127,.3)); border-radius: 6px; padding: 4px; box-shadow: 0 4px 14px rgba(0,0,0,.35); min-width: 120px; }
-  .ctx.hidden { display: none; }
-  .ctx button { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--vscode-menu-foreground, inherit); padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  .ctx button:hover { background: var(--vscode-menu-selectionBackground, rgba(80,120,255,.3)); }
-  .ctx button.danger { color: var(--vscode-errorForeground, #e55); }
+  .row .edit svg, .row .del svg { width: 14px; height: 14px; }
+  body.multi .row .edit, body.multi .row .del { display: none; }
 </style>
 </head>
 <body>
@@ -1304,10 +1300,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <button id="upd-banner" class="upd-banner hidden">${ICONS.update}<span>发现新版本 <b id="upd-ver"></b> · 点击更新</span></button>
   <button id="new" class="new">${ICONS.add}<span>新建会话</span></button>
   <div id="list" class="list"><div class="empty">暂无会话</div></div>
-  <div id="ctx" class="ctx hidden"></div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const TRASH = ${JSON.stringify(TRASH)};
+    const PENCIL = ${JSON.stringify(PENCIL)};
     let sessions = [], activeId = null, multi = false;
     const sel = new Set();
     const $ = (id) => document.getElementById(id);
@@ -1336,11 +1332,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const meta = document.createElement("div"); meta.className = "meta";
         meta.textContent = fmt(s.updatedAt) + (s.messageCount ? "  ·  " + s.messageCount + " 条" : "");
         body.append(t, meta);
+        const edit = document.createElement("button"); edit.className = "edit"; edit.title = "重命名"; edit.innerHTML = PENCIL;
+        edit.addEventListener("click", (e) => { e.stopPropagation(); rename(s.id); });
         const del = document.createElement("button"); del.className = "del"; del.title = "删除"; del.innerHTML = TRASH;
         del.addEventListener("click", (e) => { e.stopPropagation(); confirmDel([s.id]); });
-        row.append(chk, body, del);
+        row.append(chk, body, edit, del);
         row.addEventListener("click", () => { if (multi) toggle(s.id, !sel.has(s.id)); else open(s.id); });
-        row.addEventListener("contextmenu", (e) => { e.preventDefault(); showCtx(e.clientX, e.clientY, s.id); });
         list.appendChild(row);
       }
     }
@@ -1349,20 +1346,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     function open(id) { vscode.postMessage({ type: "openSession", sessionId: id }); }
     function confirmDel(ids) { if (ids.length) vscode.postMessage({ type: "deleteSessions", sessionIds: ids }); }
 
-    function showCtx(x, y, id) {
-      const c = $("ctx");
-      c.innerHTML = "";
-      const openBtn = document.createElement("button"); openBtn.textContent = "打开";
-      openBtn.onclick = () => { hideCtx(); open(id); };
-      const renBtn = document.createElement("button"); renBtn.textContent = "重命名";
-      renBtn.onclick = () => { hideCtx(); rename(id); };
-      const delBtn = document.createElement("button"); delBtn.className = "danger"; delBtn.textContent = "删除";
-      delBtn.onclick = () => { hideCtx(); confirmDel([id]); };
-      c.append(openBtn, renBtn, delBtn);
-      c.style.left = Math.min(x, window.innerWidth - 140) + "px";
-      c.style.top = Math.min(y, window.innerHeight - 80) + "px";
-      c.classList.remove("hidden");
-    }
     function rename(id) {
       const row = document.querySelector('.row[data-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
       if (!row) return;
@@ -1385,10 +1368,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
       input.addEventListener("blur", () => commit(true));
     }
-    function hideCtx() { $("ctx").classList.add("hidden"); }
-    window.addEventListener("click", hideCtx);
-    window.addEventListener("scroll", hideCtx, true);
-
     $("new").addEventListener("click", () => vscode.postMessage({ type: "newInEditor" }));
     $("multi").addEventListener("click", () => {
       multi = !multi; document.body.classList.toggle("multi", multi);

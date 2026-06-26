@@ -12,13 +12,22 @@ import { CTX_OPEN, CTX_CLOSE, SessionSummary, TimelineItem } from "../shared";
  *   - encoded-cwd = absolute cwd with every non-alphanumeric char -> '-'
  */
 export class SessionStore {
-  /** User-set title overrides (sessionId -> title), injected by the provider. */
-  private overrides: Record<string, string> = {};
-
   constructor(private readonly cwd: string) {}
 
-  setTitleOverrides(o: Record<string, string>): void {
-    this.overrides = o || {};
+  /** Persist a user-set title by appending a `custom-title` entry to the
+   *  transcript — the exact same mechanism the official Claude UI uses, so
+   *  renames sync both ways. Empty title clears the override (back to AI title).
+   *  Returns false if the session file isn't on disk yet. */
+  setCustomTitle(sessionId: string, title: string): boolean {
+    const file = this.findFile(sessionId);
+    if (!file) return false;
+    const entry = JSON.stringify({ type: "custom-title", customTitle: title, sessionId }) + "\n";
+    try {
+      fs.appendFileSync(file, entry, "utf8");
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private configDir(): string {
@@ -55,10 +64,9 @@ export class SessionStore {
           const stat = fs.statSync(full);
           const { title, messageCount } = this.peek(full);
           if (messageCount === 0) continue; // skip empty/aborted sessions
-          const id = file.replace(/\.jsonl$/, "");
           out.push({
-            id,
-            title: this.overrides[id] || title,
+            id: file.replace(/\.jsonl$/, ""),
+            title,
             updatedAt: stat.mtimeMs,
             messageCount,
           });
@@ -70,16 +78,20 @@ export class SessionStore {
     return out.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  /** Cheap scan for the list: prefer Claude Code's own AI-generated title
-   *  (persisted as `ai-title` entries — same one the official UI shows), else
-   *  fall back to the first real user prompt. Also counts user turns. */
+  /** Cheap scan for the list. Title priority mirrors the official UI:
+   *  manual rename (`custom-title`) > AI title (`ai-title`) > first user prompt.
+   *  Both title kinds are persisted in the transcript; the last entry wins
+   *  (titles evolve as the chat grows). Also counts user turns. */
   private peek(file: string): { title: string; messageCount: number } {
     const lines = this.readLines(file);
-    let aiTitle = ""; // last ai-title wins — the title evolves as the chat grows
+    let customTitle: string | null = null; // last custom-title; "" means user cleared it
+    let aiTitle = "";
     let firstUserText = "";
     let messageCount = 0;
     for (const o of lines) {
-      if (o.type === "ai-title" && typeof o.aiTitle === "string" && o.aiTitle.trim()) {
+      if (o.type === "custom-title" && typeof o.customTitle === "string") {
+        customTitle = o.customTitle.trim();
+      } else if (o.type === "ai-title" && typeof o.aiTitle === "string" && o.aiTitle.trim()) {
         aiTitle = o.aiTitle.trim();
       } else if (o.type === "user" && this.isRealUserText(o)) {
         messageCount++;
@@ -90,7 +102,7 @@ export class SessionStore {
         }
       }
     }
-    return { title: aiTitle || firstUserText || "新对话", messageCount };
+    return { title: (customTitle || aiTitle || firstUserText || "新对话"), messageCount };
   }
 
   /** Rehydrate a full session transcript into renderable timeline items. */

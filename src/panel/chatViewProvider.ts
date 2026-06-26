@@ -16,24 +16,34 @@ const ORIG_SCHEME = "claude-orig";
 /** workspaceState key: id of the last active session (restored on open). */
 const LAST_SESSION_KEY = "claudeChat.lastSession";
 
+/** Everything that belongs to one chat tab: its own panel, process, transcript
+ *  position, checkpoints. Each session lives in its OWN editor tab and its OWN
+ *  claude process — switching/closing tabs never touches another session. */
+interface SessionCtx {
+  panel: vscode.WebviewPanel;
+  webview: vscode.Webview;
+  sessionId?: string; // undefined until the first turn creates one
+  proc?: ClaudeProcess;
+  starting?: Promise<ClaudeProcess | undefined>;
+  checkpoints: CheckpointManager;
+  pendingContext?: string;
+  pendingPerm?: ToWebview; // permission raised while this tab was hidden/closed
+  blank: boolean; // a fresh "new chat" tab with no session yet
+  ready: boolean; // its webview finished loading
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "claude-chat.chatView";
 
   private view?: vscode.WebviewView;
-  private panel?: vscode.WebviewPanel; // editor-area webview (movable / splittable, e.g. to the right)
-  private active?: vscode.Webview; // whichever webview the user last interacted with
-  private proc?: ClaudeProcess;
-  private starting?: Promise<ClaudeProcess | undefined>;
+  /** One context per open chat tab. */
+  private readonly sessions = new Set<SessionCtx>();
+  /** The chat tab the user most recently focused (target for global commands). */
+  private activeCtx?: SessionCtx;
   private store: SessionStore;
-  private checkpoints: CheckpointManager;
-  private activeSessionId?: string;
-  private webviewReady = false;
-  private pendingContext?: string;
-  private forceBlank = false; // next panel-ready should show a blank new session
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private lastUsageAt = 0; // throttle for subscription-usage queries
   private usageInFlight = false;
-  private running = false; // a turn is currently streaming (drives the green dot)
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -42,18 +52,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
   ) {
     this.store = new SessionStore(this.cwd());
-    this.checkpoints = new CheckpointManager(this.storageDir());
 
     // Serve baseline (pre-edit) content so the native diff editor can show
-    // "original ⟷ current" for any file Claude changed this session.
-    const cm = this.checkpoints;
+    // "original ⟷ current" for any file Claude changed — checking every open
+    // session's checkpoints for the file's pre-edit content.
     const origChanged = this.origChanged;
+    const sessions = this.sessions;
     this.context.subscriptions.push(
       vscode.workspace.registerTextDocumentContentProvider(ORIG_SCHEME, {
         onDidChange: origChanged.event,
         provideTextDocumentContent(uri: vscode.Uri): string {
           if (uri.query === "empty") return "";
-          return cm.originalOf(uri.path) ?? "";
+          for (const s of sessions) {
+            const orig = s.checkpoints.originalOf(uri.path);
+            if (orig != null) return orig;
+          }
+          return "";
         },
       }),
       origChanged,
@@ -64,9 +78,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** Chat tabs whose panel was closed while their reply was still streaming.
+   *  Keyed by sessionId — kept alive in the background; reopening re-adopts them. */
+  private readonly detached = new Map<string, SessionCtx>();
+
   /** Tell the webview which file is shown (for the default chip). Never clears
    *  it just because focus moved to the chat — only updates to a real file. */
   private postActiveFile(): void {
+    if (!this.activeCtx) return;
     let p: string | undefined;
     const ed = vscode.window.activeTextEditor;
     if (ed && ed.document.uri.scheme === "file") {
@@ -75,7 +94,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const input = vscode.window.tabGroups.activeTabGroup?.activeTab?.input as { uri?: vscode.Uri } | undefined;
       if (input?.uri && input.uri.scheme === "file") p = input.uri.fsPath;
     }
-    if (p) this.post({ kind: "active_file", path: p });
+    if (p) this.post(this.activeCtx, { kind: "active_file", path: p });
   }
 
   /** Build a context block from attached files/dirs (embedded content / listing). */
@@ -144,15 +163,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     // The left sidebar is a session manager only — chat lives in the editor panel.
     view.webview.html = this.sidebarHtml(view.webview);
-    view.webview.onDidReceiveMessage((m: FromWebview) => this.onMessage(m));
+    view.webview.onDidReceiveMessage((m: FromWebview) => this.onSidebarMessage(m));
     this.postUpdateDot(); // restore the badge if an update was already detected
     view.onDidChangeVisibility(() => {
       if (view.visible) {
         this.post2(view.webview, {
           kind: "sessions",
           list: this.store.list(),
-          activeId: this.activeSessionId,
-          runningId: this.running ? this.activeSessionId : undefined,
+          activeId: this.activeCtx?.sessionId,
+          runningIds: this.runningIds(),
         });
         this.postUpdateDot();
       }
@@ -175,33 +194,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Broadcast the session list to both the sidebar manager and the chat panel. */
+  /** Broadcast the session list to the sidebar manager and EVERY chat panel,
+   *  and set each panel's tab title to its own session's title. */
   private refreshSessions(): void {
     const list = this.store.list();
     const e: ToWebview = {
       kind: "sessions",
       list,
-      activeId: this.activeSessionId,
-      runningId: this.running ? this.activeSessionId : undefined,
+      activeId: this.activeCtx?.sessionId,
+      runningIds: this.runningIds(),
     };
     this.view?.webview.postMessage(e);
-    this.panel?.webview.postMessage(e);
-    this.setPanelTitle(list.find((s) => s.id === this.activeSessionId)?.title);
-  }
-
-  /** Show the active conversation's title on the editor tab (falls back to brand). */
-  private setPanelTitle(title?: string): void {
-    if (this.panel) this.panel.title = title?.trim() || "ClaudeCopilot";
-  }
-
-  /** Open the chat as an editor-area panel (like Claude Code) — opens beside the
-   *  current editor so it can live on the right and be split/moved freely. */
-  async openInEditor(): Promise<void> {
-    if (this.panel) {
-      this.panel.reveal(this.panel.viewColumn ?? vscode.ViewColumn.Beside, false);
-      await this.lockChatGroup();
-      return;
+    for (const ctx of this.sessions) {
+      ctx.panel.webview.postMessage(e);
+      this.setPanelTitle(ctx);
     }
+  }
+
+  /** Show a session's conversation title on its own editor tab (falls back to brand). */
+  private setPanelTitle(ctx: SessionCtx): void {
+    const title = ctx.sessionId
+      ? this.store.list().find((s) => s.id === ctx.sessionId)?.title
+      : undefined;
+    ctx.panel.title = title?.trim() || "ClaudeCopilot";
+  }
+
+  /**
+   * Open a chat session in its OWN editor tab with its OWN claude process.
+   * If `sessionId` is given and already open, reveal that tab. If it's detached
+   * (closed mid-reply, still running), re-adopt it. Otherwise create a fresh tab.
+   */
+  async openSession(sessionId?: string): Promise<void> {
+    // Already open in a live tab — just reveal it.
+    if (sessionId) {
+      for (const ctx of this.sessions) {
+        if (ctx.sessionId === sessionId) {
+          ctx.panel.reveal(ctx.panel.viewColumn, false);
+          this.activeCtx = ctx;
+          await this.lockChatGroup(ctx.panel);
+          return;
+        }
+      }
+      // Detached but still running in the background — re-adopt with its process.
+      const det = this.detached.get(sessionId);
+      if (det) {
+        this.detached.delete(sessionId);
+        await this.reopenDetached(det);
+        return;
+      }
+    }
+
     const panel = vscode.window.createWebviewPanel(
       "claude-chat.editor",
       "ClaudeCopilot",
@@ -212,15 +254,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
       },
     );
-    this.adoptPanel(panel);
+    const ctx: SessionCtx = {
+      panel,
+      webview: panel.webview,
+      sessionId,
+      checkpoints: new CheckpointManager(this.storageDir()),
+      blank: !sessionId,
+      ready: false,
+    };
+    if (sessionId) ctx.checkpoints.setSession(sessionId);
+    this.adoptPanel(ctx);
+    this.sessions.add(ctx);
+    this.activeCtx = ctx;
     // Lock the chat's editor group so files opened from the explorer go to another
     // group instead of replacing the chat tab (lets you view files + chat together).
-    await this.lockChatGroup();
+    await this.lockChatGroup(panel);
   }
 
-  /** Wire a freshly-created OR a restored (deserialized) editor panel into the
-   *  provider: set its HTML/icon, route its messages, and track it as the panel. */
-  private adoptPanel(panel: vscode.WebviewPanel): void {
+  /** Re-adopt a session detached while streaming: fresh panel, reuse its proc. */
+  private async reopenDetached(det: SessionCtx): Promise<void> {
+    const panel = vscode.window.createWebviewPanel(
+      "claude-chat.editor",
+      "ClaudeCopilot",
+      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
+      },
+    );
+    det.panel = panel;
+    det.webview = panel.webview;
+    det.ready = false;
+    det.blank = false;
+    this.adoptPanel(det);
+    this.sessions.add(det);
+    this.activeCtx = det;
+    await this.lockChatGroup(panel);
+    // History + busy state are restored when its webview fires `ready`.
+  }
+
+  /** Wire a freshly-created OR a restored (deserialized) editor panel into a ctx:
+   *  set its HTML/icon, route its messages, and handle its disposal. */
+  private adoptPanel(ctx: SessionCtx): void {
+    const panel = ctx.panel;
     panel.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
@@ -228,37 +305,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     panel.title = "ClaudeCopilot";
     panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, "media", "icon.svg");
     panel.webview.html = this.html(panel.webview);
+    ctx.webview = panel.webview;
     panel.webview.onDidReceiveMessage((m: FromWebview) => {
-      this.active = panel.webview;
-      this.onMessage(m);
+      this.activeCtx = ctx;
+      this.onPanelMessage(ctx, m);
     });
-    panel.onDidDispose(() => {
-      if (this.panel === panel) this.panel = undefined;
-      if (this.active === panel.webview) this.active = this.view?.webview;
-    });
-    this.panel = panel;
-    this.active = panel.webview;
+    panel.onDidDispose(() => this.onPanelClosed(ctx));
+  }
+
+  /** A chat tab was closed. If its reply is still streaming, keep the process
+   *  running in the background and stash the ctx so reopening re-attaches it;
+   *  otherwise dispose the process. */
+  private onPanelClosed(ctx: SessionCtx): void {
+    this.sessions.delete(ctx);
+    if (this.activeCtx === ctx) this.activeCtx = undefined;
+    if (ctx.proc?.isBusy && ctx.sessionId) {
+      // 后台继续跑,重开再接管 — keep it alive, suppress its (now-dead) UI posts.
+      this.detached.set(ctx.sessionId, ctx);
+    } else {
+      ctx.proc?.dispose();
+      ctx.proc = undefined;
+      ctx.starting = undefined;
+    }
+    this.broadcastRunning();
+    this.refreshSessions();
   }
 
   /** Re-adopt a panel restored by VS Code after a window reload/restart. Without
-   *  this, the serialized tab comes back blank (no title, no content). */
+   *  this, the serialized tab comes back blank (no title, no content). It loads
+   *  the last session (or blank) when its webview fires `ready`. */
   async revivePanel(panel: vscode.WebviewPanel): Promise<void> {
-    if (this.panel && this.panel !== panel) {
-      // We somehow already have a live panel; drop the duplicate restored one.
-      panel.dispose();
-      return;
-    }
-    this.adoptPanel(panel);
-    await this.lockChatGroup();
+    const ctx: SessionCtx = {
+      panel,
+      webview: panel.webview,
+      checkpoints: new CheckpointManager(this.storageDir()),
+      blank: false, // restore last session on ready
+      ready: false,
+    };
+    this.adoptPanel(ctx);
+    this.sessions.add(ctx);
+    this.activeCtx = ctx;
+    await this.lockChatGroup(panel);
   }
 
-  /** Lock the chat panel's editor group so explorer files open in another group
+  /** Lock a chat panel's editor group so explorer files open in another group
    *  instead of replacing the chat tab. */
-  private async lockChatGroup(): Promise<void> {
-    if (!this.panel) return;
+  private async lockChatGroup(panel: vscode.WebviewPanel): Promise<void> {
     try {
       // Bring the chat panel forward so ITS group becomes the active group.
-      this.panel.reveal(this.panel.viewColumn, false);
+      panel.reveal(panel.viewColumn, false);
       // reveal()'s group activation is applied asynchronously — wait a tick so we
       // don't lock whatever group happened to be active (e.g. a file group) and
       // leave the chat group unlocked (which lets files replace the chat tab).
@@ -272,7 +367,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // -- Commands (from package.json) ----------------------------------------
 
   async newSession(): Promise<void> {
-    await this.startFreshSession();
+    await this.openSession(undefined);
+  }
+
+  /** Open the chat panel (compat command). Opens the last session, or a new one. */
+  async openInEditor(): Promise<void> {
+    const last = this.context.workspaceState.get<string>(LAST_SESSION_KEY);
+    await this.openSession(last && this.store.findFile(last) ? last : undefined);
   }
 
   async showSessions(): Promise<void> {
@@ -281,18 +382,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   async stop(): Promise<void> {
-    await this.proc?.interrupt();
+    await this.activeCtx?.proc?.interrupt();
   }
 
   focusInput(): void {
     this.reveal();
-    this.post({ kind: "notice", message: "" }); // no-op nudge; webview focuses input on reveal
+    if (this.activeCtx) this.post(this.activeCtx, { kind: "notice", message: "" }); // webview focuses input on reveal
   }
 
   addSelection(): void {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.selection.isEmpty) {
       vscode.window.showInformationMessage("没有选中的代码。");
+      return;
+    }
+    const ctx = this.activeCtx;
+    if (!ctx) {
+      vscode.window.showInformationMessage("请先打开一个会话。");
       return;
     }
     const sel = editor.document.getText(editor.selection);
@@ -302,25 +408,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const end = editor.selection.end.line + 1;
     const label = `${rel}:${start}-${end}`;
     const text = `选中代码 \`${label}\`:\n\`\`\`${lang}\n${sel}\n\`\`\``;
-    this.pendingContext = text;
+    ctx.pendingContext = text;
     this.reveal();
-    this.post({ kind: "context_added", label, text });
+    this.post(ctx, { kind: "context_added", label, text });
   }
 
   // -- Message handling ----------------------------------------------------
 
-  private async onMessage(m: FromWebview): Promise<void> {
+  /** Messages from the left sidebar (session manager only). */
+  private async onSidebarMessage(m: FromWebview): Promise<void> {
     try {
       switch (m.type) {
         case "ready":
-          this.webviewReady = true;
-          this.post({
+        case "listSessions":
+          this.refreshSessions();
+          this.postUpdateDot();
+          this.fetchUsage();
+          break;
+        case "checkUpdate":
+          await this.checkForUpdate();
+          break;
+        case "refreshUsage":
+          this.fetchUsage(true);
+          break;
+        case "switchSession":
+        case "openSession":
+          await this.openSession(m.sessionId);
+          break;
+        case "newInEditor":
+        case "newSession":
+          await this.openSession(undefined);
+          break;
+        case "deleteSession":
+          await this.deleteSessions([m.sessionId]);
+          break;
+        case "deleteSessions":
+          await this.deleteSessions(m.sessionIds);
+          break;
+        case "renameSession":
+          this.renameSession(m.sessionId, m.title);
+          break;
+      }
+    } catch (err) {
+      this.output.appendLine(`[onSidebarMessage:${m.type}] ${String(err)}`);
+    }
+  }
+
+  /** Messages from a chat panel — every message is scoped to that panel's ctx. */
+  private async onPanelMessage(ctx: SessionCtx, m: FromWebview): Promise<void> {
+    try {
+      switch (m.type) {
+        case "ready":
+          ctx.ready = true;
+          this.post(ctx, {
             kind: "config",
             permissionMode: this.config().get<string>("permissionMode", "default"),
             model: this.config().get<string>("model", ""),
             effort: this.config().get<string>("effort", ""),
           });
-          this.restoreLastOrActive();
+          this.loadCtxSession(ctx);
           this.postActiveFile();
           this.fetchUsage();
           break;
@@ -331,62 +477,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.fetchUsage(true);
           break;
         case "send":
-          await this.handleSend(m.text, m.context, m.images, m.files);
+          await this.handleSend(ctx, m.text, m.context, m.images, m.files);
           break;
         case "editMessage":
-          await this.editMessage(m.checkpointId, m.text);
+          await this.editMessage(ctx, m.checkpointId, m.text);
           break;
         case "interrupt":
-          await this.proc?.interrupt();
+          await ctx.proc?.interrupt();
           break;
         case "permission":
-          this.handlePermission(m.requestId, m.behavior, m.suggestionId);
+          this.handlePermission(ctx, m.requestId, m.behavior, m.suggestionId);
           break;
         case "answerQuestion":
-          this.proc?.answerQuestion(m.requestId, m.answers);
+          ctx.proc?.answerQuestion(m.requestId, m.answers);
           break;
         case "newSession":
-          await this.startFreshSession();
+          await this.openSession(undefined);
           break;
         case "listSessions":
           this.refreshSessions();
           this.postUpdateDot();
           break;
-        case "switchSession":
-          await this.switchSession(m.sessionId);
-          break;
-        case "openSession":
-          await this.openInEditor();
-          await this.switchSession(m.sessionId);
-          break;
-        case "newInEditor":
-          this.forceBlank = true;
-          await this.openInEditor();
-          await this.startFreshSession();
-          break;
-        case "deleteSession":
-          await this.deleteSessions([m.sessionId]);
-          break;
-        case "renameSession":
-          this.renameSession(m.sessionId, m.title);
-          break;
-        case "deleteSessions":
-          await this.deleteSessions(m.sessionIds);
-          break;
         case "listCheckpoints":
-          this.post({ kind: "checkpoints", list: this.checkpoints.list() });
+          this.post(ctx, { kind: "checkpoints", list: ctx.checkpoints.list() });
           break;
         case "restoreCheckpoint":
-          await this.restoreCheckpoint(m.checkpointId);
+          await this.restoreCheckpoint(ctx, m.checkpointId);
           break;
         case "setPermissionMode":
-          await this.setPermissionMode(m.mode);
+          await this.setPermissionMode(ctx, m.mode);
           break;
         case "setModel":
-          await this.setModel(m.model);
+          await this.setModel(ctx, m.model);
           break;
         case "setEffort":
-          await this.setEffort(m.effort);
+          await this.setEffort(ctx, m.effort);
           break;
         case "addContext":
           this.addSelection();
@@ -399,26 +524,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             openLabel: "附加到会话",
             defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
           });
-          if (picked?.length) this.post({ kind: "attach_files", paths: picked.map((u) => u.fsPath) });
+          if (picked?.length) this.post(ctx, { kind: "attach_files", paths: picked.map((u) => u.fsPath) });
           break;
         }
         case "openDiff":
-          await this.openDiff(m.path);
+          await this.openDiff(ctx, m.path);
           break;
         case "acceptFile":
-          this.checkpoints.accept(m.path);
-          this.refreshChangedFiles();
+          ctx.checkpoints.accept(m.path);
+          this.refreshChangedFiles(ctx);
           break;
         case "revertFile":
-          this.revertFile(m.path);
-          this.refreshChangedFiles();
+          this.revertFile(ctx, m.path);
+          this.refreshChangedFiles(ctx);
           break;
         case "acceptAll":
-          for (const f of this.getChangedFiles().files) this.checkpoints.accept(f.path);
-          this.refreshChangedFiles();
+          for (const f of this.getChangedFiles(ctx).files) ctx.checkpoints.accept(f.path);
+          this.refreshChangedFiles(ctx);
           break;
         case "revertAll": {
-          const files = this.getChangedFiles().files;
+          const files = this.getChangedFiles(ctx).files;
           if (files.length) {
             const ok = await vscode.window.showWarningMessage(
               `回滚全部 ${files.length} 个文件的改动？`,
@@ -426,8 +551,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               "回滚全部",
             );
             if (ok === "回滚全部") {
-              for (const f of files) this.revertFile(f.path);
-              this.refreshChangedFiles();
+              for (const f of files) this.revertFile(ctx, f.path);
+              this.refreshChangedFiles(ctx);
             }
           }
           break;
@@ -436,14 +561,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.runInTerminal(m.code);
           break;
         case "openFile":
-          await this.openFile(m.path, m.line, m.endLine);
+          await this.openFile(ctx, m.path, m.line, m.endLine);
           break;
         case "openSymbol":
-          await this.openSymbol(m.name);
+          await this.openSymbol(ctx, m.name);
           break;
         case "validateRefs": {
           const invalid = m.refs.filter((r) => !this.fileRefExists(r.path)).map((r) => r.id);
-          if (invalid.length) this.post({ kind: "refs_validated", invalid });
+          if (invalid.length) this.post(ctx, { kind: "refs_validated", invalid });
           break;
         }
         case "copy":
@@ -451,31 +576,72 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
       }
     } catch (err) {
-      this.output.appendLine(`[onMessage:${m.type}] ${String(err)}`);
-      this.post({ kind: "error", message: String((err as Error)?.message ?? err) });
+      this.output.appendLine(`[onPanelMessage:${m.type}] ${String(err)}`);
+      this.post(ctx, { kind: "error", message: String((err as Error)?.message ?? err) });
     }
   }
 
+  /** On a chat panel's webview load, render its session (or last/blank). */
+  private loadCtxSession(ctx: SessionCtx): void {
+    if (ctx.sessionId) {
+      this.loadSessionInto(ctx, ctx.sessionId);
+      return;
+    }
+    if (ctx.blank) {
+      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      this.refreshChangedFiles(ctx);
+      return;
+    }
+    // Revived panel — restore the last session used, or fall back to blank.
+    const sid = this.context.workspaceState.get<string>(LAST_SESSION_KEY);
+    if (sid && this.store.findFile(sid)) {
+      ctx.sessionId = sid;
+      ctx.checkpoints.setSession(sid);
+      this.loadSessionInto(ctx, sid);
+    } else {
+      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      this.refreshChangedFiles(ctx);
+    }
+  }
+
+  /** Push a session's full transcript/checkpoints/busy state into a chat panel. */
+  private loadSessionInto(ctx: SessionCtx, sid: string): void {
+    const items = this.store.load(sid);
+    const title = this.store.list().find((s) => s.id === sid)?.title;
+    this.post(ctx, { kind: "load_history", items, sessionId: sid, title, checkpoints: ctx.checkpoints.list() });
+    this.postSessionContext(ctx, sid);
+    if (ctx.proc?.isBusy) {
+      this.post(ctx, { kind: "busy", busy: true });
+      if (ctx.pendingPerm) {
+        this.post(ctx, ctx.pendingPerm);
+        ctx.pendingPerm = undefined;
+      }
+    }
+    this.refreshSessions();
+    this.refreshChangedFiles(ctx);
+  }
+
   private async handleSend(
+    ctx: SessionCtx,
     text: string,
     context?: string,
     images?: { mediaType: string; data: string }[],
     files?: string[],
   ): Promise<void> {
-    let ctx = context ?? this.pendingContext;
-    this.pendingContext = undefined;
+    let attached = context ?? ctx.pendingContext;
+    ctx.pendingContext = undefined;
     if (files && files.length) {
       const fileCtx = this.buildFileContext(files);
-      ctx = ctx ? `${fileCtx}\n\n${ctx}` : fileCtx;
+      attached = attached ? `${fileCtx}\n\n${attached}` : fileCtx;
     }
-    const proc = await this.ensureProcess();
+    const proc = await this.ensureProcess(ctx);
     if (!proc) return;
     // Record the transcript length *before* this turn so a restore point can
     // truncate the conversation back to exactly here.
-    const lineBefore = this.activeSessionId ? this.store.countLines(this.activeSessionId) : 0;
-    const checkpointId = this.checkpoints.beginTurn(text || "(图片)", lineBefore);
-    proc.sendUserMessage(text, ctx, images);
-    this.post({ kind: "checkpoint_marker", checkpointId, userText: text });
+    const lineBefore = ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0;
+    const checkpointId = ctx.checkpoints.beginTurn(text || "(图片)", lineBefore);
+    proc.sendUserMessage(text, attached, images);
+    this.post(ctx, { kind: "checkpoint_marker", checkpointId, userText: text });
   }
 
   /**
@@ -483,61 +649,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * (revert files + truncate transcript), then resend the new text as the turn.
    * The webview has already trimmed its own view, so we don't reload history.
    */
-  private async editMessage(checkpointId: string, text: string): Promise<void> {
+  private async editMessage(ctx: SessionCtx, checkpointId: string, text: string): Promise<void> {
     if (checkpointId) {
-      const res = this.checkpoints.restore(checkpointId);
+      const res = ctx.checkpoints.restore(checkpointId);
       if (res) {
-        this.proc?.dispose();
-        this.proc = undefined;
-        this.starting = undefined;
+        ctx.proc?.dispose();
+        ctx.proc = undefined;
+        ctx.starting = undefined;
         let remaining = 0;
-        if (this.activeSessionId) {
-          remaining = this.store.truncateToLines(this.activeSessionId, res.truncateLine);
+        if (ctx.sessionId) {
+          remaining = this.store.truncateToLines(ctx.sessionId, res.truncateLine);
         }
         if (remaining === 0) {
-          this.activeSessionId = undefined;
-          this.checkpoints.clear();
+          ctx.sessionId = undefined;
+          ctx.checkpoints.clear();
         }
-        this.refreshChangedFiles();
+        this.refreshChangedFiles(ctx);
       }
     }
-    await this.handleSend(text);
+    await this.handleSend(ctx, text);
   }
 
-  private handlePermission(requestId: string, behavior: "allow" | "deny", suggestionId?: string): void {
-    if (!this.proc) return;
+  private handlePermission(ctx: SessionCtx, requestId: string, behavior: "allow" | "deny", suggestionId?: string): void {
+    if (!ctx.proc) return;
     if (behavior === "allow" && suggestionId?.startsWith("setMode:")) {
       const mode = suggestionId.split(":")[1];
-      if (mode) void this.proc.setPermissionMode(mode);
+      if (mode) void ctx.proc.setPermissionMode(mode);
     }
-    this.proc.respondPermission(requestId, { behavior });
+    ctx.proc.respondPermission(requestId, { behavior });
   }
 
-  private async setPermissionMode(mode: string): Promise<void> {
+  private async setPermissionMode(ctx: SessionCtx, mode: string): Promise<void> {
     await this.config().update("permissionMode", mode, vscode.ConfigurationTarget.Global);
-    await this.proc?.setPermissionMode(mode);
+    await ctx.proc?.setPermissionMode(mode);
     // No chat notice — the picker label already reflects the change.
   }
 
-  private async setModel(model: string): Promise<void> {
+  private async setModel(ctx: SessionCtx, model: string): Promise<void> {
     await this.config().update("model", model, vscode.ConfigurationTarget.Global);
     // Model is a spawn argument; restart the process so it applies. Context is
     // preserved because the next send resumes the same session id.
-    if (this.proc) {
-      this.proc.dispose();
-      this.proc = undefined;
-      this.starting = undefined;
+    if (ctx.proc) {
+      ctx.proc.dispose();
+      ctx.proc = undefined;
+      ctx.starting = undefined;
     }
     // No chat notice — the picker label already reflects the change.
   }
 
-  private async setEffort(effort: string): Promise<void> {
+  private async setEffort(ctx: SessionCtx, effort: string): Promise<void> {
     await this.config().update("effort", effort, vscode.ConfigurationTarget.Global);
     // Effort is also a spawn argument — restart so it applies on the next message.
-    if (this.proc) {
-      this.proc.dispose();
-      this.proc = undefined;
-      this.starting = undefined;
+    if (ctx.proc) {
+      ctx.proc.dispose();
+      ctx.proc = undefined;
+      ctx.starting = undefined;
     }
   }
 
@@ -545,12 +711,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Which editor column to open code/diffs in — always opposite the chat panel
    *  so it doesn't cover the conversation (code on one side, chat on the other). */
-  private codeColumn(): vscode.ViewColumn {
-    return this.panel?.viewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
+  private codeColumn(ctx: SessionCtx): vscode.ViewColumn {
+    return ctx.panel.viewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
   }
 
-  private async openDiff(absPath: string): Promise<void> {
-    const original = this.checkpoints.originalOf(absPath);
+  private async openDiff(ctx: SessionCtx, absPath: string): Promise<void> {
+    const original = ctx.checkpoints.originalOf(absPath);
     const rel = vscode.workspace.asRelativePath(absPath);
     const left = vscode.Uri.from({ scheme: ORIG_SCHEME, path: absPath });
     const exists = fs.existsSync(absPath);
@@ -560,7 +726,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const tag = original == null ? "新增" : exists ? "改动" : "删除";
     await vscode.commands.executeCommand("vscode.diff", left, right, `${rel} (Claude ${tag})`, {
       preview: true,
-      viewColumn: this.codeColumn(),
+      viewColumn: this.codeColumn(ctx),
     });
     // Jump to the first changed line (the modified side is the active editor).
     if (exists && typeof original === "string") {
@@ -580,8 +746,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Revert a file to its pre-edit baseline, then drop it from the change list. */
-  private revertFile(absPath: string): void {
-    const base = this.checkpoints.originalOf(absPath);
+  private revertFile(ctx: SessionCtx, absPath: string): void {
+    const base = ctx.checkpoints.originalOf(absPath);
     try {
       if (base === null) {
         if (fs.existsSync(absPath)) fs.unlinkSync(absPath); // created by Claude -> remove
@@ -592,22 +758,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch (err) {
       this.output.appendLine(`[revertFile] ${absPath}: ${String(err)}`);
     }
-    this.checkpoints.accept(absPath); // stop tracking it (now matches baseline)
+    ctx.checkpoints.accept(absPath); // stop tracking it (now matches baseline)
     this.origChanged.fire(vscode.Uri.from({ scheme: ORIG_SCHEME, path: absPath }));
   }
 
-  private refreshChangedFiles(): void {
-    const { files, totalAdded, totalRemoved } = this.getChangedFiles();
+  private refreshChangedFiles(ctx: SessionCtx): void {
+    const { files, totalAdded, totalRemoved } = this.getChangedFiles(ctx);
     for (const f of files) this.origChanged.fire(vscode.Uri.from({ scheme: ORIG_SCHEME, path: f.path }));
-    this.post({ kind: "changed_files", files, totalAdded, totalRemoved });
+    this.post(ctx, { kind: "changed_files", files, totalAdded, totalRemoved });
   }
 
-  private getChangedFiles(): { files: ChangedFile[]; totalAdded: number; totalRemoved: number } {
+  private getChangedFiles(ctx: SessionCtx): { files: ChangedFile[]; totalAdded: number; totalRemoved: number } {
     const files: ChangedFile[] = [];
     let totalAdded = 0;
     let totalRemoved = 0;
-    for (const p of this.checkpoints.changedPaths()) {
-      const original = this.checkpoints.originalOf(p); // string | null | undefined
+    for (const p of ctx.checkpoints.changedPaths()) {
+      const original = ctx.checkpoints.originalOf(p); // string | null | undefined
       if (original === undefined) continue;
       const exists = fs.existsSync(p);
       let current = "";
@@ -629,8 +795,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return { files, totalAdded, totalRemoved };
   }
 
-  private async restoreCheckpoint(checkpointId: string): Promise<void> {
-    const preview = this.checkpoints.preview(checkpointId);
+  private async restoreCheckpoint(ctx: SessionCtx, checkpointId: string): Promise<void> {
+    const preview = ctx.checkpoints.preview(checkpointId);
     const confirm = await vscode.window.showWarningMessage(
       "还原到这条消息之前？",
       {
@@ -643,58 +809,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
     if (confirm !== "还原") return;
 
-    const result = this.checkpoints.restore(checkpointId);
+    const result = ctx.checkpoints.restore(checkpointId);
     if (!result) {
-      this.post({ kind: "error", message: "找不到该还原点。" });
+      this.post(ctx, { kind: "error", message: "找不到该还原点。" });
       return;
     }
 
     // 1) Stop the live process so it isn't writing to the transcript.
-    this.proc?.dispose();
-    this.proc = undefined;
-    this.starting = undefined;
+    ctx.proc?.dispose();
+    ctx.proc = undefined;
+    ctx.starting = undefined;
 
     // 2) Truly rewind the conversation: truncate the transcript so a future
     //    --resume makes Claude forget everything after this point.
     let remainingTurns = 0;
-    if (this.activeSessionId) {
-      remainingTurns = this.store.truncateToLines(this.activeSessionId, result.truncateLine);
+    if (ctx.sessionId) {
+      remainingTurns = this.store.truncateToLines(ctx.sessionId, result.truncateLine);
     }
 
     // 3) If nothing remains, this becomes a brand-new conversation.
     if (remainingTurns === 0) {
-      this.activeSessionId = undefined;
-      this.checkpoints.clear();
-      this.post({ kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      ctx.sessionId = undefined;
+      ctx.checkpoints.clear();
+      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
     } else {
-      const items = this.store.load(this.activeSessionId!);
-      this.post({ kind: "load_history", items, sessionId: this.activeSessionId, checkpoints: this.checkpoints.list() });
+      const items = this.store.load(ctx.sessionId!);
+      this.post(ctx, { kind: "load_history", items, sessionId: ctx.sessionId, checkpoints: ctx.checkpoints.list() });
     }
 
-    this.post({
+    this.post(ctx, {
       kind: "notice",
       message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。下一条消息将从这里继续。`,
     });
-    this.refreshChangedFiles();
+    this.refreshChangedFiles(ctx);
   }
 
   // -- Process management --------------------------------------------------
 
-  private ensureProcess(): Promise<ClaudeProcess | undefined> {
-    if (this.proc) return Promise.resolve(this.proc);
-    if (this.starting) return this.starting;
-    this.starting = this.spawnProcess().finally(() => {
-      this.starting = undefined;
+  private ensureProcess(ctx: SessionCtx): Promise<ClaudeProcess | undefined> {
+    if (ctx.proc) return Promise.resolve(ctx.proc);
+    if (ctx.starting) return ctx.starting;
+    ctx.starting = this.spawnProcess(ctx).finally(() => {
+      ctx.starting = undefined;
     });
-    return this.starting;
+    return ctx.starting;
   }
 
-  private async spawnProcess(): Promise<ClaudeProcess | undefined> {
-    const isResume = !!this.activeSessionId;
-    const sessionId = this.activeSessionId ?? randomUUID();
+  private async spawnProcess(ctx: SessionCtx): Promise<ClaudeProcess | undefined> {
+    const isResume = !!ctx.sessionId;
+    const sessionId = ctx.sessionId ?? randomUUID();
     if (!isResume) {
-      this.activeSessionId = sessionId;
-      this.checkpoints.setSession(sessionId);
+      ctx.sessionId = sessionId;
+      ctx.checkpoints.setSession(sessionId);
     }
     const proc = new ClaudeProcess(
       {
@@ -709,40 +875,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         appendSystemPrompt: this.config().get<string>("appendSystemPrompt", "") || undefined,
       },
       {
-        emit: (e) => this.handleEmit(e),
-        onPermission: (req) => this.onPermission(req),
-        onSessionId: (id, resumed) => this.onSessionId(id, resumed),
-        onClose: (code) => this.onProcessClose(code),
+        emit: (e) => this.handleEmit(ctx, e),
+        onPermission: (req) => this.onPermission(ctx, req),
+        onSessionId: (id, resumed) => this.onSessionId(ctx, id, resumed),
+        onClose: (code) => this.onProcessClose(ctx, code, proc),
       },
     );
-    this.proc = proc;
+    ctx.proc = proc;
     try {
       await proc.start();
     } catch (err) {
-      this.post({ kind: "error", message: `初始化 claude 失败: ${String(err)}` });
-      this.proc = undefined;
+      this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
+      ctx.proc = undefined;
       return undefined;
     }
     return proc;
   }
 
+  /** Is this ctx still attached to a live, displayable panel? */
+  private alive(ctx: SessionCtx): boolean {
+    return this.sessions.has(ctx);
+  }
+
   /** Snapshot file edits for restore points as soon as Claude proposes them. */
-  private handleEmit(e: ToWebview): void {
+  private handleEmit(ctx: SessionCtx, e: ToWebview): void {
     if (e.kind === "tool_input" && FILE_TOOLS.has(e.name)) {
       if (this.config().get<boolean>("snapshotFilesForRestore", true)) {
         const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
-        if (p && path.isAbsolute(p)) this.checkpoints.snapshotFile(p);
+        if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
       }
     }
-    this.post(e);
+    // post() safely no-ops if this ctx's panel was closed (detached/background).
+    this.post(ctx, e);
     // Track streaming state to drive the "active" green dot in the session list.
-    if (e.kind === "busy") {
-      this.running = e.busy;
-      this.broadcastRunning();
-    }
+    if (e.kind === "busy") this.broadcastRunning();
     // Refresh the changed-files panel when a turn finishes or a file result lands.
     if (e.kind === "result" || (e.kind === "tool_result" && !e.isError)) {
-      this.refreshChangedFiles();
+      this.refreshChangedFiles(ctx);
     }
     // After a turn, a new session's title becomes available — sync list + tab title.
     if (e.kind === "result") {
@@ -751,12 +920,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Tell every webview which session (if any) is currently streaming, so the
-   *  list can show a live "active" dot — even after the chat card is closed. */
+  /** All sessions (live tabs AND detached/background runs) currently streaming.
+   *  Drives the live green "active" dots in the list. */
+  private runningIds(): string[] {
+    const ids: string[] = [];
+    for (const ctx of this.sessions) if (ctx.proc?.isBusy && ctx.sessionId) ids.push(ctx.sessionId);
+    for (const ctx of this.detached.values()) if (ctx.proc?.isBusy && ctx.sessionId) ids.push(ctx.sessionId);
+    return ids;
+  }
+
+  /** Tell every webview which sessions are currently streaming, so the list can
+   *  show live "active" dots — even after a chat tab is closed or switched. */
   private broadcastRunning(): void {
-    const e: ToWebview = { kind: "running", sessionId: this.running ? this.activeSessionId ?? null : null };
+    const e: ToWebview = { kind: "running", sessionIds: this.runningIds() };
     this.view?.webview.postMessage(e);
-    this.panel?.webview.postMessage(e);
+    for (const ctx of this.sessions) ctx.panel.webview.postMessage(e);
   }
 
   /**
@@ -794,7 +972,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
       }
       const parsed = parseUsage(resultText);
-      if (parsed) this.post({ kind: "usage", ...parsed, sessionResetAt });
+      if (parsed && this.activeCtx) this.post(this.activeCtx, { kind: "usage", ...parsed, sessionResetAt });
     };
 
     try {
@@ -820,8 +998,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private onPermission(req: PermissionRequest): void {
-    this.post({
+  private onPermission(ctx: SessionCtx, req: PermissionRequest): void {
+    const msg: ToWebview = {
       kind: "permission_request",
       requestId: req.requestId,
       toolUseId: req.toolUseId,
@@ -830,65 +1008,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       input: req.input,
       description: req.description,
       suggestions: req.suggestions,
-    });
+    };
+    // This session's tab is closed (running in the background) — stash the prompt
+    // and replay it when the tab is reopened (the process waits in the meantime).
+    if (!this.alive(ctx)) {
+      ctx.pendingPerm = msg;
+      return;
+    }
+    this.post(ctx, msg);
   }
 
-  private onSessionId(id: string, resumed: boolean): void {
-    this.forceBlank = false;
-    this.activeSessionId = id;
-    this.checkpoints.setSession(id);
+  private onSessionId(ctx: SessionCtx, id: string, resumed: boolean): void {
+    const isNew = ctx.sessionId !== id;
+    ctx.blank = false;
+    ctx.sessionId = id;
+    ctx.checkpoints.setSession(id);
     void this.context.workspaceState.update(LAST_SESSION_KEY, id);
-    if (!resumed) {
+    if (!resumed || isNew) {
       // Newly created — refresh the session list lazily.
       this.refreshSessions();
     }
   }
 
-  /** On webview load, re-render the active session, or restore the last one used. */
-  private restoreLastOrActive(): void {
-    if (this.forceBlank) {
-      // The chat panel was just opened via "new chat" from the sidebar.
-      this.forceBlank = false;
-      this.activeSessionId = undefined;
-      this.checkpoints.clear();
-      this.post({ kind: "load_history", items: [], title: "新对话", checkpoints: [] });
-      this.refreshChangedFiles();
-      return;
-    }
-    const sid = this.activeSessionId ?? this.context.workspaceState.get<string>(LAST_SESSION_KEY);
-    if (!sid || !this.store.findFile(sid)) {
-      this.refreshChangedFiles();
-      return;
-    }
-    this.activeSessionId = sid;
-    this.checkpoints.setSession(sid);
-    const items = this.store.load(sid);
-    const title = this.store.list().find((s) => s.id === sid)?.title;
-    this.post({ kind: "load_history", items, sessionId: sid, title, checkpoints: this.checkpoints.list() });
-    this.postSessionContext(sid);
-    // If this session is still streaming (card was closed mid-reply, process
-    // kept running), restore the busy/working state in the reopened card.
-    if (this.running && this.proc?.isBusy) this.post({ kind: "busy", busy: true });
-    this.refreshSessions();
-    this.refreshChangedFiles();
-  }
-
-  private onProcessClose(code: number | null): void {
+  private onProcessClose(ctx: SessionCtx, code: number | null, proc: ClaudeProcess): void {
     this.output.appendLine(`[claude] process closed (code ${code})`);
-    this.proc = undefined; // next send respawns with --resume to keep context
-    this.post({ kind: "busy", busy: false });
-  }
-
-  private async startFreshSession(): Promise<void> {
-    this.proc?.dispose();
-    this.proc = undefined;
-    this.starting = undefined;
-    this.activeSessionId = undefined;
-    this.checkpoints.clear();
-    this.post({ kind: "load_history", items: [], title: "新对话", checkpoints: [] });
-    this.setPanelTitle("新对话");
-    this.refreshChangedFiles();
-    this.reveal();
+    if (ctx.proc !== proc) return; // stale process, already replaced
+    ctx.proc = undefined; // next send respawns with --resume to keep context
+    // A detached (background) session's process exited: drop it.
+    if (!this.alive(ctx) && ctx.sessionId) {
+      this.detached.delete(ctx.sessionId);
+    } else {
+      this.post(ctx, { kind: "busy", busy: false });
+    }
+    this.broadcastRunning();
   }
 
   private async deleteSessions(ids: string[]): Promise<void> {
@@ -900,13 +1052,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const ok = await vscode.window.showWarningMessage("删除会话？此操作不可撤销。", { modal: true, detail }, "删除");
     if (ok !== "删除") return;
     for (const id of ids) {
-      this.store.delete(id);
-      if (id === this.activeSessionId) {
-        this.activeSessionId = undefined;
-        this.checkpoints.clear();
-        this.post({ kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      // Tear down any open tab for this session.
+      for (const ctx of [...this.sessions]) {
+        if (ctx.sessionId === id) {
+          this.sessions.delete(ctx);
+          if (this.activeCtx === ctx) this.activeCtx = undefined;
+          ctx.proc?.dispose();
+          ctx.proc = undefined;
+          ctx.panel.dispose();
+        }
       }
+      // Tear down any background (detached) run for this session.
+      const det = this.detached.get(id);
+      if (det) {
+        det.proc?.dispose();
+        this.detached.delete(id);
+      }
+      this.store.delete(id);
     }
+    this.broadcastRunning();
     this.refreshSessions();
   }
 
@@ -922,26 +1086,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.refreshSessions();
   }
 
-  private async switchSession(sessionId: string): Promise<void> {
-    this.forceBlank = false;
-    this.proc?.dispose();
-    this.proc = undefined;
-    this.starting = undefined;
-    this.activeSessionId = sessionId;
-    this.checkpoints.setSession(sessionId);
-    void this.context.workspaceState.update(LAST_SESSION_KEY, sessionId);
-    const items = this.store.load(sessionId);
-    this.post({ kind: "load_history", items, sessionId, checkpoints: this.checkpoints.list() });
-    this.postSessionContext(sessionId);
-    this.refreshSessions();
-    this.refreshChangedFiles();
-    this.reveal();
-  }
-
   /** Post the context-usage gauge value for a loaded session (from its transcript). */
-  private postSessionContext(sid: string): void {
+  private postSessionContext(ctx: SessionCtx, sid: string): void {
     const u = this.store.lastContextUsage(sid);
-    if (u && u.used > 0) this.post({ kind: "context", used: u.used, total: contextWindowFor(u.model, u.used) });
+    if (u && u.used > 0) this.post(ctx, { kind: "context", used: u.used, total: contextWindowFor(u.model, u.used) });
   }
 
   // -- Update check --------------------------------------------------------
@@ -1058,11 +1206,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async openFile(p: string, line?: number, endLine?: number): Promise<void> {
+  private async openFile(ctx: SessionCtx, p: string, line?: number, endLine?: number): Promise<void> {
     try {
       const abs = path.isAbsolute(p) ? p : path.join(this.cwd(), p);
       const doc = await vscode.workspace.openTextDocument(abs);
-      const editor = await vscode.window.showTextDocument(doc, { viewColumn: this.codeColumn(), preview: false });
+      const editor = await vscode.window.showTextDocument(doc, { viewColumn: this.codeColumn(ctx), preview: false });
       if (line && line > 0) {
         const start = new vscode.Position(line - 1, 0);
         const last = endLine && endLine >= line ? endLine - 1 : line - 1;
@@ -1078,7 +1226,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Jump to a code symbol's definition (class / method / enum …) by name.
    *  Tries the language-server symbol index first (same as "Go to Symbol in
    *  Workspace" / Copilot), then jumps directly via file-name & text search. */
-  private async openSymbol(name: string): Promise<void> {
+  private async openSymbol(ctx: SessionCtx, name: string): Promise<void> {
     // 1) Language-server workspace-symbol index (best — needs the lang extension).
     try {
       const syms =
@@ -1100,7 +1248,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       candidates.sort((a, b) => (order[a.kind] ?? 5) - (order[b.kind] ?? 5));
       const pick = candidates[0];
       if (pick) {
-        await this.openFile(pick.location.uri.fsPath, pick.location.range.start.line + 1);
+        await this.openFile(ctx, pick.location.uri.fsPath, pick.location.range.start.line + 1);
         return;
       }
     } catch {
@@ -1115,7 +1263,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       );
       if (matches.length) {
         const doc = await vscode.workspace.openTextDocument(matches[0]);
-        await this.openFile(matches[0].fsPath, this.findDefLine(doc.getText(), name));
+        await this.openFile(ctx, matches[0].fsPath, this.findDefLine(doc.getText(), name));
         return;
       }
     } catch {
@@ -1125,7 +1273,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const hit = await this.searchDefinition(name);
       if (hit) {
-        await this.openFile(hit.uri.fsPath, hit.line);
+        await this.openFile(ctx, hit.uri.fsPath, hit.line);
         return;
       }
     } catch {
@@ -1191,16 +1339,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private reveal(): void {
-    // Reveal the panel in its CURRENT column — never re-pass ViewColumn.Beside,
-    // which would re-dock the panel into a new (unlocked) group and let explorer
-    // files start replacing the chat tab again.
-    if (this.panel) this.panel.reveal(this.panel.viewColumn, true);
+    // Reveal the active chat panel in its CURRENT column — never re-pass
+    // ViewColumn.Beside, which would re-dock the panel into a new (unlocked)
+    // group and let explorer files start replacing the chat tab again.
+    if (this.activeCtx) this.activeCtx.panel.reveal(this.activeCtx.panel.viewColumn, true);
     else this.view?.show?.(true);
   }
 
-  private post(e: ToWebview): void {
-    const target = this.active ?? this.panel?.webview ?? this.view?.webview;
-    target?.postMessage(e);
+  /** Post to a chat panel's webview. Safely no-ops if the panel was disposed
+   *  (the session is detached/running in the background). */
+  private post(ctx: SessionCtx, e: ToWebview): void {
+    if (!this.alive(ctx)) return;
+    ctx.webview.postMessage(e);
   }
 
   private config(): vscode.WorkspaceConfiguration {
@@ -1250,7 +1400,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
-    this.proc?.dispose();
+    for (const ctx of this.sessions) ctx.proc?.dispose();
+    for (const ctx of this.detached.values()) ctx.proc?.dispose();
+    this.sessions.clear();
+    this.detached.clear();
     this.terminal?.dispose();
   }
 
@@ -1335,7 +1488,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const TRASH = ${JSON.stringify(TRASH)};
     const PENCIL = ${JSON.stringify(PENCIL)};
-    let sessions = [], activeId = null, runningId = null, multi = false;
+    let sessions = [], activeId = null, runningIds = new Set(), multi = false;
     const sel = new Set();
     const $ = (id) => document.getElementById(id);
 
@@ -1360,7 +1513,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         chk.addEventListener("click", (e) => { e.stopPropagation(); toggle(s.id, chk.checked); });
         const body = document.createElement("div"); body.className = "body";
         const tRow = document.createElement("div"); tRow.className = "trow";
-        if (s.id === runningId) { const dot = document.createElement("span"); dot.className = "run-dot"; dot.title = "正在回复中"; tRow.appendChild(dot); }
+        if (runningIds.has(s.id)) { const dot = document.createElement("span"); dot.className = "run-dot"; dot.title = "正在回复中"; tRow.appendChild(dot); }
         const t = document.createElement("div"); t.className = "t"; t.textContent = s.title || "新对话";
         tRow.appendChild(t);
         const meta = document.createElement("div"); meta.className = "meta";
@@ -1416,12 +1569,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const m = ev.data;
       if (m && m.kind === "sessions") {
         sessions = m.list || []; activeId = m.activeId || null;
-        if (m.runningId !== undefined) runningId = m.runningId || null;
+        if (m.runningIds !== undefined) runningIds = new Set(m.runningIds || []);
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
         $("delsel").classList.toggle("hidden", sel.size === 0);
         render();
       } else if (m && m.kind === "running") {
-        runningId = m.sessionId || null;
+        runningIds = new Set(m.sessionIds || []);
         render();
       } else if (m && m.kind === "update_available") {
         if (m.version) { $("upd-ver").textContent = "v" + m.version; $("upd-banner").classList.remove("hidden"); }

@@ -63,8 +63,8 @@ export type ToWebview =
   | { kind: "notice"; message: string }
   // Full conversation replacement (switching/restoring sessions)
   | { kind: "load_history"; items: TimelineItem[]; sessionId?: string; title?: string; checkpoints?: CheckpointSummary[] }
-  | { kind: "sessions"; list: SessionSummary[]; activeId?: string; runningId?: string }
-  | { kind: "running"; sessionId: string | null }
+  | { kind: "sessions"; list: SessionSummary[]; activeId?: string; runningIds?: string[] }
+  | { kind: "running"; sessionIds: string[] }
   | { kind: "checkpoints"; list: CheckpointSummary[] }
   // A restore point was created for the turn just sent (live).
   | { kind: "checkpoint_marker"; checkpointId: string; userText: string }

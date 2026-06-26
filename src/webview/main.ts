@@ -473,11 +473,11 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       loadHistory(m.items, m.title, m.checkpoints);
       break;
     case "sessions":
-      if (m.runningId !== undefined) runningSessionId = m.runningId;
+      if (m.runningIds !== undefined) runningSessionIds = new Set(m.runningIds);
       renderSessions(m.list, m.activeId);
       break;
     case "running":
-      runningSessionId = m.sessionId;
+      runningSessionIds = new Set(m.sessionIds);
       renderSessions(lastSessions, lastActiveId);
       break;
     case "checkpoint_marker":
@@ -1196,7 +1196,7 @@ function renderChangedFiles(
 type SessionItem = { id: string; title: string; updatedAt: number; messageCount: number };
 let lastSessions: SessionItem[] = [];
 let lastActiveId: string | undefined;
-let runningSessionId: string | null = null; // session whose turn is currently streaming
+let runningSessionIds = new Set<string>(); // sessions whose turn is currently streaming
 let multiSelect = false;
 const selectedSessions = new Set<string>();
 
@@ -1219,7 +1219,7 @@ function renderSessions(list: SessionItem[], activeId?: string) {
     }
     const main = el("div", "list-main");
     const titleRow = el("div", "list-titlerow");
-    if (s.id === runningSessionId) {
+    if (runningSessionIds.has(s.id)) {
       const dot = el("span", "run-dot");
       dot.title = "正在回复中";
       titleRow.appendChild(dot);

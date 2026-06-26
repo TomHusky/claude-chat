@@ -91,7 +91,10 @@ export class ClaudeProcess {
     const args = this.buildArgs();
     this.proc = spawn(this.opts.claudePath, args, {
       cwd: this.opts.cwd,
-      env: { ...process.env, ...this.opts.env },
+      // Identify as the VS Code entrypoint (not "sdk-cli") so the sessions we
+      // create show up in the official Claude extension's session list, which
+      // filters out headless/SDK sessions.
+      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "claude-vscode", ...this.opts.env },
       stdio: ["pipe", "pipe", "pipe"],
     }) as ChildProcessWithoutNullStreams;
 

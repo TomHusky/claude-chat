@@ -747,12 +747,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     let out = "";
     let settled = false;
-    const finish = (text: string) => {
+    const finish = (raw: string) => {
       if (settled) return;
       settled = true;
       this.usageInFlight = false;
-      const parsed = parseUsage(text);
-      if (parsed) this.post({ kind: "usage", ...parsed });
+      // Parse the JSONL: the `result` event carries the /usage text; a
+      // `rate_limit_event` carries the exact five-hour reset timestamp.
+      let resultText = "";
+      let sessionResetAt: number | undefined;
+      for (const line of raw.split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        let o: any;
+        try { o = JSON.parse(t); } catch { continue; }
+        if (o.type === "result" && typeof o.result === "string") resultText = o.result;
+        if (o.type === "rate_limit_event") {
+          const info = o.rate_limit_info || {};
+          if (info.rateLimitType === "five_hour" && typeof info.resetsAt === "number") sessionResetAt = info.resetsAt;
+        }
+      }
+      const parsed = parseUsage(resultText);
+      if (parsed) this.post({ kind: "usage", ...parsed, sessionResetAt });
     };
 
     try {
@@ -1447,21 +1462,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-/** Parse the CLI `/usage` text into today's activity (last 24h) + the weekly
- *  quota percentage/reset. Returns undefined if nothing recognizable was found
- *  (e.g. API-key accounts, which have no subscription usage). */
-function parseUsage(text: string): { dayRequests?: number; daySessions?: number; weekPct?: number; weekReset?: string } | undefined {
+/** Parse the CLI `/usage` text into the current-session + weekly quota
+ *  percentages (and the weekly reset). Mirrors the official panel. Returns
+ *  undefined if nothing recognizable was found (e.g. API-key accounts). */
+function parseUsage(text: string): { sessionPct?: number; weekPct?: number; weekReset?: string; weekSonnetPct?: number } | undefined {
   if (!text) return undefined;
   const reset = (s?: string) => s?.replace(/\s*\(.*?\)\s*$/, "").trim() || undefined; // drop "(Asia/Shanghai)"
-  const day = /Last 24h\s*·\s*([\d,]+)\s*requests(?:\s*·\s*([\d,]+)\s*sessions)?/i.exec(text);
+  const sess = /Current session:\s*(\d+)%\s*used/i.exec(text);
   const week = /Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
-  if (!day && !week) return undefined;
-  const num = (s?: string) => (s ? parseInt(s.replace(/,/g, ""), 10) : undefined);
+  const sonnet = /Current week \(Sonnet only\):\s*(\d+)%\s*used/i.exec(text);
+  if (!sess && !week) return undefined;
   return {
-    dayRequests: num(day?.[1]),
-    daySessions: num(day?.[2]),
+    sessionPct: sess ? parseInt(sess[1], 10) : undefined,
     weekPct: week ? parseInt(week[1], 10) : undefined,
     weekReset: reset(week?.[2]),
+    weekSonnetPct: sonnet ? parseInt(sonnet[1], 10) : undefined,
   };
 }
 

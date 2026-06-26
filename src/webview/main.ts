@@ -352,18 +352,31 @@ function updateContextGauge(used: number, total: number) {
 }
 
 const usagePill = $<HTMLButtonElement>("usage-pill");
-/** Claude subscription usage (today's activity + weekly quota), where cost was. */
-function renderUsage(dayRequests?: number, daySessions?: number, weekPct?: number, weekReset?: string) {
+/** Format a unix-seconds reset time as a "还剩 Xh Ym" countdown. */
+function resetCountdown(resetAt?: number): string | undefined {
+  if (!resetAt) return undefined;
+  const mins = Math.round((resetAt * 1000 - Date.now()) / 60000);
+  if (mins <= 0) return "即将重置";
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return h > 0 ? `还剩 ${h} 小时 ${m} 分` : `还剩 ${m} 分`;
+}
+/** Claude subscription usage (current session + weekly quota), where cost was.
+ *  Mirrors the official /usage panel: session % w/ reset countdown + weekly %. */
+function renderUsage(sessionPct?: number, sessionResetAt?: number, weekPct?: number, weekReset?: string, weekSonnetPct?: number) {
   const parts: string[] = [];
-  if (typeof dayRequests === "number") parts.push(`今日 ${dayRequests} 次`);
+  if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
   if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
   if (!parts.length) return;
   usagePill.classList.remove("hidden");
-  usagePill.style.setProperty("--u-color", (weekPct ?? 0) >= 90 ? "#e5534b" : (weekPct ?? 0) >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
+  const peak = Math.max(sessionPct ?? 0, weekPct ?? 0);
+  usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
   usagePill.textContent = parts.join(" · ");
+  const cd = resetCountdown(sessionResetAt);
   const tip: string[] = ["Claude 订阅用量（点击刷新）"];
-  if (typeof dayRequests === "number") tip.push(`近 24 小时 ${dayRequests} 次请求${typeof daySessions === "number" ? ` · ${daySessions} 个会话` : ""}`);
-  if (typeof weekPct === "number") tip.push(`本周额度 ${weekPct}%${weekReset ? `，${weekReset} 重置` : ""}`);
+  if (typeof sessionPct === "number") tip.push(`当前会话 ${sessionPct}%（5 小时窗口${cd ? `，${cd}` : ""}）`);
+  if (typeof weekPct === "number") tip.push(`本周·全模型 ${weekPct}%${weekReset ? `，${weekReset} 重置` : ""}`);
+  if (typeof weekSonnetPct === "number") tip.push(`本周·Sonnet ${weekSonnetPct}%`);
   usagePill.title = tip.join("\n");
 }
 usagePill.addEventListener("click", () => send({ type: "refreshUsage" }));
@@ -447,7 +460,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       }
       break;
     case "usage":
-      renderUsage(m.dayRequests, m.daySessions, m.weekPct, m.weekReset);
+      renderUsage(m.sessionPct, m.sessionResetAt, m.weekPct, m.weekReset, m.weekSonnetPct);
       break;
     case "error":
       finalizeTurn();

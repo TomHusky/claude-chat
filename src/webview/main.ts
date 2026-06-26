@@ -539,6 +539,9 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
     }
     removeWorking();
     createToolCard(body, toolId, toolName || "tool");
+    // Non-file tools (e.g. Bash) can run a while — keep a live status pill below
+    // the card so it's clearly executing, not frozen. File tools are instant.
+    if (!FILE_VIEW_TOOLS.has(toolName || "")) showWorking();
     liveBlock = null;
     return;
   }
@@ -793,32 +796,35 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
   scrollToBottom();
 }
 
-/** Render a previously-answered AskUserQuestion (from history) as a clean card
- *  titled "AskUserQuestion" with a question→answer list, instead of the raw
- *  "Your questions have been answered: …" tool output. */
-function renderAnsweredQuestion(parent: HTMLElement, result: string) {
-  const pairs = [...result.matchAll(/"([^"]+)"\s*=\s*"([^"]*)"/g)];
+/** Build an "AskUserQuestion" timeline node: a separate title + a boxed
+ *  question→answer list (used both live after answering and in history). */
+function askQuestionNode(pairs: [string, string][], emptyText = ""): HTMLElement {
   const card = el("div", "tool-card askq-card");
   const head = el("div", "tool-head");
   head.innerHTML = `<span class="tool-name">AskUserQuestion</span>`;
   const bodyWrap = el("div", "tool-body");
   if (pairs.length) {
     const list = el("div", "askq-summary");
-    for (const [, q, a] of pairs) {
+    for (const [q, a] of pairs) {
       const row = el("div", "askq-row");
       row.append(el("span", "askq-q", q), el("span", "askq-a", a));
       list.appendChild(row);
     }
     bodyWrap.appendChild(list);
-  } else if (result.trim()) {
-    const pre = el("pre", "tool-result-body");
-    pre.textContent = truncateText(result, 4000);
-    bodyWrap.appendChild(pre);
+  } else if (emptyText) {
+    bodyWrap.appendChild(el("div", "askq-skip", emptyText));
   }
   card.append(head, bodyWrap);
   const step = el("div", "step");
   step.append(el("div", "step-dot"), card);
-  parent.appendChild(step);
+  return step;
+}
+
+/** Render a previously-answered AskUserQuestion (from history) as a clean node,
+ *  instead of the raw "Your questions have been answered: …" tool output. */
+function renderAnsweredQuestion(parent: HTMLElement, result: string) {
+  const pairs: [string, string][] = [...result.matchAll(/"([^"]+)"\s*=\s*"([^"]*)"/g)].map((mm) => [mm[1], mm[2]]);
+  parent.appendChild(askQuestionNode(pairs, pairs.length ? "" : truncateText(result, 1000)));
   maybeScroll();
 }
 
@@ -945,18 +951,17 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   const finish = (answers: Record<string, string | string[]> | null) => {
     if (done) return;
     done = true;
-    const sum = el("div", "askp-summary");
-    sum.textContent = answers
-      ? "已选择：" +
-        questions
-          .map((q) => {
-            const v = answers[q.question];
-            return Array.isArray(v) ? v.join("、") : v;
-          })
-          .filter(Boolean)
-          .join(" / ")
-      : "已跳过";
-    wrap.replaceWith(sum);
+    if (answers) {
+      const pairs = questions
+        .map((q): [string, string] => {
+          const v = answers[q.question];
+          return [q.header || q.question, Array.isArray(v) ? v.join("、") : v || ""];
+        })
+        .filter(([, a]) => a);
+      wrap.replaceWith(askQuestionNode(pairs));
+    } else {
+      wrap.replaceWith(askQuestionNode([], "已跳过"));
+    }
   };
 
   prev.onclick = () => {

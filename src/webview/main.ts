@@ -473,7 +473,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       loadHistory(m.items, m.title, m.checkpoints);
       break;
     case "sessions":
+      if (m.runningId !== undefined) runningSessionId = m.runningId;
       renderSessions(m.list, m.activeId);
+      break;
+    case "running":
+      runningSessionId = m.sessionId;
+      renderSessions(lastSessions, lastActiveId);
       break;
     case "checkpoint_marker":
       onCheckpointMarker(m.checkpointId);
@@ -1191,6 +1196,7 @@ function renderChangedFiles(
 type SessionItem = { id: string; title: string; updatedAt: number; messageCount: number };
 let lastSessions: SessionItem[] = [];
 let lastActiveId: string | undefined;
+let runningSessionId: string | null = null; // session whose turn is currently streaming
 let multiSelect = false;
 const selectedSessions = new Set<string>();
 
@@ -1212,8 +1218,15 @@ function renderSessions(list: SessionItem[], activeId?: string) {
       row.appendChild(cb);
     }
     const main = el("div", "list-main");
+    const titleRow = el("div", "list-titlerow");
+    if (s.id === runningSessionId) {
+      const dot = el("span", "run-dot");
+      dot.title = "正在回复中";
+      titleRow.appendChild(dot);
+    }
     const titleEl = el("div", "list-title", s.title);
-    main.append(titleEl, el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
+    titleRow.appendChild(titleEl);
+    main.append(titleRow, el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
     row.appendChild(main);
     // Inline actions: edit (left) then delete (right). No right-click menu.
     const actions = el("div", "list-actions");

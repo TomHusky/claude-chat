@@ -33,6 +33,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private lastUsageAt = 0; // throttle for subscription-usage queries
   private usageInFlight = false;
+  private running = false; // a turn is currently streaming (drives the green dot)
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -147,7 +148,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.postUpdateDot(); // restore the badge if an update was already detected
     view.onDidChangeVisibility(() => {
       if (view.visible) {
-        this.post2(view.webview, { kind: "sessions", list: this.store.list(), activeId: this.activeSessionId });
+        this.post2(view.webview, {
+          kind: "sessions",
+          list: this.store.list(),
+          activeId: this.activeSessionId,
+          runningId: this.running ? this.activeSessionId : undefined,
+        });
         this.postUpdateDot();
       }
     });
@@ -172,7 +178,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Broadcast the session list to both the sidebar manager and the chat panel. */
   private refreshSessions(): void {
     const list = this.store.list();
-    const e: ToWebview = { kind: "sessions", list, activeId: this.activeSessionId };
+    const e: ToWebview = {
+      kind: "sessions",
+      list,
+      activeId: this.activeSessionId,
+      runningId: this.running ? this.activeSessionId : undefined,
+    };
     this.view?.webview.postMessage(e);
     this.panel?.webview.postMessage(e);
     this.setPanelTitle(list.find((s) => s.id === this.activeSessionId)?.title);
@@ -724,6 +735,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     this.post(e);
+    // Track streaming state to drive the "active" green dot in the session list.
+    if (e.kind === "busy") {
+      this.running = e.busy;
+      this.broadcastRunning();
+    }
     // Refresh the changed-files panel when a turn finishes or a file result lands.
     if (e.kind === "result" || (e.kind === "tool_result" && !e.isError)) {
       this.refreshChangedFiles();
@@ -733,6 +749,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.refreshSessions();
       this.fetchUsage(); // throttled — subscription usage moved after this turn
     }
+  }
+
+  /** Tell every webview which session (if any) is currently streaming, so the
+   *  list can show a live "active" dot — even after the chat card is closed. */
+  private broadcastRunning(): void {
+    const e: ToWebview = { kind: "running", sessionId: this.running ? this.activeSessionId ?? null : null };
+    this.view?.webview.postMessage(e);
+    this.panel?.webview.postMessage(e);
   }
 
   /**
@@ -842,6 +866,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const title = this.store.list().find((s) => s.id === sid)?.title;
     this.post({ kind: "load_history", items, sessionId: sid, title, checkpoints: this.checkpoints.list() });
     this.postSessionContext(sid);
+    // If this session is still streaming (card was closed mid-reply, process
+    // kept running), restore the busy/working state in the reopened card.
+    if (this.running && this.proc?.isBusy) this.post({ kind: "busy", busy: true });
     this.refreshSessions();
     this.refreshChangedFiles();
   }
@@ -1277,7 +1304,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .chk { display: none; flex: 0 0 auto; width: 14px; height: 14px; }
   body.multi .row .chk { display: inline-block; }
   .row .body { flex: 1; min-width: 0; }
+  .row .trow { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .row .trow .t { flex: 1; }
   .row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; }
+  .run-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: runpulse 1.6s ease-out infinite; }
+  @keyframes runpulse { 0% { box-shadow: 0 0 0 0 rgba(63,185,80,.55); } 70% { box-shadow: 0 0 0 5px rgba(63,185,80,0); } 100% { box-shadow: 0 0 0 0 rgba(63,185,80,0); } }
   .row .meta { font-size: 10.5px; opacity: .55; margin-top: 1px; }
   .row .rename { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; padding: 1px 4px;
     border: 1px solid var(--vscode-focusBorder, #3794ff); border-radius: 4px; outline: none;
@@ -1304,7 +1335,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const TRASH = ${JSON.stringify(TRASH)};
     const PENCIL = ${JSON.stringify(PENCIL)};
-    let sessions = [], activeId = null, multi = false;
+    let sessions = [], activeId = null, runningId = null, multi = false;
     const sel = new Set();
     const $ = (id) => document.getElementById(id);
 
@@ -1328,10 +1359,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         chk.type = "checkbox"; chk.className = "chk"; chk.checked = sel.has(s.id);
         chk.addEventListener("click", (e) => { e.stopPropagation(); toggle(s.id, chk.checked); });
         const body = document.createElement("div"); body.className = "body";
+        const tRow = document.createElement("div"); tRow.className = "trow";
+        if (s.id === runningId) { const dot = document.createElement("span"); dot.className = "run-dot"; dot.title = "正在回复中"; tRow.appendChild(dot); }
         const t = document.createElement("div"); t.className = "t"; t.textContent = s.title || "新对话";
+        tRow.appendChild(t);
         const meta = document.createElement("div"); meta.className = "meta";
         meta.textContent = fmt(s.updatedAt) + (s.messageCount ? "  ·  " + s.messageCount + " 条" : "");
-        body.append(t, meta);
+        body.append(tRow, meta);
         const edit = document.createElement("button"); edit.className = "edit"; edit.title = "重命名"; edit.innerHTML = PENCIL;
         edit.addEventListener("click", (e) => { e.stopPropagation(); rename(s.id); });
         const del = document.createElement("button"); del.className = "del"; del.title = "删除"; del.innerHTML = TRASH;
@@ -1382,8 +1416,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const m = ev.data;
       if (m && m.kind === "sessions") {
         sessions = m.list || []; activeId = m.activeId || null;
+        if (m.runningId !== undefined) runningId = m.runningId || null;
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
         $("delsel").classList.toggle("hidden", sel.size === 0);
+        render();
+      } else if (m && m.kind === "running") {
+        runningId = m.sessionId || null;
         render();
       } else if (m && m.kind === "update_available") {
         if (m.version) { $("upd-ver").textContent = "v" + m.version; $("upd-banner").classList.remove("hidden"); }

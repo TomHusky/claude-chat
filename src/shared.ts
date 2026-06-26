@@ -56,6 +56,7 @@ export type ToWebview =
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
+  | { kind: "usage"; sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string }
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
   // Full conversation replacement (switching/restoring sessions)
@@ -138,6 +139,7 @@ export type TimelineItem =
 export type FromWebview =
   | { type: "ready" }
   | { type: "checkUpdate" }
+  | { type: "refreshUsage" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }

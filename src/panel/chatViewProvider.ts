@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as https from "node:https";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
@@ -30,6 +31,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private pendingContext?: string;
   private forceBlank = false; // next panel-ready should show a blank new session
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
+  private lastUsageAt = 0; // throttle for subscription-usage queries
+  private usageInFlight = false;
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -308,9 +311,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.restoreLastOrActive();
           this.postActiveFile();
+          this.fetchUsage();
           break;
         case "checkUpdate":
           await this.checkForUpdate();
+          break;
+        case "refreshUsage":
+          this.fetchUsage(true);
           break;
         case "send":
           await this.handleSend(m.text, m.context, m.images, m.files);
@@ -719,7 +726,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.refreshChangedFiles();
     }
     // After a turn, a new session's title becomes available — sync list + tab title.
-    if (e.kind === "result") this.refreshSessions();
+    if (e.kind === "result") {
+      this.refreshSessions();
+      this.fetchUsage(); // throttled — subscription usage moved after this turn
+    }
+  }
+
+  /**
+   * Query the Claude subscription usage (5h session + weekly quota) by running
+   * the CLI's `/usage` slash command headlessly and parsing its text output.
+   * Throttled so it doesn't itself burn quota on every turn. Posts a `usage`
+   * message to the webview (which shows it where the per-turn cost used to be).
+   */
+  private fetchUsage(force = false): void {
+    if (this.usageInFlight) return;
+    const now = Date.now();
+    if (!force && now - this.lastUsageAt < 90_000) return; // at most ~once / 90s
+    this.usageInFlight = true;
+    this.lastUsageAt = now;
+
+    let out = "";
+    let settled = false;
+    const finish = (text: string) => {
+      if (settled) return;
+      settled = true;
+      this.usageInFlight = false;
+      const parsed = parseUsage(text);
+      if (parsed) this.post({ kind: "usage", ...parsed });
+    };
+
+    try {
+      const proc = spawn(
+        this.config().get<string>("claudePath", "claude"),
+        ["-p", "--no-session-persistence", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"],
+        { cwd: this.cwd(), env: process.env, stdio: ["pipe", "pipe", "ignore"] },
+      );
+      const kill = setTimeout(() => {
+        try { proc.kill("SIGKILL"); } catch { /* ignore */ }
+        finish(out);
+      }, 30_000);
+      proc.on("error", () => { clearTimeout(kill); finish(""); });
+      proc.stdout.on("data", (d: Buffer) => {
+        out += d.toString();
+        // Collect the assistant text as it arrives; the `result` event repeats it.
+      });
+      proc.on("close", () => { clearTimeout(kill); finish(out); });
+      proc.stdin.write(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "/usage" }] } }) + "\n");
+      proc.stdin.end();
+    } catch {
+      finish("");
+    }
   }
 
   private onPermission(req: PermissionRequest): void {
@@ -1373,6 +1429,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
           <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji">⚡</span><span id="mode-label">Auto</span></button>
           <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
+          <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击刷新"></button>
           <div class="spacer"></div>
           <button id="btn-send" class="composer-send" title="发送">${ICONS.send}</button>
           <button id="btn-stop" class="composer-send stop hidden" title="停止">${ICONS.stop}</button>
@@ -1388,6 +1445,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/** Parse the CLI `/usage` text into session + weekly percentages and reset times.
+ *  Returns undefined if nothing recognizable was found (e.g. API-key accounts). */
+function parseUsage(text: string): { sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string } | undefined {
+  if (!text) return undefined;
+  const reset = (s?: string) => s?.replace(/\s*\(.*?\)\s*$/, "").trim() || undefined; // drop "(Asia/Shanghai)"
+  const sess = /Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
+  const week = /Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
+  if (!sess && !week) return undefined;
+  return {
+    sessionPct: sess ? parseInt(sess[1], 10) : undefined,
+    sessionReset: reset(sess?.[2]),
+    weekPct: week ? parseInt(week[1], 10) : undefined,
+    weekReset: reset(week?.[2]),
+  };
 }
 
 /** Compare two dotted versions: >0 if a>b, <0 if a<b, 0 if equal. */

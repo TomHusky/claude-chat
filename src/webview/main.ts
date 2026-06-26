@@ -350,6 +350,24 @@ function updateContextGauge(used: number, total: number) {
   if (lbl) lbl.textContent = String(pct);
   ctxGauge.title = `上下文使用 ${pct}%（约 ${fmtTokens(used)} / ${fmtTokens(total)} tokens）`;
 }
+
+const usagePill = $<HTMLButtonElement>("usage-pill");
+/** Claude subscription usage (5h session + weekly), shown where cost used to be. */
+function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string) {
+  const parts: string[] = [];
+  if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
+  if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
+  if (!parts.length) return;
+  usagePill.classList.remove("hidden");
+  const peak = Math.max(sessionPct ?? 0, weekPct ?? 0);
+  usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
+  usagePill.textContent = parts.join(" · ");
+  const tip: string[] = ["Claude 订阅用量（点击刷新）"];
+  if (typeof sessionPct === "number") tip.push(`5 小时会话额度 ${sessionPct}%${sessionReset ? `，${sessionReset} 重置` : ""}`);
+  if (typeof weekPct === "number") tip.push(`本周额度 ${weekPct}%${weekReset ? `，${weekReset} 重置` : ""}`);
+  usagePill.title = tip.join("\n");
+}
+usagePill.addEventListener("click", () => send({ type: "refreshUsage" }));
 function startTick() {
   if (tickTimer) return;
   tickTimer = window.setInterval(() => {
@@ -426,9 +444,11 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "result":
       finalizeTurn();
       if (m.numTurns != null) {
-        statusLine.textContent =
-          `完成 · ${m.numTurns} 轮` + (m.costUsd ? ` · $${m.costUsd.toFixed(4)}` : "");
+        statusLine.textContent = `完成 · ${m.numTurns} 轮`;
       }
+      break;
+    case "usage":
+      renderUsage(m.sessionPct, m.sessionReset, m.weekPct, m.weekReset);
       break;
     case "error":
       finalizeTurn();

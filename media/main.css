@@ -802,6 +802,18 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 /* warn colors as usage climbs */
 .ctx-gauge { --cg-color: #d97757; }
 
+/* Claude subscription usage pill (replaces the per-turn $ cost) */
+.usage-pill {
+  flex: 0 0 auto; display: inline-flex; align-items: center;
+  height: 22px; padding: 0 7px; border: none; border-radius: 11px;
+  background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.14));
+  color: var(--u-color, var(--vscode-descriptionForeground));
+  font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums;
+  cursor: pointer; white-space: nowrap;
+}
+.usage-pill:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.25)); }
+.usage-pill.hidden { display: none; }
+
 /* The bordered composer box: textarea on top, controls row beneath */
 .input-wrap {
   display: flex;

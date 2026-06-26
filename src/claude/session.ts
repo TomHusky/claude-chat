@@ -21,7 +21,8 @@ export class SessionStore {
   setCustomTitle(sessionId: string, title: string): boolean {
     const file = this.findFile(sessionId);
     if (!file) return false;
-    const entry = JSON.stringify({ type: "custom-title", customTitle: title, sessionId }) + "\n";
+    // Field order mirrors what the official Claude UI writes, byte-for-byte.
+    const entry = JSON.stringify({ type: "custom-title", sessionId, customTitle: title }) + "\n";
     try {
       fs.appendFileSync(file, entry, "utf8");
       return true;

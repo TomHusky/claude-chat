@@ -15,6 +15,7 @@ const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 const ORIG_SCHEME = "claude-orig";
 /** workspaceState key: id of the last active session (restored on open). */
 const LAST_SESSION_KEY = "claudeChat.lastSession";
+const TITLE_OVERRIDES_KEY = "claudeChat.titleOverrides"; // sessionId -> user-set title
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "claude-chat.chatView";
@@ -41,6 +42,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly output: vscode.OutputChannel,
   ) {
     this.store = new SessionStore(this.cwd());
+    this.store.setTitleOverrides(this.context.globalState.get<Record<string, string>>(TITLE_OVERRIDES_KEY, {}));
     this.checkpoints = new CheckpointManager(this.storageDir());
 
     // Serve baseline (pre-edit) content so the native diff editor can show
@@ -355,6 +357,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "deleteSession":
           await this.deleteSessions([m.sessionId]);
+          break;
+        case "renameSession":
+          this.renameSession(m.sessionId, m.title);
           break;
         case "deleteSessions":
           await this.deleteSessions(m.sessionIds);
@@ -880,6 +885,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.refreshSessions();
   }
 
+  /** Set (or clear, when blank) a user-defined title for a session. Stored in
+   *  the extension's own globalState — Claude Code's transcript is never touched. */
+  private renameSession(sessionId: string, title: string): void {
+    const map = { ...this.context.globalState.get<Record<string, string>>(TITLE_OVERRIDES_KEY, {}) };
+    const clean = (title || "").trim().slice(0, 80);
+    if (clean) map[sessionId] = clean;
+    else delete map[sessionId]; // empty -> revert to AI title / first message
+    void this.context.globalState.update(TITLE_OVERRIDES_KEY, map);
+    this.store.setTitleOverrides(map);
+    this.refreshSessions();
+  }
+
   private async switchSession(sessionId: string): Promise<void> {
     this.forceBlank = false;
     this.proc?.dispose();
@@ -1262,6 +1279,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .body { flex: 1; min-width: 0; }
   .row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; }
   .row .meta { font-size: 10.5px; opacity: .55; margin-top: 1px; }
+  .row .rename { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; padding: 1px 4px;
+    border: 1px solid var(--vscode-focusBorder, #3794ff); border-radius: 4px; outline: none;
+    background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
   .row .del { flex: 0 0 auto; opacity: 0; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 2px; border-radius: 4px; }
   .row:hover .del { opacity: .65; }
   .row .del:hover { opacity: 1; color: var(--vscode-errorForeground, #e55); }
@@ -1334,12 +1354,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       c.innerHTML = "";
       const openBtn = document.createElement("button"); openBtn.textContent = "打开";
       openBtn.onclick = () => { hideCtx(); open(id); };
+      const renBtn = document.createElement("button"); renBtn.textContent = "重命名";
+      renBtn.onclick = () => { hideCtx(); rename(id); };
       const delBtn = document.createElement("button"); delBtn.className = "danger"; delBtn.textContent = "删除";
       delBtn.onclick = () => { hideCtx(); confirmDel([id]); };
-      c.append(openBtn, delBtn);
+      c.append(openBtn, renBtn, delBtn);
       c.style.left = Math.min(x, window.innerWidth - 140) + "px";
       c.style.top = Math.min(y, window.innerHeight - 80) + "px";
       c.classList.remove("hidden");
+    }
+    function rename(id) {
+      const row = document.querySelector('.row[data-id="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+      if (!row) return;
+      const t = row.querySelector(".t");
+      const cur = (sessions.find((s) => s.id === id) || {}).title || "";
+      const input = document.createElement("input");
+      input.className = "rename"; input.value = cur;
+      t.replaceWith(input); input.focus(); input.select();
+      let done = false;
+      const commit = (save) => {
+        if (done) return; done = true;
+        if (save) vscode.postMessage({ type: "renameSession", sessionId: id, title: input.value.trim() });
+        render();
+      };
+      input.addEventListener("click", (e) => e.stopPropagation());
+      input.addEventListener("keydown", (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") { e.preventDefault(); commit(true); }
+        else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+      });
+      input.addEventListener("blur", () => commit(true));
     }
     function hideCtx() { $("ctx").classList.add("hidden"); }
     window.addEventListener("click", hideCtx);

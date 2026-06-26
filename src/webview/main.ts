@@ -1200,7 +1200,8 @@ function renderSessions(list: SessionItem[], activeId?: string) {
       row.appendChild(cb);
     }
     const main = el("div", "list-main");
-    main.append(el("div", "list-title", s.title), el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
+    const titleEl = el("div", "list-title", s.title);
+    main.append(titleEl, el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
     row.appendChild(main);
     row.onclick = () => {
       if (multiSelect) {
@@ -1214,11 +1215,38 @@ function renderSessions(list: SessionItem[], activeId?: string) {
     };
     row.oncontextmenu = (e) => {
       e.preventDefault();
-      showCtxMenu(e.clientX, e.clientY, [{ label: "删除会话", danger: true, run: () => send({ type: "deleteSession", sessionId: s.id }) }]);
+      showCtxMenu(e.clientX, e.clientY, [
+        { label: "重命名", run: () => startRenameSession(titleEl, s.id, s.title) },
+        { label: "删除会话", danger: true, run: () => send({ type: "deleteSession", sessionId: s.id }) },
+      ]);
     };
     sessionsList.appendChild(row);
   }
   updateSessionTools();
+}
+
+/** Inline-edit a session title: swap the title div for an input. Enter / blur
+ *  commits (empty reverts to the auto title); Esc cancels. */
+function startRenameSession(titleEl: HTMLElement, id: string, current: string) {
+  const input = el("input", "rename-input") as HTMLInputElement;
+  input.value = current;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = (save: boolean) => {
+    if (done) return;
+    done = true;
+    if (save) send({ type: "renameSession", sessionId: id, title: input.value.trim() });
+    renderSessions(lastSessions, lastActiveId); // restore/refresh (server echo re-renders on save)
+  };
+  input.onclick = (e) => e.stopPropagation();
+  input.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") { e.preventDefault(); commit(true); }
+    else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+  };
+  input.onblur = () => commit(true);
 }
 
 function updateSessionTools() {

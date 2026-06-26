@@ -12,7 +12,14 @@ import { CTX_OPEN, CTX_CLOSE, SessionSummary, TimelineItem } from "../shared";
  *   - encoded-cwd = absolute cwd with every non-alphanumeric char -> '-'
  */
 export class SessionStore {
+  /** User-set title overrides (sessionId -> title), injected by the provider. */
+  private overrides: Record<string, string> = {};
+
   constructor(private readonly cwd: string) {}
+
+  setTitleOverrides(o: Record<string, string>): void {
+    this.overrides = o || {};
+  }
 
   private configDir(): string {
     return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
@@ -48,9 +55,10 @@ export class SessionStore {
           const stat = fs.statSync(full);
           const { title, messageCount } = this.peek(full);
           if (messageCount === 0) continue; // skip empty/aborted sessions
+          const id = file.replace(/\.jsonl$/, "");
           out.push({
-            id: file.replace(/\.jsonl$/, ""),
-            title,
+            id,
+            title: this.overrides[id] || title,
             updatedAt: stat.mtimeMs,
             messageCount,
           });

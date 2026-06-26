@@ -151,6 +151,7 @@ export type FromWebview =
   | { type: "openSession"; sessionId: string }
   | { type: "newInEditor" }
   | { type: "deleteSession"; sessionId: string }
+  | { type: "renameSession"; sessionId: string; title: string }
   | { type: "deleteSessions"; sessionIds: string[] }
   | { type: "listCheckpoints" }
   | { type: "restoreCheckpoint"; checkpointId: string }

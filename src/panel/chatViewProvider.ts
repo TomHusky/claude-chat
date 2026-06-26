@@ -1447,17 +1447,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 }
 
-/** Parse the CLI `/usage` text into session + weekly percentages and reset times.
- *  Returns undefined if nothing recognizable was found (e.g. API-key accounts). */
-function parseUsage(text: string): { sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string } | undefined {
+/** Parse the CLI `/usage` text into today's activity (last 24h) + the weekly
+ *  quota percentage/reset. Returns undefined if nothing recognizable was found
+ *  (e.g. API-key accounts, which have no subscription usage). */
+function parseUsage(text: string): { dayRequests?: number; daySessions?: number; weekPct?: number; weekReset?: string } | undefined {
   if (!text) return undefined;
   const reset = (s?: string) => s?.replace(/\s*\(.*?\)\s*$/, "").trim() || undefined; // drop "(Asia/Shanghai)"
-  const sess = /Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
+  const day = /Last 24h\s*·\s*([\d,]+)\s*requests(?:\s*·\s*([\d,]+)\s*sessions)?/i.exec(text);
   const week = /Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
-  if (!sess && !week) return undefined;
+  if (!day && !week) return undefined;
+  const num = (s?: string) => (s ? parseInt(s.replace(/,/g, ""), 10) : undefined);
   return {
-    sessionPct: sess ? parseInt(sess[1], 10) : undefined,
-    sessionReset: reset(sess?.[2]),
+    dayRequests: num(day?.[1]),
+    daySessions: num(day?.[2]),
     weekPct: week ? parseInt(week[1], 10) : undefined,
     weekReset: reset(week?.[2]),
   };

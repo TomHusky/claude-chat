@@ -352,18 +352,17 @@ function updateContextGauge(used: number, total: number) {
 }
 
 const usagePill = $<HTMLButtonElement>("usage-pill");
-/** Claude subscription usage (5h session + weekly), shown where cost used to be. */
-function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string) {
+/** Claude subscription usage (today's activity + weekly quota), where cost was. */
+function renderUsage(dayRequests?: number, daySessions?: number, weekPct?: number, weekReset?: string) {
   const parts: string[] = [];
-  if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
+  if (typeof dayRequests === "number") parts.push(`今日 ${dayRequests} 次`);
   if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
   if (!parts.length) return;
   usagePill.classList.remove("hidden");
-  const peak = Math.max(sessionPct ?? 0, weekPct ?? 0);
-  usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
+  usagePill.style.setProperty("--u-color", (weekPct ?? 0) >= 90 ? "#e5534b" : (weekPct ?? 0) >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
   usagePill.textContent = parts.join(" · ");
   const tip: string[] = ["Claude 订阅用量（点击刷新）"];
-  if (typeof sessionPct === "number") tip.push(`5 小时会话额度 ${sessionPct}%${sessionReset ? `，${sessionReset} 重置` : ""}`);
+  if (typeof dayRequests === "number") tip.push(`近 24 小时 ${dayRequests} 次请求${typeof daySessions === "number" ? ` · ${daySessions} 个会话` : ""}`);
   if (typeof weekPct === "number") tip.push(`本周额度 ${weekPct}%${weekReset ? `，${weekReset} 重置` : ""}`);
   usagePill.title = tip.join("\n");
 }
@@ -448,7 +447,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       }
       break;
     case "usage":
-      renderUsage(m.sessionPct, m.sessionReset, m.weekPct, m.weekReset);
+      renderUsage(m.dayRequests, m.daySessions, m.weekPct, m.weekReset);
       break;
     case "error":
       finalizeTurn();

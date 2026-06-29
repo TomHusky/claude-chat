@@ -188,6 +188,9 @@ function finalizeTurn() {
     assistantEl.classList.remove("streaming-turn");
     assistantEl.querySelector(".rail .thread-active")?.remove(); // stop the progress pulse
     const body = assistantEl.querySelector(".msg-body");
+    // If the user manually stopped, mark it at the very end of the reply.
+    if (body && userStopped) body.appendChild(el("div", "msg-interrupted", "[Request interrupted by user]"));
+    userStopped = false;
     if (body && body.children.length === 0) {
       assistantEl.remove();
     } else if (body) {
@@ -688,6 +691,12 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   if (why) {
     why.classList.toggle("warn", interrupted && !isError);
     why.textContent = bad ? (interrupted ? "已中断" : "执行失败") : "";
+  }
+  // Interrupted: the "[Request interrupted by user]" text is shown once at the
+  // end of the reply, so don't also dump it in the tool body — the badge says it.
+  if (interrupted && !isError) {
+    maybeScroll();
+    return;
   }
   // While the model moves on to the next step, show the thinking pill again.
   if (isBusy) showWorking();
@@ -1543,7 +1552,11 @@ function renderQueue() {
 }
 
 sendBtn.onclick = doSend;
-stopBtn.onclick = () => send({ type: "interrupt" });
+let userStopped = false; // user hit Stop — append an interrupted marker on finalize
+stopBtn.onclick = () => {
+  userStopped = true;
+  send({ type: "interrupt" });
+};
 inputEl.addEventListener("keydown", (e) => {
   // Ignore Enter while an IME composition is active (e.g. confirming a pinyin
   // candidate) — `isComposing`/keyCode 229 means it's not a real "send".

@@ -451,6 +451,11 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .askq-q { flex: 0 0 auto; max-width: 45%; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .askq-a { flex: 1; min-width: 0; font-weight: 600; }
 .askq-skip { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px; }
+/* user-stopped marker at the end of an AI reply */
+.msg-interrupted {
+  margin: 6px 0 2px; font-size: 12px; font-style: italic;
+  color: var(--vscode-descriptionForeground); opacity: .8;
+}
 /* the avatar icon is the first node — don't draw a dot that overlaps it */
 .msg-body > .step:first-child > .step-dot { display: none; }
 .tool-head {

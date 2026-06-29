@@ -808,8 +808,10 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 }
 .ctx-gauge:hover { opacity: .82; }
 .ctx-gauge.hidden { display: none; }
-/* spin while /compact runs */
-.ctx-gauge.compacting { cursor: progress; animation: cg-spin 1s linear infinite; }
+/* spin only the colored ring while /compact runs; keep the center number still */
+.ctx-gauge.compacting { cursor: progress; }
+.ctx-gauge.compacting .cg-ring { animation: cg-spin 1s linear infinite; }
+.ctx-gauge.compacting .cg-pct { animation: cg-spin 1s linear infinite reverse; }
 @keyframes cg-spin { to { transform: rotate(360deg); } }
 .cg-ring {
   position: relative; width: 22px; height: 22px; border-radius: 50%;

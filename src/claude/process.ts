@@ -172,6 +172,15 @@ export class ClaudeProcess {
     this.write({ type: "user", message: { role: "user", content } });
   }
 
+  /** Run `/compact`: ask the CLI to summarize and shrink the conversation
+   *  context. The CLI streams a `compacting` status, then a `compact_boundary`
+   *  system event with pre/post token counts, then a normal `result`. */
+  compact(): void {
+    if (!this.proc || !this.initialized) return;
+    this.setBusy(true);
+    this.write({ type: "user", message: { role: "user", content: [{ type: "text", text: "/compact" }] } });
+  }
+
   /** Resolve a pending permission request (called by the provider). */
   respondPermission(requestId: string, decision: { behavior: "allow" | "deny"; message?: string }): void {
     const originalInput = this.pendingPermissions.get(requestId);
@@ -377,7 +386,23 @@ export class ClaudeProcess {
       });
     } else if ((ev as any).subtype === "status") {
       const status = (ev as any).status;
-      if (typeof status === "string") this.hooks.emit({ kind: "status", label: status });
+      // /compact lifecycle: a "compacting" status, then a status carrying
+      // compact_result, then the compact_boundary detail below.
+      if (status === "compacting") {
+        this.hooks.emit({ kind: "compacting" });
+      } else if ((ev as any).compact_result) {
+        /* swallow; compact_boundary carries the numbers */
+      } else if (typeof status === "string") {
+        this.hooks.emit({ kind: "status", label: status });
+      }
+    } else if ((ev as any).subtype === "compact_boundary") {
+      const md = (ev as any).compact_metadata ?? {};
+      this.hooks.emit({
+        kind: "compacted",
+        trigger: md.trigger ?? "manual",
+        preTokens: md.pre_tokens ?? 0,
+        postTokens: md.post_tokens ?? 0,
+      });
     }
   }
 

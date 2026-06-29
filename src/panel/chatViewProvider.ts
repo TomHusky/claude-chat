@@ -530,6 +530,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (ctx.proc) await ctx.proc.interrupt();
           else this.post(ctx, { kind: "busy", busy: false }); // nothing running yet — reset the UI
           break;
+        case "compact": {
+          // Resume/spawn the process so it holds the full transcript, then /compact it.
+          const proc = await this.ensureProcess(ctx);
+          if (proc) proc.compact();
+          else this.post(ctx, { kind: "busy", busy: false });
+          break;
+        }
         case "permission":
           ctx.pendingPerm = undefined;
           this.handlePermission(ctx, m.requestId, m.behavior, m.suggestionId);

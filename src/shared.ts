@@ -59,6 +59,8 @@ export type ToWebview =
   | { kind: "refs_validated"; invalid: string[] }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
   | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; weekPct?: number; weekReset?: string; weekSonnetPct?: number }
+  | { kind: "compacting" }
+  | { kind: "compacted"; trigger: string; preTokens: number; postTokens: number }
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
   // Full conversation replacement (switching/restoring sessions)
@@ -146,6 +148,7 @@ export type FromWebview =
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
   | { type: "editMessage"; checkpointId: string; text: string }
   | { type: "interrupt" }
+  | { type: "compact" }
   | { type: "permission"; requestId: string; behavior: "allow" | "deny"; suggestionId?: string }
   | { type: "answerQuestion"; requestId: string; answers: Record<string, string | string[]> }
   | { type: "newSession" }

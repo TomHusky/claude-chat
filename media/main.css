@@ -804,9 +804,13 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 /* Circular context-usage gauge (right of the mode picker) */
 .ctx-gauge {
   flex: 0 0 auto; position: relative; width: 22px; height: 22px; padding: 0;
-  display: inline-flex; align-items: center; justify-content: center; cursor: default;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
 }
+.ctx-gauge:hover { opacity: .82; }
 .ctx-gauge.hidden { display: none; }
+/* spin while /compact runs */
+.ctx-gauge.compacting { cursor: progress; animation: cg-spin 1s linear infinite; }
+@keyframes cg-spin { to { transform: rotate(360deg); } }
 .cg-ring {
   position: relative; width: 22px; height: 22px; border-radius: 50%;
   display: flex; align-items: center; justify-content: center;

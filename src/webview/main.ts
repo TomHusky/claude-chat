@@ -379,8 +379,12 @@ function addStreamEst(text: string) {
 }
 
 const ctxGauge = $("ctx-gauge");
-/** Circular context-usage gauge next to the mode picker (hidden below 10%). */
+let lastCtxTotal = 1_000_000; // remembered so we can repaint the gauge after a /compact
+let compacting = false;
+/** Circular context-usage gauge next to the mode picker (hidden below 10%).
+ *  Clicking it runs /compact to summarize and shrink the conversation. */
 function updateContextGauge(used: number, total: number) {
+  if (total > 0) lastCtxTotal = total;
   const pct = Math.max(0, Math.min(100, Math.round((used / total) * 100)));
   if (pct < 10) {
     ctxGauge.classList.add("hidden");
@@ -391,8 +395,12 @@ function updateContextGauge(used: number, total: number) {
   ctxGauge.style.setProperty("--cg-color", pct >= 85 ? "#e5534b" : pct >= 60 ? "#e0a33e" : "#d97757");
   const lbl = ctxGauge.querySelector(".cg-pct") as HTMLElement | null;
   if (lbl) lbl.textContent = String(pct);
-  ctxGauge.title = `上下文使用 ${pct}%（约 ${fmtTokens(used)} / ${fmtTokens(total)} tokens）`;
+  ctxGauge.title = `上下文使用 ${pct}%（约 ${fmtTokens(used)} / ${fmtTokens(total)} tokens）\n点击压缩上下文（/compact）`;
 }
+ctxGauge.addEventListener("click", () => {
+  if (compacting || isBusy) return; // already working
+  send({ type: "compact" });
+});
 
 const usagePill = $<HTMLButtonElement>("usage-pill");
 /** Format a unix-seconds reset time as a "还剩 Xh Ym" countdown. */
@@ -514,6 +522,19 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "usage":
       renderUsage(m.sessionPct, m.sessionResetAt, m.weekPct, m.weekReset, m.weekSonnetPct);
       break;
+    case "compacting":
+      compacting = true;
+      ctxGauge.classList.add("compacting");
+      showWorking("正在压缩上下文…");
+      break;
+    case "compacted": {
+      compacting = false;
+      ctxGauge.classList.remove("compacting");
+      const saved = m.preTokens > 0 ? `（${fmtTokens(m.preTokens)} → ${fmtTokens(m.postTokens)} tokens）` : "";
+      appendNotice(`上下文已压缩${saved}`, "info");
+      updateContextGauge(m.postTokens, lastCtxTotal);
+      break;
+    }
     case "error":
       finalizeTurn();
       appendNotice(m.message, "error");

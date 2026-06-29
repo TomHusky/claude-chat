@@ -316,15 +316,21 @@ function updateActiveLine() {
     const r = av.getBoundingClientRect();
     startY = r.top + r.height / 2 - railTop;
   }
-  // Bottom = the bottom of the last real content node (text / tool card), NOT
-  // any trailing interactive box (the option picker or permission box), which
-  // can be very tall. This keeps the active glow to just the last segment
-  // instead of stretching down past the whole picker.
-  const content = assistantEl.querySelectorAll(".msg-body > .step, .msg-body > .text-seg, .msg-body > .msg-images");
-  const lastContent = content[content.length - 1] as HTMLElement | undefined;
-  const bottomY = lastContent
-    ? lastContent.getBoundingClientRect().bottom - railTop
-    : rail.getBoundingClientRect().bottom - railTop - 2;
+  // Bottom = where the work currently IS: the live "working" pill if present
+  // (so the glow reaches the bottom of a running tool's card), otherwise the
+  // bottom of the last real content node — but NOT a trailing interactive box
+  // (the option picker / permission box), which can be very tall.
+  const pill = assistantEl.querySelector(".msg-body > .working-pill") as HTMLElement | null;
+  let bottomY: number;
+  if (pill) {
+    bottomY = pill.getBoundingClientRect().bottom - railTop;
+  } else {
+    const content = assistantEl.querySelectorAll(".msg-body > .step, .msg-body > .text-seg, .msg-body > .msg-images");
+    const lastContent = content[content.length - 1] as HTMLElement | undefined;
+    bottomY = lastContent
+      ? lastContent.getBoundingClientRect().bottom - railTop
+      : rail.getBoundingClientRect().bottom - railTop - 2;
+  }
   active.style.top = `${startY}px`;
   active.style.removeProperty("bottom");
   active.style.height = `${Math.max(0, bottomY - startY)}px`;
@@ -435,6 +441,7 @@ function startTick() {
       const seed = Number(wk.dataset.wseed || 0);
       if (lbl) lbl.textContent = `${THINKING_WORDS[(seed + Math.floor(elapsed / 3)) % THINKING_WORDS.length]}…`;
     }
+    updateActiveLine(); // keep the active glow tracking the pill as content grows
   }, 1000);
 }
 
@@ -2120,6 +2127,7 @@ function showWorking(label?: string) {
   // Always keep the pill as the last element so it sits below the latest output.
   if (body.lastElementChild !== w) body.appendChild(w);
   startTick();
+  updateActiveLine(); // extend the active glow down to the pill right away
   maybeScroll();
 }
 function removeWorking() {

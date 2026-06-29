@@ -1534,6 +1534,7 @@ function performSend(p: QueueItem) {
   turnTokens = 0; // reset token counters for the new turn
   turnEst = 0;
   isBusy = true;
+  refreshComposerHint(); // show the Stop button immediately (don't wait for the busy event)
   showWorking(); // instant feedback (the busy event confirms it a moment later)
   if (assistantEl) assistantEl.classList.add("streaming-turn");
   send({

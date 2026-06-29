@@ -30,6 +30,7 @@ interface SessionCtx {
   pendingPerm?: ToWebview; // permission raised while this tab was hidden/closed
   blank: boolean; // a fresh "new chat" tab with no session yet
   ready: boolean; // its webview finished loading
+  interruptRequested?: boolean; // user hit Stop while the process was still spawning
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -525,7 +526,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "interrupt":
           ctx.pendingPerm = undefined;
-          await ctx.proc?.interrupt();
+          ctx.interruptRequested = true; // if the process is still spawning, abort the pending send
+          if (ctx.proc) await ctx.proc.interrupt();
+          else this.post(ctx, { kind: "busy", busy: false }); // nothing running yet — reset the UI
           break;
         case "permission":
           ctx.pendingPerm = undefined;
@@ -673,12 +676,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     let attached = context ?? ctx.pendingContext;
     ctx.pendingContext = undefined;
+    ctx.interruptRequested = false;
     if (files && files.length) {
       const fileCtx = this.buildFileContext(files);
       attached = attached ? `${fileCtx}\n\n${attached}` : fileCtx;
     }
     const proc = await this.ensureProcess(ctx);
     if (!proc) return;
+    // The user hit Stop while the process was still spawning — don't send the turn.
+    if (ctx.interruptRequested) {
+      ctx.interruptRequested = false;
+      this.post(ctx, { kind: "busy", busy: false });
+      return;
+    }
     // Record the transcript length *before* this turn so a restore point can
     // truncate the conversation back to exactly here.
     const lineBefore = ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0;

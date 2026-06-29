@@ -291,8 +291,18 @@ export class SessionStore {
 
   /** True for genuine user-typed text (not tool results or synthetic injects). */
   private isRealUserText(o: any): boolean {
+    // Skip CLI-generated meta turns: /compact summaries, slash-command echoes,
+    // and local-command stdout/caveat wrappers — these aren't real user input.
+    if (o?.isMeta === true || o?.isCompactSummary === true) return false;
     const c = o.message?.content;
-    if (typeof c === "string") return c.trim().length > 0;
+    if (typeof c === "string") {
+      const t = c.trim();
+      if (!t) return false;
+      if (/^<(command-name|command-message|command-args|local-command-stdout|local-command-caveat)>/.test(t)) {
+        return false;
+      }
+      return true;
+    }
     if (Array.isArray(c)) {
       const hasText = c.some((b) => b?.type === "text" && b.text?.trim());
       const hasToolResult = c.some((b) => b?.type === "tool_result");

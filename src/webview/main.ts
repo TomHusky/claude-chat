@@ -214,17 +214,33 @@ function finalizeTurn() {
 function endTimelineAtLastNode(msg: HTMLElement) {
   const line = msg.querySelector(".thread-line") as HTMLElement | null;
   if (!line) return;
-  const nodes = msg.querySelectorAll(".step, .text-seg.summary-node");
-  const last = nodes[nodes.length - 1] as HTMLElement | undefined;
-  if (!last) {
-    line.style.display = "none";
-    return;
+  const compute = () => {
+    const nodes = msg.querySelectorAll(".step, .text-seg.summary-node");
+    const last = nodes[nodes.length - 1] as HTMLElement | undefined;
+    if (!last) {
+      line.style.display = "none";
+      return;
+    }
+    line.style.display = "";
+    const aTop = msg.getBoundingClientRect().top;
+    const lineTop = line.getBoundingClientRect().top - aTop;
+    const endY = last.getBoundingClientRect().top - aTop + 9; // ≈ dot center
+    line.style.flex = "0 0 auto";
+    line.style.height = Math.max(0, endY - lineTop) + "px";
+  };
+  compute();
+  // The pixel height goes stale when content below reflows (code highlighting,
+  // expanding a tool result, images loading). Recompute on any size change so
+  // the line always connects every node exactly.
+  const m = msg as HTMLElement & { _lineObs?: ResizeObserver };
+  if (!m._lineObs) {
+    let raf = 0;
+    m._lineObs = new ResizeObserver(() => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(compute);
+    });
+    m._lineObs.observe(msg);
   }
-  const aTop = msg.getBoundingClientRect().top;
-  const lineTop = line.getBoundingClientRect().top - aTop;
-  const endY = last.getBoundingClientRect().top - aTop + 9; // ≈ dot center
-  line.style.flex = "0 0 auto";
-  line.style.height = Math.max(0, endY - lineTop) + "px";
 }
 
 /** Reveal the live text with a typewriter: complete lines are rendered as

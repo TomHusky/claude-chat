@@ -300,12 +300,18 @@ function updateActiveLine() {
     const r = av.getBoundingClientRect();
     startY = r.top + r.height / 2 - railTop;
   }
-  // Anchor the bottom to the rail's end (which grows with the message) so the
-  // active segment always reaches the very bottom of the line, even when more
-  // content (e.g. a permission box) is added after the last node.
+  // Bottom = the bottom of the last real content node (text / tool card), NOT
+  // any trailing interactive box (the option picker or permission box), which
+  // can be very tall. This keeps the active glow to just the last segment
+  // instead of stretching down past the whole picker.
+  const content = assistantEl.querySelectorAll(".msg-body > .step, .msg-body > .text-seg, .msg-body > .msg-images");
+  const lastContent = content[content.length - 1] as HTMLElement | undefined;
+  const bottomY = lastContent
+    ? lastContent.getBoundingClientRect().bottom - railTop
+    : rail.getBoundingClientRect().bottom - railTop - 2;
   active.style.top = `${startY}px`;
-  active.style.bottom = "2px";
-  active.style.removeProperty("height");
+  active.style.removeProperty("bottom");
+  active.style.height = `${Math.max(0, bottomY - startY)}px`;
 }
 
 // -- Shared 1s ticker: updates the "Thinking · Ns · N tokens" pill ------------

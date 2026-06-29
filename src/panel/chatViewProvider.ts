@@ -45,6 +45,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private lastUsageAt = 0; // throttle for subscription-usage queries
   private usageInFlight = false;
   private lastUsage?: ToWebview; // most recent usage result, replayed to new tabs
+  private layoutFixing = false; // guards re-entrancy while sliding a file group left
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
 
@@ -75,7 +76,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.window.onDidCloseTerminal((t) => {
         if (t === this.terminal) this.terminal = undefined;
       }),
-      vscode.window.onDidChangeActiveTextEditor(() => this.postActiveFile()),
+      vscode.window.onDidChangeActiveTextEditor((ed) => {
+        this.postActiveFile();
+        void this.keepFilesLeft(ed);
+      }),
     );
   }
 
@@ -347,6 +351,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.sessions.add(ctx);
     this.activeCtx = ctx;
     await this.lockChatGroup(panel);
+  }
+
+  /** Keep the layout "files on the left, chat on the right": whenever a file
+   *  editor ends up to the right of (or alongside) the chat, slide its group to
+   *  the far left. Focus stays on the file. */
+  private async keepFilesLeft(ed?: vscode.TextEditor): Promise<void> {
+    if (this.layoutFixing || !ed || ed.viewColumn === undefined) return;
+    if (!this.sessions.size) return;
+    if (ed.document.uri.scheme === ORIG_SCHEME) return; // our diff baselines
+    const chatCol = (): number | undefined => {
+      let m: number | undefined;
+      for (const ctx of this.sessions) {
+        const c = ctx.panel.viewColumn;
+        if (c && (m === undefined || c < m)) m = c;
+      }
+      return m;
+    };
+    const cc = chatCol();
+    if (cc === undefined || ed.viewColumn < cc) return; // already left of the chat
+    this.layoutFixing = true;
+    try {
+      for (let i = 0; i < 8; i++) {
+        const a = vscode.window.activeTextEditor;
+        const col = a?.viewColumn;
+        if (!a || col === undefined || col === vscode.ViewColumn.One) break;
+        const ck = chatCol();
+        if (ck !== undefined && col < ck) break; // now left of the chat
+        await vscode.commands.executeCommand("workbench.action.moveActiveEditorGroupLeft");
+        if (vscode.window.activeTextEditor?.viewColumn === col) break; // no movement
+      }
+    } catch {
+      /* best effort */
+    } finally {
+      this.layoutFixing = false;
+    }
   }
 
   /** Lock a chat panel's editor group so explorer files open in another group

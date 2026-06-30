@@ -58,7 +58,7 @@ export type ToWebview =
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
-  | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; weekPct?: number; weekReset?: string; weekSonnetPct?: number }
+  | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekSonnetPct?: number }
   | { kind: "compacting" }
   | { kind: "compacted"; trigger: string; preTokens: number; postTokens: number }
   | { kind: "error"; message: string }

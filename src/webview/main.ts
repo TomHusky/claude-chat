@@ -414,7 +414,17 @@ function resetCountdown(resetAt?: number): string | undefined {
 }
 /** Claude subscription usage (current session + weekly quota), where cost was.
  *  Mirrors the official /usage panel: session % w/ reset countdown + weekly %. */
-function renderUsage(sessionPct?: number, sessionResetAt?: number, weekPct?: number, weekReset?: string, weekSonnetPct?: number) {
+type UsageData = {
+  sessionPct?: number;
+  sessionReset?: string;
+  weekPct?: number;
+  weekReset?: string;
+  weekSonnetPct?: number;
+};
+let lastUsageData: UsageData = {};
+const usageMenu = $("usage-menu");
+function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string, weekSonnetPct?: number) {
+  lastUsageData = { sessionPct, sessionReset, weekPct, weekReset, weekSonnetPct };
   const parts: string[] = [];
   if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
   if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
@@ -423,14 +433,88 @@ function renderUsage(sessionPct?: number, sessionResetAt?: number, weekPct?: num
   const peak = Math.max(sessionPct ?? 0, weekPct ?? 0);
   usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
   usagePill.textContent = parts.join(" · ");
-  const cd = resetCountdown(sessionResetAt);
-  const tip: string[] = ["Claude 订阅用量（点击刷新）"];
-  if (typeof sessionPct === "number") tip.push(`当前会话 ${sessionPct}%（5 小时窗口${cd ? `，${cd}` : ""}）`);
-  if (typeof weekPct === "number") tip.push(`本周·全模型 ${weekPct}%${weekReset ? `，${weekReset} 重置` : ""}`);
-  if (typeof weekSonnetPct === "number") tip.push(`本周·Sonnet ${weekSonnetPct}%`);
-  usagePill.title = tip.join("\n");
+  usagePill.title = "Claude 订阅用量 · 点击查看详情";
+  if (!usageMenu.classList.contains("hidden")) buildUsageMenu(); // live-refresh while open
 }
-usagePill.addEventListener("click", () => send({ type: "refreshUsage" }));
+
+// Convert the CLI's English reset string ("Jun 30 at 1:50pm" / "Jul 6 at 2am")
+// into Chinese. Session resets within hours → show just the time (or date+time
+// if not today); weekly resets days out → show the date.
+const RESET_MONTHS: Record<string, number> = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12,
+};
+function parseResetParts(s?: string): { mon?: number; day?: number; hh?: number; mm: number } {
+  if (!s) return { mm: 0 };
+  const m = /([A-Za-z]{3,})\s+(\d{1,2})(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?/i.exec(s);
+  if (!m) return { mm: 0 };
+  const mon = RESET_MONTHS[m[1].slice(0, 3).toLowerCase()];
+  const day = parseInt(m[2], 10);
+  let hh = m[3] != null ? parseInt(m[3], 10) : undefined;
+  const mm = m[4] != null ? parseInt(m[4], 10) : 0;
+  const ap = (m[5] || "").toLowerCase();
+  if (hh != null) {
+    if (ap === "pm" && hh < 12) hh += 12;
+    if (ap === "am" && hh === 12) hh = 0;
+  }
+  return { mon, day, hh, mm };
+}
+function cnResetSession(s?: string): string {
+  const p = parseResetParts(s);
+  if (p.hh == null) return p.mon != null ? `${p.mon}月${p.day}日 重置` : "";
+  const time = `${p.hh}:${String(p.mm).padStart(2, "0")}`;
+  const now = new Date();
+  const today = p.mon === now.getMonth() + 1 && p.day === now.getDate();
+  return today ? `${time} 重置` : `${p.mon}月${p.day}日 ${time} 重置`;
+}
+function cnResetWeek(s?: string): string {
+  const p = parseResetParts(s);
+  return p.mon != null ? `${p.mon}月${p.day}日 重置` : "";
+}
+function usageRow(label: string, pct: number | undefined, resetText: string): string {
+  const has = typeof pct === "number";
+  const p = has ? Math.max(0, Math.min(100, pct as number)) : 0;
+  const shown = has ? `${pct}%` : "—";
+  const warn = p >= 90 ? " warn-high" : p >= 70 ? " warn-mid" : "";
+  return (
+    `<div class="usage-row${warn}">` +
+    `<div class="usage-row-top"><span class="usage-name">${label}</span>` +
+    `<span class="usage-pct">${shown}</span></div>` +
+    `<div class="usage-bar"><span style="width:${p}%"></span></div>` +
+    (resetText ? `<div class="usage-reset">${resetText}</div>` : "") +
+    `</div>`
+  );
+}
+/** Expanded "套餐用量" panel — mirrors the official Plan-usage popover. */
+function buildUsageMenu() {
+  const d = lastUsageData;
+  let html = `<div class="pick-head usage-head">套餐用量</div>`;
+  html += usageRow("5 小时限额", d.sessionPct, cnResetSession(d.sessionReset));
+  html += usageRow("每周 · 全部模型", d.weekPct, cnResetWeek(d.weekReset));
+  html += usageRow("仅 Sonnet", d.weekSonnetPct, "");
+  usageMenu.innerHTML = html;
+}
+/** Anchor the popover directly above the usage pill (right edges aligned). */
+function positionUsageMenu() {
+  const parent = usageMenu.offsetParent as HTMLElement | null;
+  if (!parent) return;
+  const pill = usagePill.getBoundingClientRect();
+  const pr = parent.getBoundingClientRect();
+  usageMenu.style.left = "auto";
+  usageMenu.style.right = `${Math.max(8, pr.right - pill.right)}px`;
+  usageMenu.style.bottom = `${pr.bottom - pill.top + 6}px`;
+}
+usagePill.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = !usageMenu.classList.contains("hidden");
+  closePickers();
+  if (!open) {
+    buildUsageMenu();
+    usageMenu.classList.remove("hidden");
+    positionUsageMenu();
+    pickBackdrop.classList.remove("hidden");
+    send({ type: "refreshUsage" }); // pull fresh numbers; renderUsage rebuilds the open panel
+  }
+});
 function startTick() {
   if (tickTimer) return;
   tickTimer = window.setInterval(() => {
@@ -520,7 +604,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       }
       break;
     case "usage":
-      renderUsage(m.sessionPct, m.sessionResetAt, m.weekPct, m.weekReset, m.weekSonnetPct);
+      renderUsage(m.sessionPct, m.sessionReset, m.weekPct, m.weekReset, m.weekSonnetPct);
       break;
     case "compacting":
       compacting = true;
@@ -1833,6 +1917,7 @@ function syncPickers() {
 function closePickers() {
   modeMenu.classList.add("hidden");
   modelMenu.classList.add("hidden");
+  usageMenu.classList.add("hidden");
   pickBackdrop.classList.add("hidden");
 }
 

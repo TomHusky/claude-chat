@@ -1720,7 +1720,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
           <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji">⚡</span><span id="mode-label">Auto</span></button>
           <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
-          <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击刷新"></button>
+          <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>
           <div class="spacer"></div>
           <button id="btn-send" class="composer-send" title="发送">${ICONS.send}</button>
           <button id="btn-stop" class="composer-send stop hidden" title="停止">${ICONS.stop}</button>
@@ -1729,6 +1729,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="pick-backdrop" class="pick-backdrop hidden"></div>
       <div id="mode-menu" class="pick-menu hidden"></div>
       <div id="model-menu" class="pick-menu hidden"></div>
+      <div id="usage-menu" class="pick-menu usage-menu hidden"></div>
       <div id="status-line" class="status-line"></div>
     </footer>
   </div>
@@ -1741,15 +1742,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 /** Parse the CLI `/usage` text into the current-session + weekly quota
  *  percentages (and the weekly reset). Mirrors the official panel. Returns
  *  undefined if nothing recognizable was found (e.g. API-key accounts). */
-function parseUsage(text: string): { sessionPct?: number; weekPct?: number; weekReset?: string; weekSonnetPct?: number } | undefined {
+function parseUsage(text: string): { sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekSonnetPct?: number } | undefined {
   if (!text) return undefined;
   const reset = (s?: string) => s?.replace(/\s*\(.*?\)\s*$/, "").trim() || undefined; // drop "(Asia/Shanghai)"
-  const sess = /Current session:\s*(\d+)%\s*used/i.exec(text);
+  const sess = /Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
   const week = /Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
   const sonnet = /Current week \(Sonnet only\):\s*(\d+)%\s*used/i.exec(text);
   if (!sess && !week) return undefined;
   return {
     sessionPct: sess ? parseInt(sess[1], 10) : undefined,
+    sessionReset: reset(sess?.[2]),
     weekPct: week ? parseInt(week[1], 10) : undefined,
     weekReset: reset(week?.[2]),
     weekSonnetPct: sonnet ? parseInt(sonnet[1], 10) : undefined,

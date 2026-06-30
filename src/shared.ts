@@ -137,7 +137,8 @@ export type TimelineItem =
       isError?: boolean;
       permission?: "allow" | "deny" | "pending";
     }
-  | { type: "checkpoint"; id: string; label: string };
+  | { type: "checkpoint"; id: string; label: string }
+  | { type: "compaction"; preTokens: number; postTokens: number };
 
 // ---- Webview -> extension host --------------------------------------------
 

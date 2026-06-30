@@ -527,14 +527,14 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       ctxGauge.classList.add("compacting");
       showWorking("正在压缩上下文…");
       break;
-    case "compacted": {
+    case "compacted":
       compacting = false;
       ctxGauge.classList.remove("compacting");
-      const saved = m.preTokens > 0 ? `（${fmtTokens(m.preTokens)} → ${fmtTokens(m.postTokens)} tokens）` : "";
-      appendNotice(`上下文已压缩${saved}`, "info");
+      removeWorking();
+      messagesEl.appendChild(renderCompactionDivider(m.preTokens, m.postTokens));
+      scrollToBottom();
       updateContextGauge(m.postTokens, lastCtxTotal);
       break;
-    }
     case "error":
       finalizeTurn();
       appendNotice(m.message, "error");
@@ -1139,6 +1139,9 @@ function renderHistory(showAll: boolean) {
       body.appendChild(seg);
     } else if (it.type === "thinking") {
       // thinking is not displayed
+    } else if (it.type === "compaction") {
+      finalizeTurn();
+      messagesEl.appendChild(renderCompactionDivider(it.preTokens, it.postTokens));
     } else if (it.type === "tool") {
       if (it.name === "AskUserQuestion") {
         // Show the answered question as a clean titled card (not the raw output).
@@ -1483,6 +1486,14 @@ function renderCheckpointDivider(checkpointId: string): HTMLElement {
   // Confirmation is shown by the extension (native modal); we just request it.
   btn.onclick = () => send({ type: "restoreCheckpoint", checkpointId });
   d.append(btn);
+  return d;
+}
+
+/** A divider marking where the conversation was compacted (/compact). */
+function renderCompactionDivider(preTokens: number, postTokens: number): HTMLElement {
+  const d = el("div", "compaction-divider");
+  const saved = preTokens > 0 ? `${fmtTokens(preTokens)} → ${fmtTokens(postTokens)}` : "";
+  d.append(el("span", "cp-icon", "⟱"), document.createTextNode(saved ? ` 上下文已压缩 ${saved}` : " 上下文已压缩"));
   return d;
 }
 

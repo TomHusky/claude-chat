@@ -173,6 +173,14 @@ export class SessionStore {
             if (uri) items.push({ type: "image", src: uri });
           }
         }
+      } else if (o.type === "system" && (o as any).subtype === "compact_boundary") {
+        // Mark where a /compact summarized the conversation (a divider in the UI).
+        const cm = (o as any).compactMetadata ?? (o as any).compact_metadata ?? {};
+        items.push({
+          type: "compaction",
+          preTokens: cm.preTokens ?? cm.pre_tokens ?? 0,
+          postTokens: cm.postTokens ?? cm.post_tokens ?? 0,
+        });
       }
     }
     return items;
@@ -184,7 +192,8 @@ export class SessionStore {
   lastContextUsage(sessionId: string): { used: number; model?: string } | undefined {
     const file = this.findFile(sessionId);
     if (!file) return undefined;
-    let result: { used: number; model?: string } | undefined;
+    let used: number | undefined;
+    let model: string | undefined;
     for (const o of this.readLines(file)) {
       const msg = (o as any)?.message;
       const u = msg?.usage;
@@ -194,10 +203,19 @@ export class SessionStore {
           (u.cache_read_input_tokens || 0) +
           (u.cache_creation_input_tokens || 0) +
           (u.output_tokens || 0);
-        if (v > 0) result = { used: v, model: msg?.model };
+        if (v > 0) {
+          used = v;
+          model = msg?.model;
+        }
+      } else if (o.type === "system" && (o as any).subtype === "compact_boundary") {
+        // After a /compact the live context drops to postTokens until the next
+        // turn — without this, reloading re-reads the big pre-compact usage.
+        const cm = (o as any).compactMetadata ?? (o as any).compact_metadata;
+        const post = cm?.postTokens ?? cm?.post_tokens;
+        if (typeof post === "number" && post > 0) used = post;
       }
     }
-    return result;
+    return used !== undefined ? { used, model } : undefined;
   }
 
   /** Number of non-empty lines in a session transcript (0 if not yet written). */

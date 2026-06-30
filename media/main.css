@@ -705,6 +705,18 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   flex: 1;
   border-top: 1px dashed var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
 }
+/* compaction marker — same centered-dashed look as the checkpoint divider */
+.compaction-divider {
+  display: flex; align-items: center; gap: 8px;
+  margin: 6px 2px; padding: 3px 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px; user-select: none; cursor: default;
+}
+.compaction-divider::before,
+.compaction-divider::after {
+  content: ""; flex: 1;
+  border-top: 1px dashed var(--vscode-panel-border, rgba(128, 128, 128, 0.3));
+}
 .cp-icon { font-size: 11px; }
 /* Always present and the same size whether hovered or not — only the color
    and background change on hover, so the divider never reflows. */

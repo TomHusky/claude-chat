@@ -528,8 +528,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "interrupt":
           ctx.pendingPerm = undefined;
           ctx.interruptRequested = true; // if the process is still spawning, abort the pending send
-          if (ctx.proc) await ctx.proc.interrupt();
-          else this.post(ctx, { kind: "busy", busy: false }); // nothing running yet — reset the UI
+          this.post(ctx, { kind: "busy", busy: false }); // instant UI feedback regardless of CLI latency
+          void ctx.proc?.interrupt(); // fire-and-forget — don't block the message loop on the round-trip
           break;
         case "compact": {
           // Resume/spawn the process so it holds the full transcript, then /compact it.

@@ -1702,6 +1702,11 @@ let userStopped = false; // user hit Stop — append an interrupted marker on fi
 stopBtn.onclick = () => {
   userStopped = true;
   send({ type: "interrupt" });
+  // Optimistic: react to the click itself with zero latency. The host confirms
+  // with a busy:false, and the final `result` appends the interrupted marker.
+  isBusy = false;
+  refreshComposerHint();
+  removeWorking();
 };
 inputEl.addEventListener("keydown", (e) => {
   // Ignore Enter while an IME composition is active (e.g. confirming a pinyin

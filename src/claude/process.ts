@@ -216,6 +216,10 @@ export class ClaudeProcess {
   /** Interrupt the current turn. */
   async interrupt(): Promise<void> {
     if (!this.proc) return;
+    // Clear the busy UI up front so Stop always feels instant — even if the
+    // control request is slow to come back (e.g. fired during init or a
+    // non-streaming phase). Waiting on the round-trip first made Stop look dead.
+    this.setBusy(false);
     // Deny any in-flight permission asks so the turn can unwind cleanly.
     for (const requestId of [...this.pendingPermissions.keys()]) {
       this.respondPermission(requestId, { behavior: "deny", message: "已中断。" });
@@ -225,7 +229,6 @@ export class ClaudeProcess {
     } catch {
       /* best effort */
     }
-    this.setBusy(false);
   }
 
   async setPermissionMode(mode: string): Promise<void> {

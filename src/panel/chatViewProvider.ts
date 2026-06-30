@@ -1698,13 +1698,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div id="app">
     <div id="overlay" class="overlay hidden"></div>
     <div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="预览" /></div>
-    <header id="toolbar">
-      <div class="title"><span id="session-title">新对话</span></div>
-      <div class="spacer"></div>
-      <button id="btn-sessions" class="icon-btn" title="历史会话">${ICONS.sessions}</button>
-      <button id="btn-new" class="icon-btn" title="新建会话">${ICONS.newChat}</button>
-    </header>
-
     <div id="messages" class="messages"></div>
 
     <div id="panel-sessions" class="drawer hidden">

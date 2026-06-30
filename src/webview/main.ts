@@ -100,7 +100,6 @@ const queueHint = $("queue-hint");
 const PLACEHOLDER_IDLE = inputEl.placeholder;
 const PLACEHOLDER_BUSY = "任务进行中 · 回车将内容加入等待队列";
 const statusLine = $("status-line");
-const sessionTitle = $("session-title");
 const modeTrigger = $("mode-trigger");
 const modeIcon = $("mode-icon");
 const modeLabel = $("mode-label");
@@ -552,7 +551,6 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   const m = ev.data;
   switch (m.kind) {
     case "session":
-      sessionTitle.textContent = m.resumed ? sessionTitle.textContent || "会话" : sessionTitle.textContent || "新对话";
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
       break;
     case "busy":
@@ -1159,7 +1157,6 @@ let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: str
 
 function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string }[]) {
   historyState = { items, checkpoints: checkpoints || [] };
-  if (title) sessionTitle.textContent = title;
   renderHistory(false);
 }
 
@@ -2017,14 +2014,8 @@ cfHeader.onclick = (e) => {
   changedFiles.classList.toggle("collapsed");
 };
 
-$("btn-new").onclick = () => {
-  send({ type: "newSession" });
-  sessionTitle.textContent = "新对话";
-};
-$("btn-sessions").onclick = () => {
-  send({ type: "listSessions" });
-  openDrawer(sessionsPanel);
-};
+// New-session / history are now driven from the editor title bar + sidebar;
+// the in-panel toolbar was removed.
 overlay.onclick = closeDrawers;
 document.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = closeDrawers));
 

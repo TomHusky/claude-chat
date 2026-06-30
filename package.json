@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.136",
+  "version": "0.1.141",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -53,7 +53,7 @@
       {
         "command": "claude-chat.newSession",
         "title": "Claude: New Chat Session",
-        "icon": "$(add)"
+        "icon": "media/icon.svg"
       },
       {
         "command": "claude-chat.showSessions",
@@ -117,6 +117,11 @@
           "command": "claude-chat.open",
           "when": "resourceScheme == file",
           "group": "navigation@9"
+        },
+        {
+          "command": "claude-chat.newSession",
+          "when": "activeWebviewPanelId == 'claude-chat.editor'",
+          "group": "navigation@0"
         }
       ],
       "editor/context": [

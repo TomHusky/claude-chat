@@ -43,6 +43,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private activeCtx?: SessionCtx;
   private store: SessionStore;
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
+  private installedPending?: string; // version installed this session, awaiting a window reload to take effect
   private lastUsageAt = 0; // throttle for subscription-usage queries
   private usageInFlight = false;
   private lastUsage?: ToWebview; // most recent usage result, replayed to new tabs
@@ -1178,11 +1179,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (cmpVersion(remote, local) <= 0) {
+      this.installedPending = undefined; // running version caught up — clear any pending-reload flag
       if (!silent) vscode.window.showInformationMessage(`已是最新版本 v${local}`);
       return;
     }
     // Newer version available.
     this.updateAvailable = remote; // remembered so the dot re-appears when the sidebar opens
+    // Already installed this (or newer) earlier this session — it just needs a
+    // window reload. Don't re-download / re-prompt (that caused an update loop).
+    if (this.installedPending && cmpVersion(remote, this.installedPending) <= 0) {
+      this.postUpdateDot();
+      if (!silent) {
+        const reload = await vscode.window.showInformationMessage(
+          `v${remote} 已安装，需重新加载窗口后生效。`,
+          "重新加载",
+        );
+        if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
+      }
+      return;
+    }
     if (silent) {
       this.postUpdateDot(); // auto-check: show banner + activity-bar badge, no popup
       return;
@@ -1208,8 +1223,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.updateAvailable = undefined; // installed — clear the pending-update flag
+    this.installedPending = remote; // remember so we don't re-prompt before the reload takes effect
     this.postUpdateDot();
-    const reload = await vscode.window.showInformationMessage(`已更新到 v${remote}，重新加载窗口后生效。`, "重新加载");
+    const reload = await vscode.window.showInformationMessage(
+      `已下载安装 v${remote}，必须重新加载窗口才会生效（在此之前仍显示旧版本，属正常现象）。`,
+      "重新加载",
+    );
     if (reload === "重新加载") void vscode.commands.executeCommand("workbench.action.reloadWindow");
   }
 

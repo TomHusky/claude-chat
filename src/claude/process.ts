@@ -60,7 +60,8 @@ export interface ClaudeProcessHooks {
 export class ClaudeProcess {
   private proc?: ChildProcessWithoutNullStreams;
   private rl?: readline.Interface;
-  private readonly pendingControl = new Map<string, (resp: unknown) => void>();
+  private exited = false;
+  private readonly pendingControl = new Map<string, { resolve: (resp: unknown) => void; reject: (err: Error) => void }>();
   private readonly pendingPermissions = new Map<string, Record<string, unknown>>();
   private sessionId?: string;
   private initialized = false;
@@ -107,25 +108,37 @@ export class ClaudeProcess {
       });
     });
 
+    // Without a listener, an async EPIPE on stdin (CLI died mid-write) is an
+    // uncaught exception that takes down the whole extension host.
+    this.proc.stdin.on("error", () => undefined);
+
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.onLine(line));
 
     let stderrBuf = "";
     this.proc.stderr.on("data", (d: Buffer) => {
-      stderrBuf += d.toString();
-      // Surface only obvious fatal lines; the CLI is chatty on stderr.
-      const lower = stderrBuf.toLowerCase();
-      if (lower.includes("error") && stderrBuf.length < 4000) {
-        // Defer; many "errors" are benign. Emit on close instead.
-      }
+      // Keep only the tail — the CLI is chatty and the buffer must not grow forever.
+      stderrBuf = (stderrBuf + d.toString()).slice(-4096);
     });
 
     this.proc.on("close", (code) => {
+      this.exited = true;
+      // Unblock anyone awaiting the control channel (initialize/interrupt/…):
+      // the process is gone, no response will ever come. Without this, start()
+      // hangs for the full 30s timeout when the CLI dies during the handshake.
+      for (const [, pending] of this.pendingControl) pending.reject(new Error("claude 进程已退出"));
+      this.pendingControl.clear();
+      if (this.disposed) return; // intentional shutdown — don't disturb the ctx (a new proc may be live)
+      // Close out any permission dialogs still on screen — no answer will come.
+      for (const requestId of [...this.pendingPermissions.keys()]) {
+        this.pendingPermissions.delete(requestId);
+        this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
+      }
       if (code && code !== 0 && stderrBuf.trim()) {
         this.hooks.emit({ kind: "error", message: `claude 进程退出 (code ${code}): ${stderrBuf.trim().slice(0, 800)}` });
       }
       this.setBusy(false);
-      if (!this.disposed) this.hooks.onClose(code);
+      this.hooks.onClose(code);
     });
 
     // Handshake: must complete before sending user turns, and it is what
@@ -243,7 +256,7 @@ export class ClaudeProcess {
   dispose(): void {
     this.disposed = true;
     this.rl?.close();
-    if (this.proc && !this.proc.killed) {
+    if (this.proc && !this.exited) {
       try {
         this.proc.stdin.end();
       } catch {
@@ -252,9 +265,25 @@ export class ClaudeProcess {
       this.proc.kill("SIGTERM");
       const p = this.proc;
       setTimeout(() => {
-        if (!p.killed) p.kill("SIGKILL");
+        // NOTE: `p.killed` is true as soon as SIGTERM was *sent*, not when the
+        // process exits — check actual exit state or the escalation never fires.
+        if (p.exitCode === null && p.signalCode === null) p.kill("SIGKILL");
       }, 2000);
     }
+  }
+
+  /** Dispose and wait until the child has actually exited (capped at ~3s).
+   *  Needed before touching the transcript file (truncate/delete): the dying
+   *  CLI can still flush buffered lines, silently undoing a rewind/delete. */
+  disposeAndWait(): Promise<void> {
+    const p = this.proc;
+    const done = new Promise<void>((resolve) => {
+      if (!p || this.exited || p.exitCode !== null || p.signalCode !== null) return resolve();
+      p.once("close", () => resolve());
+      setTimeout(resolve, 3000); // hard cap — don't block the UI forever
+    });
+    this.dispose();
+    return done;
   }
 
   // -- Control channel -----------------------------------------------------
@@ -262,13 +291,20 @@ export class ClaudeProcess {
   private sendControlRequest(request: Record<string, unknown>): Promise<unknown> {
     const requestId = `req-${randomUUID()}`;
     return new Promise((resolve, reject) => {
+      if (this.exited) return reject(new Error("claude 进程已退出"));
       const timer = setTimeout(() => {
         this.pendingControl.delete(requestId);
         reject(new Error(`control_request timed out: ${String(request.subtype)}`));
       }, 30_000);
-      this.pendingControl.set(requestId, (resp) => {
-        clearTimeout(timer);
-        resolve(resp);
+      this.pendingControl.set(requestId, {
+        resolve: (resp) => {
+          clearTimeout(timer);
+          resolve(resp);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
       });
       this.write({ type: "control_request", request_id: requestId, request });
     });
@@ -294,13 +330,19 @@ export class ClaudeProcess {
   }
 
   private handleEvent(ev: OutEvent): void {
+    // Events produced INSIDE a Task subagent carry parent_tool_use_id. Rendering
+    // them would stomp the live tool-input state and show the subagent's inner
+    // monologue as main-agent output — drop them (the Task tool_result summarizes).
+    if ((ev as any).parent_tool_use_id && (ev.type === "stream_event" || ev.type === "assistant" || ev.type === "user")) {
+      return;
+    }
     switch (ev.type) {
       case "control_response": {
         const r = (ev as any).response;
         const cb = this.pendingControl.get(r?.request_id);
         if (cb) {
           this.pendingControl.delete(r.request_id);
-          cb(r);
+          cb.resolve(r);
         }
         return;
       }
@@ -511,6 +553,7 @@ export class ClaudeProcess {
   }
 
   private handleResult(ev: ResultEvent): void {
+    this.seenToolIds.clear(); // per-turn de-dupe only; don't grow forever
     this.setBusy(false);
     this.hooks.emit({
       kind: "result",
@@ -528,13 +571,21 @@ export class ClaudeProcess {
   }
 }
 
+/** Posting multi-MB tool outputs (huge Reads, base64 blobs) through postMessage
+ *  and into the DOM stalls the webview — cap what we ship. */
+const MAX_TOOL_RESULT_CHARS = 200_000;
+
 function stringifyToolResult(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
+  let s: string;
+  if (typeof content === "string") s = content;
+  else if (Array.isArray(content)) {
+    s = content
       .map((c) => (typeof c === "string" ? c : (c as { text?: string }).text ?? JSON.stringify(c)))
       .join("\n");
+  } else if (content == null) s = "";
+  else s = JSON.stringify(content, null, 2);
+  if (s.length > MAX_TOOL_RESULT_CHARS) {
+    s = s.slice(0, MAX_TOOL_RESULT_CHARS) + `\n…（输出过长，已截断 ${s.length - MAX_TOOL_RESULT_CHARS} 字符）`;
   }
-  if (content == null) return "";
-  return JSON.stringify(content, null, 2);
+  return s;
 }

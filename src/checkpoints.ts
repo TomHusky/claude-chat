@@ -15,12 +15,20 @@ interface Checkpoint {
   createdAt: number;
   userText: string;
   files: FileBackup[];
+  /** Files touched this turn that could NOT be snapshotted (too large / binary).
+   *  Restore must surface these — silently reporting success while a file keeps
+   *  Claude's edits is a lie. */
+  skipped?: string[];
   /** Number of lines the session .jsonl had *before* this turn ran. Restoring
    *  this checkpoint truncates the transcript back to this many lines. */
   truncateLine: number;
 }
 
 const MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024;
+/** Oldest checkpoints beyond this are pruned (their earliest-baseline role for
+ *  the changed-files panel passes to the next snapshot). Keeps globalStorage
+ *  from growing without bound: each checkpoint can hold full file contents. */
+const MAX_CHECKPOINTS = 40;
 
 /**
  * Restore points. A checkpoint is created at each user turn. Before any
@@ -54,6 +62,9 @@ export class CheckpointManager {
       files: [],
       truncateLine,
     });
+    if (this.checkpoints.length > MAX_CHECKPOINTS) {
+      this.checkpoints = this.checkpoints.slice(-MAX_CHECKPOINTS);
+    }
     this.persist();
     return id;
   }
@@ -62,17 +73,30 @@ export class CheckpointManager {
   snapshotFile(absPath: string): void {
     const cp = this.current();
     if (!cp) return;
-    if (cp.files.some((f) => f.path === absPath)) return;
+    if (cp.files.some((f) => f.path === absPath) || cp.skipped?.includes(absPath)) return;
     let content: string | null = null;
     try {
       const stat = fs.statSync(absPath);
-      if (stat.size > MAX_SNAPSHOT_BYTES) return; // too large to snapshot
-      content = fs.readFileSync(absPath, "utf8");
+      if (stat.size > MAX_SNAPSHOT_BYTES) {
+        (cp.skipped ??= []).push(absPath); // too large — restore must report it
+        this.persistSoon();
+        return;
+      }
+      const buf = fs.readFileSync(absPath);
+      // Binary files round-tripped through utf8 come back corrupted — skip them.
+      if (buf.subarray(0, 8192).includes(0)) {
+        (cp.skipped ??= []).push(absPath);
+        this.persistSoon();
+        return;
+      }
+      content = buf.toString("utf8");
     } catch {
       content = null; // file does not exist yet -> created by this turn
     }
     cp.files.push({ path: absPath, content });
-    this.persist();
+    // Debounced: a turn with many edits otherwise rewrites the (potentially
+    // multi-MB) snapshot JSON once per tool call, on the host thread.
+    this.persistSoon();
   }
 
   list(): CheckpointSummary[] {
@@ -133,10 +157,16 @@ export class CheckpointManager {
    * turn, and drop that checkpoint and everything after it.
    * Returns the number of files reverted.
    */
-  restore(checkpointId: string): { restoredFiles: number; userText: string; truncateLine: number } | undefined {
+  restore(checkpointId: string): { restoredFiles: number; skipped: string[]; userText: string; truncateLine: number } | undefined {
     const idx = this.checkpoints.findIndex((c) => c.id === checkpointId);
     if (idx < 0) return undefined;
     const truncateLine = this.checkpoints[idx].truncateLine;
+    // Files we could never snapshot (large/binary) keep Claude's edits — collect
+    // them so the caller can tell the user instead of claiming a full revert.
+    const skippedSet = new Set<string>();
+    for (let i = idx; i < this.checkpoints.length; i++) {
+      for (const s of this.checkpoints[i].skipped ?? []) skippedSet.add(s);
+    }
 
     // Earliest backup per path across checkpoints[idx..] == pre-turn content.
     const target = new Map<string, string | null>();
@@ -167,7 +197,7 @@ export class CheckpointManager {
     const userText = this.checkpoints[idx].userText;
     this.checkpoints = this.checkpoints.slice(0, idx);
     this.persist();
-    return { restoredFiles: restored, userText, truncateLine };
+    return { restoredFiles: restored, skipped: [...skippedSet], userText, truncateLine };
   }
 
   clear(): void {
@@ -183,6 +213,16 @@ export class CheckpointManager {
     return path.join(this.storageDir, `checkpoints-${this.sessionId ?? "none"}.json`);
   }
 
+  /** Delete the persisted checkpoint file of a session (used when the session
+   *  itself is deleted — otherwise globalStorage grows forever). */
+  static deleteFor(storageDir: string, sessionId: string): void {
+    try {
+      fs.unlinkSync(path.join(storageDir, `checkpoints-${sessionId}.json`));
+    } catch {
+      /* absent is fine */
+    }
+  }
+
   private load(): void {
     try {
       this.checkpoints = JSON.parse(fs.readFileSync(this.file(), "utf8"));
@@ -192,7 +232,22 @@ export class CheckpointManager {
     }
   }
 
+  private persistTimer?: ReturnType<typeof setTimeout>;
+
+  /** Debounced persist for high-frequency snapshot writes. */
+  private persistSoon(): void {
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      this.persist();
+    }, 500);
+  }
+
   private persist(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
       fs.writeFileSync(this.file(), JSON.stringify(this.checkpoints), "utf8");

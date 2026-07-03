@@ -50,8 +50,13 @@ export class SessionStore {
   }
 
   /** List sessions for the current workspace, newest first. */
+  /** peek() results keyed by path — reparsing every transcript on every refresh
+   *  is O(total bytes) sync I/O per turn; the mtime+size key skips unchanged files. */
+  private readonly peekCache = new Map<string, { m: number; s: number; v: { title: string; messageCount: number; hasContent: boolean } }>();
+
   list(): SessionSummary[] {
     const out: SessionSummary[] = [];
+    const seen = new Set<string>();
     for (const dir of this.projectDirs()) {
       let files: string[];
       try {
@@ -61,21 +66,29 @@ export class SessionStore {
       }
       for (const file of files) {
         const full = path.join(dir, file);
+        seen.add(full);
         try {
           const stat = fs.statSync(full);
-          const { title, messageCount, hasContent } = this.peek(full);
-          if (!hasContent) continue; // skip truly-empty sessions (system-init only)
+          const cached = this.peekCache.get(full);
+          let v = cached && cached.m === stat.mtimeMs && cached.s === stat.size ? cached.v : undefined;
+          if (!v) {
+            v = this.peek(full);
+            this.peekCache.set(full, { m: stat.mtimeMs, s: stat.size, v });
+          }
+          if (!v.hasContent) continue; // skip truly-empty sessions (system-init only)
           out.push({
             id: file.replace(/\.jsonl$/, ""),
-            title,
+            title: v.title,
             updatedAt: stat.mtimeMs,
-            messageCount,
+            messageCount: v.messageCount,
           });
         } catch {
           /* ignore unreadable file */
         }
       }
     }
+    // Drop cache entries for deleted files so the map doesn't grow forever.
+    for (const k of [...this.peekCache.keys()]) if (!seen.has(k)) this.peekCache.delete(k);
     return out.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
@@ -245,21 +258,31 @@ export class SessionStore {
       return 0;
     }
     const out: string[] = [];
-    let kept = 0;
+    const carried: string[] = []; // title lines beyond the cut — keep them, or a
+    let kept = 0; //                  rewind silently erases a later rename/ai-title
     let userTurns = 0;
+    let pastCut = false;
     for (const line of raw.split("\n")) {
       if (line.trim()) {
-        if (kept >= keepLines) break;
-        kept++;
+        if (kept >= keepLines) pastCut = true;
         try {
           const o = JSON.parse(line);
+          if (pastCut) {
+            if (o.type === "custom-title" || o.type === "ai-title") carried.push(line);
+            continue;
+          }
           if (o.type === "user" && this.isRealUserText(o)) userTurns++;
         } catch {
+          if (pastCut) continue;
           /* keep non-JSON lines verbatim */
         }
+        kept++;
+      } else if (pastCut) {
+        continue;
       }
       out.push(line);
     }
+    out.push(...carried);
     try {
       fs.writeFileSync(file, out.join("\n").replace(/\n*$/, "\n"), "utf8");
     } catch {

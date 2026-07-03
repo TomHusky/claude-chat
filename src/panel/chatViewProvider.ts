@@ -30,7 +30,11 @@ interface SessionCtx {
   pendingPerm?: ToWebview; // permission raised while this tab was hidden/closed
   blank: boolean; // a fresh "new chat" tab with no session yet
   ready: boolean; // its webview finished loading
-  interruptRequested?: boolean; // user hit Stop while the process was still spawning
+  /** Monotonic send counter + the seq at which Stop was last pressed. A send
+   *  started at seq N is cancelled iff stopSeq >= N — a plain boolean gets
+   *  clobbered when a second send races the first one's spawn await. */
+  sendSeq?: number;
+  stopSeq?: number;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -214,14 +218,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.view?.webview.postMessage(e);
     for (const ctx of this.sessions) {
       ctx.panel.webview.postMessage(e);
-      this.setPanelTitle(ctx);
+      this.setPanelTitle(ctx, list);
     }
   }
 
-  /** Show a session's conversation title on its own editor tab (falls back to brand). */
-  private setPanelTitle(ctx: SessionCtx): void {
+  /** Show a session's conversation title on its own editor tab (falls back to brand).
+   *  Pass the already-computed list when available — store.list() re-reads disk. */
+  private setPanelTitle(ctx: SessionCtx, list?: ReturnType<SessionStore["list"]>): void {
     const title = ctx.sessionId
-      ? this.store.list().find((s) => s.id === ctx.sessionId)?.title
+      ? (list ?? this.store.list()).find((s) => s.id === ctx.sessionId)?.title
       : undefined;
     ctx.panel.title = title?.trim() || "ClaudeCopilot";
   }
@@ -339,16 +344,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Re-adopt a panel restored by VS Code after a window reload/restart. Without
-   *  this, the serialized tab comes back blank (no title, no content). It loads
-   *  the last session (or blank) when its webview fires `ready`. */
-  async revivePanel(panel: vscode.WebviewPanel): Promise<void> {
+   *  this, the serialized tab comes back blank (no title, no content). The
+   *  webview persists its sessionId via setState, so each revived tab restores
+   *  its OWN conversation — and duplicates (two tabs on one session would mean
+   *  two --resume processes appending to one transcript) become blank tabs. */
+  async revivePanel(panel: vscode.WebviewPanel, sessionId?: string): Promise<void> {
+    let sid = sessionId && this.store.findFile(sessionId) ? sessionId : undefined;
+    if (sid) {
+      for (const other of this.sessions) {
+        if (other.sessionId === sid) {
+          sid = undefined; // already open in another live tab
+          break;
+        }
+      }
+    }
     const ctx: SessionCtx = {
       panel,
       webview: panel.webview,
+      sessionId: sid,
       checkpoints: new CheckpointManager(this.storageDir()),
-      blank: false, // restore last session on ready
+      blank: !sid && !!sessionId, // its session is taken/gone — stay blank, don't steal LAST_SESSION_KEY
       ready: false,
     };
+    if (sid) ctx.checkpoints.setSession(sid);
     this.adoptPanel(ctx);
     this.sessions.add(ctx);
     this.activeCtx = ctx;
@@ -400,6 +418,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // don't lock whatever group happened to be active (e.g. a file group) and
       // leave the chat group unlocked (which lets files replace the chat tab).
       await new Promise((r) => setTimeout(r, 60));
+      // The user may have clicked a file editor during that window — locking
+      // would then freeze THEIR group. Only lock while the panel is truly active.
+      if (!panel.active) return;
       await vscode.commands.executeCommand("workbench.action.lockEditorGroup");
     } catch {
       /* lock command may be unavailable on older VS Code */
@@ -527,7 +548,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "interrupt":
           ctx.pendingPerm = undefined;
-          ctx.interruptRequested = true; // if the process is still spawning, abort the pending send
+          ctx.stopSeq = ctx.sendSeq ?? 0; // cancel every send already in flight (incl. mid-spawn)
           this.post(ctx, { kind: "busy", busy: false }); // instant UI feedback regardless of CLI latency
           void ctx.proc?.interrupt(); // fire-and-forget — don't block the message loop on the round-trip
           break;
@@ -629,6 +650,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "copy":
           await vscode.env.clipboard.writeText(m.text);
           break;
+        case "saveImage":
+          await this.saveImage(m.dataUri);
+          break;
       }
     } catch (err) {
       this.output.appendLine(`[onPanelMessage:${m.type}] ${String(err)}`);
@@ -647,8 +671,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.refreshChangedFiles(ctx);
       return;
     }
-    // Revived panel — restore the last session used, or fall back to blank.
-    const sid = this.context.workspaceState.get<string>(LAST_SESSION_KEY);
+    // Revived panel (no serialized state) — restore the last session used, or
+    // fall back to blank. Never claim a session another live tab already holds:
+    // two tabs on one session = two processes forking one transcript.
+    let sid = this.context.workspaceState.get<string>(LAST_SESSION_KEY);
+    if (sid) {
+      for (const other of this.sessions) {
+        if (other !== ctx && other.sessionId === sid) {
+          sid = undefined;
+          break;
+        }
+      }
+    }
     if (sid && this.store.findFile(sid)) {
       ctx.sessionId = sid;
       ctx.checkpoints.setSession(sid);
@@ -684,16 +718,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     let attached = context ?? ctx.pendingContext;
     ctx.pendingContext = undefined;
-    ctx.interruptRequested = false;
+    const mySeq = (ctx.sendSeq = (ctx.sendSeq ?? 0) + 1);
     if (files && files.length) {
       const fileCtx = this.buildFileContext(files);
       attached = attached ? `${fileCtx}\n\n${attached}` : fileCtx;
     }
     const proc = await this.ensureProcess(ctx);
-    if (!proc) return;
-    // The user hit Stop while the process was still spawning — don't send the turn.
-    if (ctx.interruptRequested) {
-      ctx.interruptRequested = false;
+    if (!proc) {
+      // Spawn failed — release the composer or the tab is stuck busy forever.
+      this.post(ctx, { kind: "busy", busy: false });
+      return;
+    }
+    // The user hit Stop after this send started (e.g. while spawning) — drop it.
+    if ((ctx.stopSeq ?? -1) >= mySeq) {
       this.post(ctx, { kind: "busy", busy: false });
       return;
     }
@@ -714,9 +751,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (checkpointId) {
       const res = ctx.checkpoints.restore(checkpointId);
       if (res) {
-        ctx.proc?.dispose();
+        // Wait for the CLI to actually exit before rewriting the transcript —
+        // a dying process can flush buffered lines AFTER our truncation,
+        // resurrecting the rewound turns (and --resume would race the flush).
+        const proc = ctx.proc;
         ctx.proc = undefined;
         ctx.starting = undefined;
+        if (proc) await proc.disposeAndWait();
         let remaining = 0;
         if (ctx.sessionId) {
           remaining = this.store.truncateToLines(ctx.sessionId, res.truncateLine);
@@ -729,6 +770,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     await this.handleSend(ctx, text);
+  }
+
+  /** Save a chat image (data URI) to disk via the native save dialog. */
+  private async saveImage(dataUri: string): Promise<void> {
+    const m = /^data:image\/([a-z0-9.+-]+);base64,(.+)$/i.exec(dataUri);
+    if (!m) return;
+    const ext = m[1] === "jpeg" ? "jpg" : m[1].replace(/[^a-z0-9]/gi, "") || "png";
+    const uri = await vscode.window.showSaveDialog({
+      defaultUri: vscode.Uri.file(path.join(os.homedir(), "Downloads", `claude-image-${Date.now()}.${ext}`)),
+      filters: { 图片: [ext] },
+    });
+    if (!uri) return;
+    fs.writeFileSync(uri.fsPath, Buffer.from(m[2], "base64"));
+    vscode.window.showInformationMessage(`图片已保存到 ${uri.fsPath}`);
   }
 
   private handlePermission(ctx: SessionCtx, requestId: string, behavior: "allow" | "deny", suggestionId?: string): void {
@@ -824,6 +879,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private refreshChangedFiles(ctx: SessionCtx): void {
+    // Detached/closed panels can't render this anyway — skip the (expensive)
+    // per-file LCS diff instead of computing it for a no-op post.
+    if (!this.alive(ctx)) return;
     const { files, totalAdded, totalRemoved } = this.getChangedFiles(ctx);
     for (const f of files) this.origChanged.fire(vscode.Uri.from({ scheme: ORIG_SCHEME, path: f.path }));
     this.post(ctx, { kind: "changed_files", files, totalAdded, totalRemoved });
@@ -876,10 +934,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // 1) Stop the live process so it isn't writing to the transcript.
-    ctx.proc?.dispose();
+    // 1) Stop the live process AND wait for it to exit — a dying CLI can still
+    //    flush transcript lines after our truncation, undoing the rewind.
+    const proc = ctx.proc;
     ctx.proc = undefined;
     ctx.starting = undefined;
+    if (proc) await proc.disposeAndWait();
 
     // 2) Truly rewind the conversation: truncate the transcript so a future
     //    --resume makes Claude forget everything after this point.
@@ -898,9 +958,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post(ctx, { kind: "load_history", items, sessionId: ctx.sessionId, checkpoints: ctx.checkpoints.list() });
     }
 
+    const skippedNote = result.skipped.length
+      ? `⚠️ ${result.skipped.length} 个文件因过大或为二进制无法还原：${result.skipped.map((p) => path.basename(p)).join("、")}。`
+      : "";
     this.post(ctx, {
       kind: "notice",
-      message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。下一条消息将从这里继续。`,
+      message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。${skippedNote}下一条消息将从这里继续。`,
     });
     this.refreshChangedFiles(ctx);
   }
@@ -908,8 +971,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // -- Process management --------------------------------------------------
 
   private ensureProcess(ctx: SessionCtx): Promise<ClaudeProcess | undefined> {
-    if (ctx.proc) return Promise.resolve(ctx.proc);
+    // `starting` first: spawnProcess assigns ctx.proc BEFORE the initialize
+    // handshake finishes, and sendUserMessage on an uninitialized proc silently
+    // drops the message. Wait for the in-flight start instead.
     if (ctx.starting) return ctx.starting;
+    if (ctx.proc) return Promise.resolve(ctx.proc);
     ctx.starting = this.spawnProcess(ctx).finally(() => {
       ctx.starting = undefined;
     });
@@ -947,7 +1013,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       await proc.start();
     } catch (err) {
       this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
+      proc.dispose(); // reap the half-started child
       ctx.proc = undefined;
+      // A brand-new tab minted this sessionId but the CLI never created the
+      // session. Keeping it would make every retry `--resume <ghost>` and fail
+      // forever, even after the user fixes claudePath.
+      if (!isResume) ctx.sessionId = undefined;
       return undefined;
     }
     return proc;
@@ -1038,6 +1109,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // to every open chat tab (not just the focused one).
         this.lastUsage = { kind: "usage", ...parsed, sessionResetAt };
         for (const ctx of this.sessions) this.post(ctx, this.lastUsage);
+      } else {
+        // Transient failure — don't let the throttle block retries for 90s.
+        this.lastUsageAt = 0;
       }
     };
 
@@ -1052,6 +1126,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         finish(out);
       }, 30_000);
       proc.on("error", () => { clearTimeout(kill); finish(""); });
+      // Async EPIPE on stdin (child died instantly) is otherwise an UNCAUGHT
+      // exception that crashes the whole extension host.
+      proc.stdin.on("error", () => undefined);
       proc.stdout.on("data", (d: Buffer) => {
         out += d.toString();
         // Collect the assistant text as it arrives; the `result` event repeats it.
@@ -1115,12 +1192,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const ok = await vscode.window.showWarningMessage("删除会话？此操作不可撤销。", { modal: true, detail }, "删除");
     if (ok !== "删除") return;
     for (const id of ids) {
+      // Collect every live process bound to this session — we must wait for
+      // them to EXIT before unlinking the jsonl, or a dying CLI recreates the
+      // file with its final buffered lines and the session "resurrects".
+      const waits: Promise<void>[] = [];
       // Tear down any open tab for this session.
       for (const ctx of [...this.sessions]) {
         if (ctx.sessionId === id) {
           this.sessions.delete(ctx);
           if (this.activeCtx === ctx) this.activeCtx = undefined;
-          ctx.proc?.dispose();
+          if (ctx.proc) waits.push(ctx.proc.disposeAndWait());
           ctx.proc = undefined;
           ctx.panel.dispose();
         }
@@ -1128,10 +1209,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // Tear down any background (detached) run for this session.
       const det = this.detached.get(id);
       if (det) {
-        det.proc?.dispose();
+        if (det.proc) waits.push(det.proc.disposeAndWait());
         this.detached.delete(id);
       }
+      if (waits.length) await Promise.all(waits);
       this.store.delete(id);
+      // Also drop its persisted checkpoint snapshots — otherwise globalStorage
+      // keeps full pre-edit file contents of deleted sessions forever.
+      CheckpointManager.deleteFor(this.storageDir(), id);
     }
     this.broadcastRunning();
     this.refreshSessions();
@@ -1184,9 +1269,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     // Newer version available.
-    this.updateAvailable = remote; // remembered so the dot re-appears when the sidebar opens
     // Already installed this (or newer) earlier this session — it just needs a
-    // window reload. Don't re-download / re-prompt (that caused an update loop).
+    // window reload. Don't re-download / re-prompt (that caused an update loop),
+    // and don't re-light the badge for a version that's already on disk.
     if (this.installedPending && cmpVersion(remote, this.installedPending) <= 0) {
       this.postUpdateDot();
       if (!silent) {
@@ -1198,6 +1283,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       return;
     }
+    this.updateAvailable = remote; // remembered so the dot re-appears when the sidebar opens
     if (silent) {
       this.postUpdateDot(); // auto-check: show banner + activity-bar badge, no popup
       return;
@@ -1697,7 +1783,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <body>
   <div id="app">
     <div id="overlay" class="overlay hidden"></div>
-    <div id="lightbox" class="lightbox hidden"><img id="lightbox-img" alt="预览" /></div>
+    <div id="lightbox" class="lightbox hidden">
+      <div class="lightbox-actions">
+        <button id="lb-copy" title="复制图片到剪贴板">${ICONS.copy} 复制</button>
+        <button id="lb-save" title="保存图片到本地">${ICONS.file} 保存</button>
+        <button id="lb-close" title="关闭">×</button>
+      </div>
+      <img id="lightbox-img" alt="预览" />
+    </div>
     <div id="messages" class="messages"></div>
 
     <div id="panel-sessions" class="drawer hidden">

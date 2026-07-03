@@ -192,7 +192,19 @@ html, body {
   display: flex; align-items: center; justify-content: center;
   cursor: zoom-out; padding: 24px;
 }
-.lightbox img { max-width: 100%; max-height: 100%; border-radius: 6px; box-shadow: 0 8px 36px rgba(0,0,0,.6); }
+.lightbox img { max-width: 100%; max-height: calc(100% - 52px); border-radius: 6px; box-shadow: 0 8px 36px rgba(0,0,0,.6); cursor: default; }
+.lightbox-actions {
+  position: absolute; top: 14px; right: 16px; display: flex; gap: 8px; z-index: 51;
+}
+.lightbox-actions button {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: rgba(30,30,30,.85); color: #eee;
+  border: 1px solid rgba(255,255,255,.22); border-radius: 7px;
+  padding: 5px 12px; font-size: 12px; cursor: pointer;
+}
+.lightbox-actions button:hover { background: rgba(60,60,60,.95); }
+.lightbox-actions button svg { width: 14px; height: 14px; }
+.lightbox-actions #lb-close { font-size: 16px; line-height: 1; padding: 5px 10px; }
 
 /* attached files (current editor file + dragged files) */
 #file-chips { display: flex; flex-wrap: wrap; gap: 5px; }
@@ -533,6 +545,15 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   user-select: none;
 }
 .history-expand:hover { background: var(--vscode-button-secondaryHoverBackground, rgba(128,128,128,.3)); }
+/* Older turns render but stay hidden until the banner unfolds them — expanding
+   must never re-render (that used to wipe messages sent since load). */
+.history-folded { display: none !important; }
+/* A question/permission box whose turn already ended — visibly dead. */
+.interaction-cancelled { opacity: .55; pointer-events: none; position: relative; }
+.interaction-cancelled::after {
+  content: "本轮已结束 · 此询问已取消"; display: block;
+  font-size: 11px; color: var(--vscode-descriptionForeground); padding: 4px 2px 0;
+}
 .diff { display: flex; flex-direction: column; gap: 2px; margin: 4px 0; }
 .diff .del { background: rgba(241,76,76,.12); border-left: 3px solid #f14c4c; }
 .diff .add { background: rgba(115,201,145,.12); border-left: 3px solid #73c991; }

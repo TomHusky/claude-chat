@@ -176,4 +176,5 @@ export type FromWebview =
   | { type: "openSymbol"; name: string }
   | { type: "validateRefs"; refs: { id: string; path: string }[] }
   | { type: "runInTerminal"; code: string }
-  | { type: "copy"; text: string };
+  | { type: "copy"; text: string }
+  | { type: "saveImage"; dataUri: string };

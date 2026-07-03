@@ -14,8 +14,8 @@ export function activate(context: vscode.ExtensionContext): void {
     // Rehydrate the editor-area chat panel after a window reload/restart so it
     // doesn't come back as a blank, titleless tab.
     vscode.window.registerWebviewPanelSerializer("claude-chat.editor", {
-      async deserializeWebviewPanel(panel: vscode.WebviewPanel): Promise<void> {
-        await provider.revivePanel(panel);
+      async deserializeWebviewPanel(panel: vscode.WebviewPanel, state: { sessionId?: string } | undefined): Promise<void> {
+        await provider.revivePanel(panel, state?.sessionId);
       },
     }),
     vscode.commands.registerCommand("claude-chat.newSession", () => provider.newSession()),

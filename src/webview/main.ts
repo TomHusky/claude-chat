@@ -33,12 +33,16 @@ mdFull.renderer.rules.fence = (tokens, idx) => {
     } catch {
       body = escapeHtml(token.content);
     }
-  } else {
+  } else if (token.content.length <= 10_000) {
     try {
       body = hljs.highlightAuto(token.content).value;
     } catch {
       body = escapeHtml(token.content);
     }
+  } else {
+    // Auto-detection runs EVERY registered grammar — on big unlabeled blocks
+    // that visibly stalls the finalize step. Plain text is fine there.
+    body = escapeHtml(token.content);
   }
   return wrapCodeBlock(body, lang, token.content, true, true);
 };
@@ -183,13 +187,13 @@ function ensureAssistant(): HTMLElement {
 function finalizeTurn() {
   finalizeLive();
   removeWorking();
+  cancelPendingInteractions();
   if (assistantEl) {
     assistantEl.classList.remove("streaming-turn");
     assistantEl.querySelector(".rail .thread-active")?.remove(); // stop the progress pulse
     const body = assistantEl.querySelector(".msg-body");
     // If the user manually stopped, mark it at the very end of the reply.
     if (body && userStopped) body.appendChild(el("div", "msg-interrupted", "[Request interrupted by user]"));
-    userStopped = false;
     if (body && body.children.length === 0) {
       assistantEl.remove();
     } else if (body) {
@@ -205,8 +209,25 @@ function finalizeTurn() {
       }
     }
   }
+  // Reset unconditionally: if Stop landed after the bubble was already
+  // finalized, a sticky flag would stamp "[interrupted]" onto the NEXT turn.
+  userStopped = false;
   assistantEl = null;
   liveBlock = null;
+}
+
+/** The turn is over — any interactive UI still waiting for the user (question
+ *  picker `.askp`, permission bar `.perm-bar`) is bound to a dead request:
+ *  answering it would silently go nowhere. Freeze it visibly instead. */
+function cancelPendingInteractions() {
+  Array.from(
+    messagesEl.querySelectorAll<HTMLElement>(
+      ".askp:not(.interaction-cancelled), .perm-bar:not(.resolved):not(.interaction-cancelled)",
+    ),
+  ).forEach((box) => {
+    box.classList.add("interaction-cancelled");
+    Array.from(box.querySelectorAll("button")).forEach((b) => ((b as HTMLButtonElement).disabled = true));
+  });
 }
 
 /** Shorten the timeline rail so it ends exactly at the last node (no trailing line). */
@@ -239,18 +260,27 @@ function endTimelineAtLastNode(msg: HTMLElement) {
       raf = requestAnimationFrame(compute);
     });
     m._lineObs.observe(msg);
+    railObservers.push(m._lineObs); // disconnected when the transcript re-renders
   }
 }
+/** Rail observers of all finalized messages — long sessions otherwise pile up
+ *  one live ResizeObserver per reply, each still firing on any resize. */
+const railObservers: ResizeObserver[] = [];
 
 /** Reveal the live text with a typewriter: complete lines are rendered as
  *  markdown (committed once each newline arrives), and the current line types
- *  out char-by-char as plain text. Cheap — markdown only re-renders per line. */
+ *  out char-by-char as plain text.
+ *  NOTE: each commit re-renders the whole prefix — O(n²) over a long reply.
+ *  Once the text is big, batch commits into larger chunks: the tail lines just
+ *  stay as plain text a moment longer, which is visually indistinguishable. */
 function renderLive() {
   if (!liveBlock) return;
   const shownText = liveBlock.raw.slice(0, liveBlock.shown);
   const lastNl = shownText.lastIndexOf("\n");
   const commitLen = lastNl >= 0 ? lastNl + 1 : 0;
-  if (commitLen > liveBlock.committedLen) {
+  // Commit threshold grows with size: instant at first, ~1/16 of length later.
+  const minGain = Math.min(4096, Math.max(1, liveBlock.committedLen >> 4));
+  if (commitLen - liveBlock.committedLen >= minGain) {
     liveBlock.committedLen = commitLen;
     liveBlock.committedEl.innerHTML = mdFast.render(liveBlock.raw.slice(0, commitLen));
   }
@@ -276,6 +306,15 @@ function startTypewriter() {
   typewriterRAF = requestAnimationFrame(tick);
 }
 
+/** The model occasionally leaks its internal tool-call XML into plain prose
+ *  (degenerate output after long context/compaction). It's stored that way in
+ *  the transcript — fold it into a fenced block so it reads as raw syntax
+ *  instead of broken paragraphs. */
+function foldLeakedToolXml(text: string): string {
+  if (!text.includes("<invoke name=")) return text;
+  return text.replace(/<invoke name=[\s\S]*?(?:<\/invoke>|$)/g, (blk) => "\n```xml\n" + blk.trim() + "\n```\n");
+}
+
 /** Snap the live block to its full text, rendered with syntax highlighting. */
 function finalizeLive() {
   if (typewriterRAF) {
@@ -283,7 +322,7 @@ function finalizeLive() {
     typewriterRAF = 0;
   }
   if (!liveBlock) return;
-  liveBlock.el.innerHTML = mdFull.render(liveBlock.raw);
+  liveBlock.el.innerHTML = mdFull.render(foldLeakedToolXml(liveBlock.raw));
   linkifyRefs(liveBlock.el);
   removeWorking(); // the text block is done — drop the "Thinking" pill
   updateActiveLine();
@@ -339,6 +378,8 @@ function updateActiveLine() {
 let tickTimer = 0;
 let turnTokens = 0; // exact output tokens (only arrives at each message's end)
 let turnEst = 0; // live estimate from streamed chars (the CLI doesn't stream counts)
+let msgTokenBase = 0; // sum of PREVIOUS messages' finals within this turn
+let lastMsgTokens = 0; // the current message's cumulative count so far
 // The CLI doesn't stream status text in -p mode, so (like Claude Code's TUI) we
 // cycle through its whimsical "working" verbs locally to show it's alive.
 const THINKING_WORDS = [
@@ -360,8 +401,12 @@ function setPillTokens() {
   if (tk) tk.textContent = n > 0 ? `${fmtTokens(n)} tokens` : "";
 }
 function onTokens(output: number) {
-  // Exact cumulative output tokens for a message — only sent once, at its end.
-  turnTokens = Math.max(turnTokens, output);
+  // `output` is cumulative WITHIN one assistant message; a turn with tool loops
+  // has several messages. A drop in the counter = a new message started — bank
+  // the previous message's final so the turn total is a true sum, not a max.
+  if (output < lastMsgTokens) msgTokenBase += lastMsgTokens;
+  lastMsgTokens = output;
+  turnTokens = msgTokenBase + output;
   setPillTokens();
 }
 /** The CLI only reports tokens at message end, so estimate live from streamed
@@ -549,9 +594,26 @@ messagesEl.addEventListener("scroll", () => {
 // ---------------------------------------------------------------------------
 window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   const m = ev.data;
+  // After Stop, swallow the tail of the dying turn (deltas already in the pipe
+  // would re-open a bubble and keep "typing"). Lifecycle events still flow.
+  if (
+    stoppingView &&
+    (m.kind === "block_start" ||
+      m.kind === "text_delta" ||
+      m.kind === "thinking_delta" ||
+      m.kind === "tool_input" ||
+      m.kind === "tool_input_partial" ||
+      m.kind === "status" ||
+      m.kind === "tokens")
+  ) {
+    return;
+  }
   switch (m.kind) {
     case "session":
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
+      // Persist the tab↔session binding so a window reload restores THIS tab to
+      // THIS conversation (and never two tabs onto one session = two processes).
+      if (m.sessionId) vscode.setState({ sessionId: m.sessionId });
       break;
     case "busy":
       setBusy(m.busy);
@@ -612,20 +674,25 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "compacted":
       compacting = false;
       ctxGauge.classList.remove("compacting");
-      removeWorking();
+      finalizeTurn(); // clears the working pill AND the otherwise-empty assistant bubble
       messagesEl.appendChild(renderCompactionDivider(m.preTokens, m.postTokens));
       scrollToBottom();
       updateContextGauge(m.postTokens, lastCtxTotal);
       break;
     case "error":
       finalizeTurn();
+      // A fatal error may arrive with no busy:false (spawn failures kill the
+      // proc before it ever reports); release the composer or it's stuck forever.
+      setBusy(false);
+      compacting = false;
+      ctxGauge.classList.remove("compacting");
       appendNotice(m.message, "error");
       break;
     case "notice":
       if (m.message) appendNotice(m.message, "info");
       break;
     case "load_history":
-      loadHistory(m.items, m.title, m.checkpoints);
+      loadHistory(m.items, m.title, m.checkpoints, m.sessionId);
       break;
     case "sessions":
       if (m.runningIds !== undefined) runningSessionIds = new Set(m.runningIds);
@@ -750,6 +817,8 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
     return;
   }
   if (sub) sub.textContent = subtitle;
+  // Replace (don't stack) — a permission_request may already have rendered one.
+  bodyWrap.querySelector(".tool-input")?.remove();
   const inputEl2 = el("div", "tool-input");
   inputEl2.innerHTML = html;
   // keep any existing result/permission below
@@ -810,12 +879,24 @@ function updateToolPartial(toolId: string, name: string, json: string) {
   maybeScroll();
 }
 
+/** Only the CLI's exact cancellation sentinels — a substring match ("interrupt"
+ *  appears in ordinary code/output constantly) hid perfectly good results. */
+function isInterruptSentinel(content: string): boolean {
+  const t = content.trim();
+  return (
+    t === "[Request interrupted by user]" ||
+    t === "[Request interrupted by user for tool use]" ||
+    t.startsWith("The user doesn't want to proceed") ||
+    t === "已中断。"
+  );
+}
+
 function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const card = toolCards.get(toolUseId);
   if (!card) return;
   card.classList.remove("running");
   // Abnormal endings: mark the node red and show WHY it stopped.
-  const interrupted = /interrupt|中断/i.test(content);
+  const interrupted = isInterruptSentinel(content);
   const bad = isError || interrupted;
   card.classList.toggle("error", bad);
   card.closest(".step")?.classList.toggle("error", bad); // red timeline dot
@@ -1155,8 +1236,9 @@ function resolvePermission(requestId: string, behavior: "allow" | "deny") {
 const HISTORY_TURN_LIMIT = 3; // only the last N turns render by default; older folds behind a banner
 let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: string }[] } | null = null;
 
-function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string }[]) {
+function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string }[], sessionId?: string) {
   historyState = { items, checkpoints: checkpoints || [] };
+  if (sessionId) vscode.setState({ sessionId });
   renderHistory(false);
 }
 
@@ -1165,22 +1247,30 @@ function renderHistory(showAll: boolean) {
   const { items, checkpoints } = historyState;
   messagesEl.innerHTML = "";
   toolCards.clear();
+  railObservers.forEach((o) => o.disconnect()); // per-message rail observers of removed nodes
+  railObservers.length = 0;
   assistantEl = null;
   liveBlock = null;
   lastUserEl = null;
   userMsgCount = 0;
   ctxGauge.classList.add("hidden"); // refreshes from the next turn's usage
 
-  // Align checkpoints to the trailing user messages (tracking may start mid-session).
+  // Align checkpoints to the trailing user messages (tracking may start
+  // mid-session, and after a rewind there may be MORE checkpoints than turns —
+  // then the oldest checkpoints must drop, not shift onto the wrong messages).
   const userTotal = items.filter((i) => i.type === "user").length;
-  const offset = Math.max(0, userTotal - checkpoints.length);
   const cpByOrdinal = new Map<number, { id: string }>();
-  checkpoints.forEach((c, j) => cpByOrdinal.set(offset + j, c));
+  checkpoints.forEach((c, j) => {
+    const ordinal = userTotal - checkpoints.length + j;
+    if (ordinal >= 0) cpByOrdinal.set(ordinal, c);
+  });
 
-  // By default only render the last HISTORY_TURN_LIMIT turns; fold the rest.
+  // Fold everything before the last HISTORY_TURN_LIMIT turns behind a banner.
+  // IMPORTANT: everything is RENDERED (hidden with CSS) — re-rendering from
+  // historyState on expand used to wipe all live messages sent since load.
   let cutoff = 0;
   if (!showAll && userTotal > HISTORY_TURN_LIMIT) {
-    const target = userTotal - HISTORY_TURN_LIMIT; // skip this many user turns
+    const target = userTotal - HISTORY_TURN_LIMIT; // fold this many user turns
     let seen = 0;
     for (let i = 0; i < items.length; i++) {
       if (items[i].type === "user") {
@@ -1192,15 +1282,25 @@ function renderHistory(showAll: boolean) {
       }
     }
     const banner = el("div", "history-expand", `▾ 显示更早的 ${target} 条消息`);
-    banner.onclick = () => renderHistory(true);
+    banner.onclick = () => {
+      Array.from(messagesEl.querySelectorAll(".history-folded")).forEach((n) => n.classList.remove("history-folded"));
+      banner.remove();
+    };
     messagesEl.appendChild(banner);
   }
+
+  // Elements appended while i < cutoff get folded after the loop.
+  const foldBoundary = () => messagesEl.children.length;
+  let foldEnd = 0;
 
   let userOrdinal = -1;
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
     if (it.type === "user") userOrdinal++;
-    if (i < cutoff) continue; // fold earlier items but keep ordinal counting accurate
+    if (cutoff && i === cutoff) {
+      finalizeTurn(); // close the folded portion's last assistant bubble
+      foldEnd = foldBoundary();
+    }
     if (it.type === "user") {
       finalizeTurn();
       const cp = cpByOrdinal.get(userOrdinal);
@@ -1215,7 +1315,7 @@ function renderHistory(showAll: boolean) {
     } else if (it.type === "assistant_text") {
       const body = ensureAssistant();
       const seg = el("div", "md text-seg");
-      seg.innerHTML = mdFull.render(it.text);
+      seg.innerHTML = mdFull.render(foldLeakedToolXml(it.text));
       linkifyRefs(seg);
       body.appendChild(seg);
     } else if (it.type === "thinking") {
@@ -1236,6 +1336,11 @@ function renderHistory(showAll: boolean) {
     }
   }
   finalizeTurn();
+  // Hide the folded portion (children after the banner, before foldEnd).
+  if (cutoff && foldEnd > 1) {
+    const kids = Array.from(messagesEl.children);
+    for (let k = 1; k < foldEnd; k++) kids[k]?.classList.add("history-folded");
+  }
   updateEmptyState();
   scrollToBottom();
 }
@@ -1642,10 +1747,14 @@ function doSend() {
 
 /** Actually start a turn from a payload (used for live sends and queued ones). */
 function performSend(p: QueueItem) {
+  queuePaused = false; // a manual send re-arms the queue after a Stop
+  stoppingView = false;
   appendUser(p.text, p.labels, p.imageUris);
   finalizeTurn();
   turnTokens = 0; // reset token counters for the new turn
   turnEst = 0;
+  msgTokenBase = 0;
+  lastMsgTokens = 0;
   isBusy = true;
   refreshComposerHint(); // show the Stop button immediately (don't wait for the busy event)
   showWorking(); // instant feedback (the busy event confirms it a moment later)
@@ -1661,11 +1770,14 @@ function performSend(p: QueueItem) {
 
 /** When the current turn ends, auto-run the next queued task (if any). */
 function flushQueue() {
-  if (isBusy || !taskQueue.length) return;
+  // Stop means STOP: don't auto-launch the next queued prompt 150ms after the
+  // user halted the current one. The queue resumes on their next manual send.
+  if (queuePaused || isBusy || !taskQueue.length) return;
   const next = taskQueue.shift()!;
   renderQueue();
   performSend(next);
 }
+let queuePaused = false;
 
 function renderQueue() {
   if (!taskQueue.length) {
@@ -1698,6 +1810,12 @@ sendBtn.onclick = doSend;
 let userStopped = false; // user hit Stop — append an interrupted marker on finalize
 stopBtn.onclick = () => {
   userStopped = true;
+  queuePaused = true; // halt the queue too — Stop shouldn't auto-fire the next task
+  // Drop everything still in flight for this turn: deltas buffered in the pipe
+  // (or a slow interrupt) would otherwise keep "typing" after the button
+  // already flipped — the classic "stopped but still replying" bug.
+  stoppingView = true;
+  if (liveBlock) liveBlock.raw = liveBlock.raw.slice(0, liveBlock.shown); // freeze the typewriter tail
   send({ type: "interrupt" });
   // Optimistic: react to the click itself with zero latency. The host confirms
   // with a busy:false, and the final `result` appends the interrupted marker.
@@ -1705,6 +1823,8 @@ stopBtn.onclick = () => {
   refreshComposerHint();
   removeWorking();
 };
+/** True from Stop-click until the next turn starts: render nothing new. */
+let stoppingView = false;
 inputEl.addEventListener("keydown", (e) => {
   // Ignore Enter while an IME composition is active (e.g. confirming a pinyin
   // candidate) — `isComposing`/keyCode 229 means it's not a real "send".
@@ -1758,6 +1878,7 @@ inputEl.addEventListener("paste", (e) => {
         if (m) {
           pendingImages.push({ mediaType: m[1], data: m[2], uri });
           addImagePreview(uri);
+          refreshComposerHint(); // an image alone should enable send/queue
         }
       };
       reader.readAsDataURL(file);
@@ -1775,19 +1896,59 @@ function addImagePreview(uri: string) {
     const idx = pendingImages.findIndex((p) => p.uri === uri);
     if (idx >= 0) pendingImages.splice(idx, 1);
     wrap.remove();
+    refreshComposerHint();
   };
   wrap.append(img, x);
   imagePreviews.appendChild(wrap);
 }
 
-// Lightbox (click any chat image to view full size)
+// Lightbox (click any chat image to view full size; copy/save from the toolbar)
 function openLightbox(src: string) {
   lightboxImg.src = src;
   lightbox.classList.remove("hidden");
 }
-lightbox.onclick = () => {
+function closeLightbox() {
   lightbox.classList.add("hidden");
   lightboxImg.src = "";
+}
+lightbox.onclick = closeLightbox; // click outside the image closes
+lightboxImg.onclick = (e) => e.stopPropagation(); // clicking the image itself doesn't
+$("lb-close").onclick = (e) => {
+  e.stopPropagation();
+  closeLightbox();
+};
+$("lb-save").onclick = (e) => {
+  e.stopPropagation();
+  if (lightboxImg.src) send({ type: "saveImage", dataUri: lightboxImg.src });
+};
+$<HTMLButtonElement>("lb-copy").onclick = async (e) => {
+  e.stopPropagation();
+  const btn = $("lb-copy");
+  const src = lightboxImg.src;
+  if (!src) return;
+  try {
+    // Clipboard only takes PNG — round-trip through a canvas (also normalizes jpeg/webp).
+    const img = new Image();
+    await new Promise<void>((res, rej) => {
+      img.onload = () => res();
+      img.onerror = () => rej(new Error("load"));
+      img.src = src;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.getContext("2d")!.drawImage(img, 0, 0);
+    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/png"));
+    if (!blob) throw new Error("blob");
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+    const old = btn.textContent;
+    btn.textContent = "已复制 ✓";
+    setTimeout(() => (btn.innerHTML = `${ICON.copy} 复制`), 1200);
+    void old;
+  } catch {
+    btn.textContent = "复制失败，请用「保存」";
+    setTimeout(() => (btn.innerHTML = `${ICON.copy} 复制`), 2000);
+  }
 };
 
 // ---- Attached files (active editor file + drag-and-drop from the explorer) ----
@@ -1903,7 +2064,14 @@ const MODELS = [
   { id: "haiku", label: "Claude Haiku 4.5", short: "Haiku", desc: "最快 · 轻量任务" },
   { id: "fable", label: "Fable 5", short: "Fable", desc: "" },
 ];
-const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+// Reasoning-effort levels — labels + wording aligned with Claude Code's `/effort`.
+const EFFORTS = [
+  { id: "low", label: "Low", desc: "快速、直接的实现" },
+  { id: "medium", label: "Medium", desc: "均衡，标准测试" },
+  { id: "high", label: "High", desc: "全面实现，充分测试" },
+  { id: "xhigh", label: "xHigh", desc: "扩展推理，深入分析" },
+  { id: "max", label: "Max", desc: "最强能力，最深推理" },
+];
 let currentMode = "default";
 let currentModel = "";
 let currentEffort = "";
@@ -1943,11 +2111,12 @@ function buildModelMenu() {
       `<span class="pick-text"><span class="pick-title">${m.label}</span>${m.desc ? `<span class="pick-desc">${m.desc}</span>` : ""}</span>` +
       `<span class="pick-check">${m.id === currentModel ? "✓" : ""}</span></button>`;
   }
-  // Reasoning-effort row (dots) — lives in the model settings.
-  const idx = EFFORTS.indexOf(currentEffort);
-  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度 ${currentEffort ? `(${currentEffort})` : "(默认)"}</span><span class="effort-dots">`;
+  // Reasoning-effort dots — level names + Claude's /effort wording on hover.
+  const idx = EFFORTS.findIndex((e) => e.id === currentEffort);
+  const curLabel = idx >= 0 ? EFFORTS[idx].label : "默认";
+  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度 (${curLabel})</span><span class="effort-dots">`;
   EFFORTS.forEach((e, i) => {
-    html += `<span class="effort-dot ${idx >= 0 && i <= idx ? "on" : ""}" data-effort="${e}" title="${e}"></span>`;
+    html += `<span class="effort-dot ${idx >= 0 && i <= idx ? "on" : ""}" data-effort="${e.id}" title="${e.label}：${e.desc}"></span>`;
   });
   html += `</span></div>`;
   modelMenu.innerHTML = html;
@@ -2163,6 +2332,18 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   userMsgCount = messagesEl.querySelectorAll(".msg.user").length;
   appendUser(newText);
   finalizeTurn();
+  // Enter busy state like performSend — the host rewinds + respawns before the
+  // real busy:true arrives; without this the stop button is missing and a
+  // second Enter could race a concurrent turn.
+  turnTokens = 0;
+  turnEst = 0;
+  msgTokenBase = 0;
+  lastMsgTokens = 0;
+  isBusy = true;
+  queuePaused = false;
+  stoppingView = false;
+  refreshComposerHint();
+  showWorking();
   send({ type: "editMessage", checkpointId, text: newText });
 }
 
@@ -2202,6 +2383,7 @@ function clearContextChips() {
 
 function setBusy(busy: boolean) {
   isBusy = busy;
+  if (busy) stoppingView = false; // a new turn is live — resume rendering
   refreshComposerHint(); // toggles send/stop + the "加入等待队列" hint
   if (busy) {
     showWorking();

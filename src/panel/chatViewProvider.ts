@@ -803,11 +803,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private handlePermission(ctx: SessionCtx, requestId: string, behavior: "allow" | "deny", suggestionId?: string): void {
     if (!ctx.proc) return;
-    if (behavior === "allow" && suggestionId?.startsWith("setMode:")) {
-      const mode = suggestionId.split(":")[1];
-      if (mode) void ctx.proc.setPermissionMode(mode);
-    }
-    ctx.proc.respondPermission(requestId, { behavior });
+    // The chosen suggestion is echoed back raw (updatedPermissions) — the CLI
+    // applies it to the session and persists it, so "总是允许" truly sticks.
+    ctx.proc.respondPermission(requestId, { behavior, suggestionId });
   }
 
   private async setPermissionMode(ctx: SessionCtx, mode: string): Promise<void> {

@@ -62,7 +62,10 @@ export class ClaudeProcess {
   private rl?: readline.Interface;
   private exited = false;
   private readonly pendingControl = new Map<string, { resolve: (resp: unknown) => void; reject: (err: Error) => void }>();
-  private readonly pendingPermissions = new Map<string, Record<string, unknown>>();
+  /** Per pending can_use_tool ask: the original input (echoed back on allow)
+   *  plus the CLI's RAW permission suggestions — echoing a chosen suggestion in
+   *  `updatedPermissions` is what makes "总是允许" actually persist. */
+  private readonly pendingPermissions = new Map<string, { input: Record<string, unknown>; suggestions: unknown[] }>();
   private sessionId?: string;
   private initialized = false;
   private disposed = false;
@@ -194,16 +197,24 @@ export class ClaudeProcess {
     this.write({ type: "user", message: { role: "user", content: [{ type: "text", text: "/compact" }] } });
   }
 
-  /** Resolve a pending permission request (called by the provider). */
-  respondPermission(requestId: string, decision: { behavior: "allow" | "deny"; message?: string }): void {
-    const originalInput = this.pendingPermissions.get(requestId);
-    if (originalInput === undefined) return;
+  /** Resolve a pending permission request (called by the provider). When the
+   *  user chose a suggestion ("总是允许…"), echo the CLI's raw suggestion object
+   *  in `updatedPermissions` — the CLI then applies it to the live session AND
+   *  persists it (settings), so the same ask doesn't come back forever. */
+  respondPermission(requestId: string, decision: { behavior: "allow" | "deny"; message?: string; suggestionId?: string }): void {
+    const pending = this.pendingPermissions.get(requestId);
+    if (pending === undefined) return;
     this.pendingPermissions.delete(requestId);
 
-    const response: PermissionDecision =
-      decision.behavior === "allow"
-        ? { behavior: "allow", updatedInput: originalInput }
-        : { behavior: "deny", message: decision.message ?? "用户拒绝了此操作。", interrupt: false };
+    let response: PermissionDecision;
+    if (decision.behavior === "allow") {
+      response = { behavior: "allow", updatedInput: pending.input };
+      const m = /^sugg:(\d+)$/.exec(decision.suggestionId ?? "");
+      const raw = m ? pending.suggestions[Number(m[1])] : undefined;
+      if (raw) (response as Record<string, unknown>).updatedPermissions = [raw];
+    } else {
+      response = { behavior: "deny", message: decision.message ?? "用户拒绝了此操作。", interrupt: false };
+    }
 
     this.write({
       type: "control_response",
@@ -215,12 +226,12 @@ export class ClaudeProcess {
   /** Answer an AskUserQuestion tool: echo the input plus an `answers` map
    *  (question text -> chosen label / labels) so the CLI returns the selection. */
   answerQuestion(requestId: string, answers: Record<string, string | string[]>): void {
-    const originalInput = this.pendingPermissions.get(requestId);
-    if (originalInput === undefined) return;
+    const pending = this.pendingPermissions.get(requestId);
+    if (pending === undefined) return;
     this.pendingPermissions.delete(requestId);
     const response: PermissionDecision = {
       behavior: "allow",
-      updatedInput: { ...(originalInput as Record<string, unknown>), answers },
+      updatedInput: { ...pending.input, answers },
     };
     this.write({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });
     this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "allow" });
@@ -372,7 +383,10 @@ export class ClaudeProcess {
   private handleControlRequest(ev: ControlRequest): void {
     if (isCanUseTool(ev.request)) {
       const req = ev.request;
-      this.pendingPermissions.set(ev.request_id, req.input);
+      this.pendingPermissions.set(ev.request_id, {
+        input: req.input,
+        suggestions: (req.permission_suggestions as unknown[]) ?? [],
+      });
       const suggestions = this.normalizeSuggestions(req);
       this.hooks.onPermission({
         requestId: ev.request_id,
@@ -397,21 +411,19 @@ export class ClaudeProcess {
   private normalizeSuggestions(req: { permission_suggestions?: unknown[] }): PermissionSuggestionView[] {
     const out: PermissionSuggestionView[] = [];
     const seen = new Set<string>();
-    for (const s of req.permission_suggestions ?? []) {
+    (req.permission_suggestions ?? []).forEach((s, i) => {
       const sug = s as { type?: string; mode?: string };
-      let item: PermissionSuggestionView | undefined;
-      if (sug.type === "setMode" && sug.mode) {
-        item = { id: `setMode:${sug.mode}`, label: `本会话总是允许 (${sug.mode})` };
-      } else if (sug.type === "addRules") {
-        item = { id: "addRules", label: "总是允许此类操作" };
+      let label: string | undefined;
+      if (sug.type === "setMode" && sug.mode) label = `本会话总是允许 (${sug.mode})`;
+      else if (sug.type === "addRules") label = "总是允许此类操作";
+      // The id is the index into the RAW suggestion list — respondPermission
+      // echoes that raw object back so the CLI applies AND persists it.
+      // De-dupe by label: several scope variants would render identically.
+      if (label && !seen.has(label)) {
+        seen.add(label);
+        out.push({ id: `sugg:${i}`, label });
       }
-      // The CLI may send several variants (different scopes) that we surface
-      // identically — de-dupe so the user doesn't see two identical buttons.
-      if (item && !seen.has(item.id)) {
-        seen.add(item.id);
-        out.push(item);
-      }
-    }
+    });
     return out;
   }
 

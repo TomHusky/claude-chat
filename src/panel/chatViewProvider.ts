@@ -26,7 +26,10 @@ interface SessionCtx {
   proc?: ClaudeProcess;
   starting?: Promise<ClaudeProcess | undefined>;
   checkpoints: CheckpointManager;
-  pendingContext?: string;
+  /** Selection added while the webview was still loading — replayed as a
+   *  visible chip on ready. NEVER silently attached at send time: what the
+   *  composer shows must be exactly what gets sent. */
+  pendingContext?: { label: string; text: string };
   pendingPerm?: ToWebview; // permission raised while this tab was hidden/closed
   blank: boolean; // a fresh "new chat" tab with no session yet
   ready: boolean; // its webview finished loading
@@ -471,9 +474,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const end = editor.selection.end.line + 1;
     const label = `${rel}:${start}-${end}`;
     const text = `选中代码 \`${label}\`:\n\`\`\`${lang}\n${sel}\n\`\`\``;
-    ctx.pendingContext = text;
+    if (ctx.ready) {
+      // Webview is live — it shows the chip and owns the state from here.
+      this.post(ctx, { kind: "context_added", label, text });
+    } else {
+      // Still loading — replay as a visible chip when it becomes ready.
+      ctx.pendingContext = { label, text };
+    }
     this.reveal();
-    this.post(ctx, { kind: "context_added", label, text });
   }
 
   // -- Message handling ----------------------------------------------------
@@ -531,6 +539,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           this.loadCtxSession(ctx);
           this.postActiveFile();
+          if (ctx.pendingContext) {
+            // Selection added before the webview finished loading — show it as
+            // a normal removable chip now (never attach anything invisibly).
+            this.post(ctx, { kind: "context_added", ...ctx.pendingContext });
+            ctx.pendingContext = undefined;
+          }
           if (this.lastUsage) this.post(ctx, this.lastUsage); // show cached usage immediately
           this.fetchUsage();
           break;
@@ -716,8 +730,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     images?: { mediaType: string; data: string }[],
     files?: string[],
   ): Promise<void> {
-    let attached = context ?? ctx.pendingContext;
-    ctx.pendingContext = undefined;
+    // ONLY what the webview sent — a host-side fallback here once re-attached a
+    // selection whose chip the user had already removed (invisible attach).
+    let attached = context;
     const mySeq = (ctx.sendSeq = (ctx.sendSeq ?? 0) + 1);
     if (files && files.length) {
       const fileCtx = this.buildFileContext(files);

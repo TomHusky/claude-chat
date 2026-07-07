@@ -1727,7 +1727,10 @@ function clearComposer() {
   imagePreviews.innerHTML = "";
   // Staged attachments are consumed by the message; keep only the default current file.
   attachedFiles = [];
-  autoDismissed = false;
+  // NOTE: autoDismissed is deliberately NOT reset here — if the user removed
+  // the auto-attached file chip, sending must not silently re-attach it.
+  // It re-arms only when the active file changes (onActiveFile) or the user
+  // re-adds the file manually (addFile).
   onActiveFile(autoPath);
   refreshComposerHint();
 }

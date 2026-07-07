@@ -26,7 +26,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.moveToRight", () => moveToRight()),
     vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
     vscode.commands.registerCommand("claude-chat.openInEditor", () => provider.openInEditor()),
-    vscode.commands.registerCommand("claude-chat.open", () => provider.openInEditor()),
+    // The icon on FILE editors' title bar: always start a FRESH conversation
+    // (openInEditor would resurrect the last session).
+    vscode.commands.registerCommand("claude-chat.open", () => provider.newSession()),
   );
 
   // Auto-check for updates once on startup (silent — only prompts if newer).

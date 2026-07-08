@@ -75,6 +75,7 @@ export class ClaudeProcess {
   private currentToolJson = ""; // accumulated partial input JSON for the live tool
   private currentModel?: string; // model id from the init event (for context window)
   private busy = false;
+  private pendingMode?: string; // mode change requested before the handshake finished
   private readonly seenToolIds = new Set<string>();
 
   constructor(
@@ -148,6 +149,19 @@ export class ClaudeProcess {
     // enables `can_use_tool` permission prompts over the control channel.
     await this.sendControlRequest({ subtype: "initialize" });
     this.initialized = true;
+    // A mode change arrived mid-handshake — apply it now, or this process keeps
+    // running the mode it was spawned with while the picker says otherwise.
+    if (this.pendingMode) {
+      const mode = this.pendingMode;
+      this.pendingMode = undefined;
+      // A refused mode switch must not fail the whole spawn — the process is
+      // usable, just in its spawn-time mode.
+      try {
+        await this.setPermissionMode(mode);
+      } catch {
+        /* keep the spawned mode */
+      }
+    }
   }
 
   private buildArgs(): string[] {
@@ -256,12 +270,16 @@ export class ClaudeProcess {
   }
 
   async setPermissionMode(mode: string): Promise<void> {
-    if (!this.proc) return;
-    try {
-      await this.sendControlRequest({ subtype: "set_permission_mode", mode });
-    } catch {
-      /* ignore */
+    if (!this.proc || this.exited) return;
+    if (!this.initialized) {
+      // Spawned with the old mode but still handshaking: a control request now
+      // would wait out the 30s timeout. Remember it and apply after initialize.
+      this.pendingMode = mode;
+      return;
     }
+    // Let rejections propagate — swallowing them made a refused mode switch look
+    // like success while the process kept asking for every permission.
+    await this.sendControlRequest({ subtype: "set_permission_mode", mode });
   }
 
   dispose(): void {
@@ -353,7 +371,10 @@ export class ClaudeProcess {
         const cb = this.pendingControl.get(r?.request_id);
         if (cb) {
           this.pendingControl.delete(r.request_id);
-          cb.resolve(r);
+          // A `subtype:"error"` reply is a REJECTION. Resolving it made every
+          // caller (initialize, set_permission_mode) believe it succeeded.
+          if (r?.subtype === "error") cb.reject(new Error(String(r.error ?? "control_request failed")));
+          else cb.resolve(r);
         }
         return;
       }
@@ -440,9 +461,10 @@ export class ClaudeProcess {
         cwd: ev.cwd,
         tools: ev.tools ?? [],
         resumed,
-        // Ground truth from the CLI — a resumed session may run a different
-        // mode than our local setting, and the picker must show what's real.
-        permissionMode: (ev as any).permissionMode,
+        // Ground truth from the CLI. But if a mode change arrived mid-handshake,
+        // init still reports the SPAWN-time mode — reporting it would snap the
+        // picker back to the mode the user just moved away from.
+        permissionMode: this.pendingMode ?? (ev as any).permissionMode,
       });
     } else if ((ev as any).subtype === "status") {
       const status = (ev as any).status;

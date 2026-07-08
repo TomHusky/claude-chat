@@ -311,8 +311,11 @@ function startTypewriter() {
  *  the transcript — fold it into a fenced block so it reads as raw syntax
  *  instead of broken paragraphs. */
 function foldLeakedToolXml(text: string): string {
-  if (!text.includes("<invoke name=")) return text;
-  return text.replace(/<invoke name=[\s\S]*?(?:<\/invoke>|$)/g, (blk) => "\n```xml\n" + blk.trim() + "\n```\n");
+  // Require a real </invoke>: an open-ended `|$` alternative made a single
+  // prose mention of "<invoke name=" swallow the entire rest of the reply.
+  // And never touch text that already has fences — we'd break the existing one.
+  if (text.includes("```") || !/<invoke name=[\s\S]*?<\/invoke>/.test(text)) return text;
+  return text.replace(/<invoke name=[\s\S]*?<\/invoke>/g, (blk) => "\n```xml\n" + blk.trim() + "\n```\n");
 }
 
 /** Snap the live block to its full text, rendered with syntax highlighting. */
@@ -1758,7 +1761,10 @@ function doSend() {
 /** Actually start a turn from a payload (used for live sends and queued ones). */
 function performSend(p: QueueItem) {
   queuePaused = false; // a manual send re-arms the queue after a Stop
-  stoppingView = false;
+  // NOTE: stoppingView is NOT cleared here. The stopped turn's deltas may still
+  // be in flight; clearing the gate now would append them to this new bubble.
+  // Only `setBusy(true)` — which the host always emits before the new turn's
+  // first stream event — reopens rendering.
   appendUser(p.text, p.labels, p.imageUris);
   finalizeTurn();
   turnTokens = 0; // reset token counters for the new turn
@@ -1825,7 +1831,14 @@ stopBtn.onclick = () => {
   // (or a slow interrupt) would otherwise keep "typing" after the button
   // already flipped — the classic "stopped but still replying" bug.
   stoppingView = true;
-  if (liveBlock) liveBlock.raw = liveBlock.raw.slice(0, liveBlock.shown); // freeze the typewriter tail
+  if (liveBlock) {
+    // Freeze the typewriter tail. Don't cut between the two halves of a
+    // surrogate pair (emoji) — that renders as a replacement char.
+    let cut = liveBlock.shown;
+    if (cut > 0 && /[\uD800-\uDBFF]/.test(liveBlock.raw[cut - 1])) cut--;
+    liveBlock.raw = liveBlock.raw.slice(0, cut);
+    liveBlock.shown = cut;
+  }
   send({ type: "interrupt" });
   // Optimistic: react to the click itself with zero latency. The host confirms
   // with a busy:false, and the final `result` appends the interrupted marker.
@@ -2060,12 +2073,16 @@ const ICONS = {
   acceptEdits: SVG('<path d="M3 13l1-3 6.5-6.5 2 2L6 12z"/><path d="M9.5 4l2 2"/>'), // pencil
   plan: SVG('<rect x="3.5" y="2" width="9" height="12" rx="1"/><path d="M5.8 5.5h4.4M5.8 8h4.4M5.8 10.5h2.6"/>'), // plan/list
   auto: SVG('<path d="M8.6 1.6 4 9h3.2l-.6 5.4L12 6.6H8.2z"/>'), // zap (auto)
+  bypassPermissions: SVG('<path d="M8 1.8 13 3.6V7.2c0 3-2 5.2-5 6.2-3-1-5-3.2-5-6.2V3.6z"/><path d="M5.4 5.4l5.2 5.2"/>'), // shield struck through (danger)
 };
 const MODES = [
   { id: "default", icon: ICONS.default, title: "发送前确认", desc: "每次编辑前 Claude 都会请求你确认" },
   { id: "acceptEdits", icon: ICONS.acceptEdits, title: "自动编辑", desc: "Claude 直接编辑文件，无需逐个确认" },
   { id: "plan", icon: ICONS.plan, title: "规划模式", desc: "先探索代码并给出方案，再开始编辑" },
   { id: "auto", icon: ICONS.auto, title: "Auto 模式", desc: "自动为每个任务选择最合适的权限模式" },
+  // Offered by the settings enum, so it MUST be representable here — falling
+  // back to MODES[0] would label the most dangerous mode "发送前确认".
+  { id: "bypassPermissions", icon: ICONS.bypassPermissions, title: "绕过权限", desc: "跳过所有权限检查（危险）" },
 ];
 const MODELS = [
   { id: "", label: "默认模型", short: "默认", desc: "使用 CLI 默认模型" },
@@ -2087,7 +2104,15 @@ let currentModel = "";
 let currentEffort = "";
 
 function syncPickers() {
-  const mode = MODES.find((x) => x.id === currentMode) || MODES[0];
+  // An unknown mode must show ITSELF, never silently degrade to MODES[0] —
+  // labelling an unrecognised (possibly permission-skipping) mode "发送前确认"
+  // is the most dangerous lie this UI can tell.
+  const mode = MODES.find((x) => x.id === currentMode) ?? {
+    id: currentMode,
+    icon: ICONS.default,
+    title: currentMode || "未知模式",
+    desc: "",
+  };
   modeIcon.innerHTML = mode.icon;
   modeLabel.textContent = mode.title;
   const model = MODELS.find((x) => x.id === currentModel) || MODELS[0];
@@ -2321,19 +2346,28 @@ function regenerate(aEl: HTMLElement) {
   const userMsg = precedingUserMsg(aEl);
   if (!userMsg) return;
   const raw = userMsg.dataset.rawText || "";
-  // Image-only messages have no text but are still regenerable.
-  if (!raw && !userMsg.querySelector(".msg-images img")) return;
+  // Image-only messages have no text but are still regenerable — as long as at
+  // least one image can actually be re-sent (a base64 data URI).
+  const hasSendableImage = Array.from(userMsg.querySelectorAll<HTMLImageElement>(".msg-images img")).some((i) =>
+    i.src.startsWith("data:"),
+  );
+  if (!raw && !hasSendableImage) return;
   submitEdit(userMsg, userMsg.dataset.checkpointId || "", raw);
 }
 
 function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
-  // Carry the original message's images through the edit/regenerate — dropping
-  // them corrupted the visible history AND resent the turn without the image.
-  const imageUris = Array.from(msg.querySelectorAll<HTMLImageElement>(".msg-images img")).map((i) => i.src);
+  // Carry the original message's images through the edit/regenerate. Build the
+  // shown list and the sent list in ONE pass: filtering only the sent list let
+  // the view display images (e.g. https: or `;charset=` data URIs) that were
+  // never actually sent to the model.
+  const imageUris: string[] = [];
   const images: { mediaType: string; data: string }[] = [];
-  for (const uri of imageUris) {
-    const m = /^data:([^;]+);base64,(.*)$/.exec(uri);
-    if (m) images.push({ mediaType: m[1], data: m[2] });
+  for (const img of Array.from(msg.querySelectorAll<HTMLImageElement>(".msg-images img"))) {
+    const m = /^data:([^;,]+)(?:;[^;,]+)*;base64,(.*)$/.exec(img.src);
+    if (m) {
+      images.push({ mediaType: m[1], data: m[2] });
+      imageUris.push(img.src);
+    }
   }
   // Remove this message's checkpoint divider (the one just above it), the
   // message itself, and everything after it.
@@ -2362,7 +2396,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   lastMsgTokens = 0;
   isBusy = true;
   queuePaused = false;
-  stoppingView = false;
+  // stoppingView stays as-is — see performSend; `setBusy(true)` reopens the gate.
   refreshComposerHint();
   showWorking();
   send({ type: "editMessage", checkpointId, text: newText, images: images.length ? images : undefined });

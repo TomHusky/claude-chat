@@ -768,27 +768,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     text: string,
     images?: { mediaType: string; data: string }[],
   ): Promise<void> {
-    if (checkpointId) {
-      const res = ctx.checkpoints.restore(checkpointId);
-      if (res) {
-        // Wait for the CLI to actually exit before rewriting the transcript —
-        // a dying process can flush buffered lines AFTER our truncation,
-        // resurrecting the rewound turns (and --resume would race the flush).
-        const proc = ctx.proc;
-        ctx.proc = undefined;
-        ctx.starting = undefined;
-        if (proc) await proc.disposeAndWait();
-        let remaining = 0;
-        if (ctx.sessionId) {
-          remaining = this.store.truncateToLines(ctx.sessionId, res.truncateLine);
-        }
-        if (remaining === 0) {
-          ctx.sessionId = undefined;
-          ctx.checkpoints.clear();
-        }
-        this.refreshChangedFiles(ctx);
-      }
+    // The webview already deleted this message and everything after it. If we
+    // can't actually rewind, sending anyway would leave the transcript holding
+    // turns the user believes are gone (and files at Claude's latest edits).
+    // Bail loudly and reload the true history instead.
+    const res = checkpointId ? ctx.checkpoints.restore(checkpointId) : undefined;
+    if (!res) {
+      this.post(ctx, {
+        kind: "error",
+        message: checkpointId ? "找不到该还原点（可能已被清理），无法重新生成。" : "这条消息没有还原点，无法重新生成。",
+      });
+      this.post(ctx, { kind: "busy", busy: false });
+      this.loadCtxSession(ctx); // restore the view we just let the webview trim
+      return;
     }
+    // Wait for the CLI to actually exit before rewriting the transcript —
+    // a dying process can flush buffered lines AFTER our truncation,
+    // resurrecting the rewound turns (and --resume would race the flush).
+    const proc = ctx.proc;
+    ctx.proc = undefined;
+    ctx.starting = undefined;
+    if (proc) await proc.disposeAndWait();
+    let remaining = 0;
+    if (ctx.sessionId) {
+      remaining = this.store.truncateToLines(ctx.sessionId, res.truncateLine);
+    }
+    if (remaining === 0) {
+      ctx.sessionId = undefined;
+      ctx.checkpoints.clear();
+    }
+    this.refreshChangedFiles(ctx);
     await this.handleSend(ctx, text, undefined, images);
   }
 
@@ -817,14 +826,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    *  Global update is silently shadowed by a Workspace/Folder value, so the
    *  picker would appear to change while every new process kept the old value. */
   private async updateConfig(key: string, value: unknown): Promise<void> {
+    // These settings are window-scoped, so `inspect()` never reports a
+    // workspaceFolderValue — only Workspace can shadow Global.
     const insp = this.config().inspect(key);
     const target =
-      insp?.workspaceFolderValue !== undefined
-        ? vscode.ConfigurationTarget.WorkspaceFolder
-        : insp?.workspaceValue !== undefined
-          ? vscode.ConfigurationTarget.Workspace
-          : vscode.ConfigurationTarget.Global;
-    await this.config().update(key, value, target);
+      insp?.workspaceValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    try {
+      await this.config().update(key, value, target);
+    } catch (err) {
+      // Don't fall back to Global: a workspace value would keep shadowing it and
+      // the pick would silently not apply. Tell the user instead.
+      this.output.appendLine(`[updateConfig:${key}] ${String(err)}`);
+      vscode.window.showWarningMessage(`无法保存设置 claudeChat.${key}，请检查工作区设置是否只读。`);
+    }
   }
 
   /** Every live process (all tabs + background runs) — the settings below are
@@ -837,11 +851,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return out;
   }
 
-  private async setPermissionMode(ctx: SessionCtx, mode: string): Promise<void> {
+  private modeSeq = 0;
+
+  private async setPermissionMode(_ctx: SessionCtx, mode: string): Promise<void> {
+    // Two quick picks race: each awaits a CLI round-trip, and the slower one's
+    // broadcast used to land last and show the losing mode everywhere.
+    const seq = ++this.modeSeq;
     await this.updateConfig("permissionMode", mode);
-    // Apply to every running process, not just this tab's.
-    await Promise.all(this.allProcs().map((p) => p.setPermissionMode(mode)));
-    // Keep every open picker in sync with the new global setting.
+    if (seq !== this.modeSeq) return; // superseded — the later pick owns the UI
+    // Keep every open picker in sync BEFORE the (possibly slow) round-trips.
     const cfg: ToWebview = {
       kind: "config",
       permissionMode: mode,
@@ -849,6 +867,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       effort: this.config().get<string>("effort", ""),
     };
     for (const c of this.sessions) this.post(c, cfg);
+    // Apply to every running process, not just this tab's.
+    const results = await Promise.allSettled(this.allProcs().map((p) => p.setPermissionMode(mode)));
+    if (seq !== this.modeSeq) return;
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed) {
+      this.post(_ctx, { kind: "error", message: `有 ${failed} 个会话未能切换到该模式，请重试或新建会话。` });
+    }
   }
 
   private async setModel(ctx: SessionCtx, model: string): Promise<void> {
@@ -1617,6 +1642,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    // Flush debounced snapshot writes first — a hard window close within 500ms
+    // of the last file edit would otherwise lose that file's baseline.
+    for (const ctx of this.sessions) ctx.checkpoints.flush();
+    for (const ctx of this.detached.values()) ctx.checkpoints.flush();
     for (const ctx of this.sessions) ctx.proc?.dispose();
     for (const ctx of this.detached.values()) ctx.proc?.dispose();
     this.sessions.clear();

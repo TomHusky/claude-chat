@@ -38,6 +38,12 @@ const MAX_CHECKPOINTS = 40;
  */
 export class CheckpointManager {
   private checkpoints: Checkpoint[] = [];
+  /** Pre-session content of files whose ORIGINAL snapshot lived in a checkpoint
+   *  that has since been pruned. Without this, `originalOf()` would return a
+   *  mid-session snapshot (already containing Claude's earlier edits) and
+   *  "revert file" would silently keep those edits while claiming success. */
+  private baseline = new Map<string, string | null>();
+  private baselineSkipped = new Set<string>();
   private sessionId?: string;
 
   constructor(private readonly storageDir: string) {}
@@ -63,7 +69,15 @@ export class CheckpointManager {
       truncateLine,
     });
     if (this.checkpoints.length > MAX_CHECKPOINTS) {
-      this.checkpoints = this.checkpoints.slice(-MAX_CHECKPOINTS);
+      // Fold the dropped checkpoints' EARLIEST snapshots into `baseline` before
+      // discarding them — they are the only record of the files' pre-session
+      // content. Dropping them outright corrupts revert/diff.
+      const cut = this.checkpoints.length - MAX_CHECKPOINTS;
+      for (const c of this.checkpoints.slice(0, cut)) {
+        for (const f of c.files) if (!this.baseline.has(f.path)) this.baseline.set(f.path, f.content);
+        for (const s of c.skipped ?? []) this.baselineSkipped.add(s);
+      }
+      this.checkpoints = this.checkpoints.slice(cut);
     }
     this.persist();
     return id;
@@ -118,9 +132,9 @@ export class CheckpointManager {
     return c ? { userText: c.label } : undefined;
   }
 
-  /** All file paths touched during this session. */
+  /** All file paths touched during this session (incl. pruned-away turns). */
   changedPaths(): string[] {
-    const set = new Set<string>();
+    const set = new Set<string>(this.baseline.keys());
     for (const c of this.checkpoints) for (const f of c.files) set.add(f.path);
     return [...set];
   }
@@ -130,7 +144,8 @@ export class CheckpointManager {
    * pending change (the on-disk content is kept as the new baseline).
    */
   accept(path: string): void {
-    let changed = false;
+    let changed = this.baseline.delete(path);
+    this.baselineSkipped.delete(path);
     for (const c of this.checkpoints) {
       const before = c.files.length;
       c.files = c.files.filter((f) => f.path !== path);
@@ -145,6 +160,8 @@ export class CheckpointManager {
    * Returns null if the file did not exist at baseline, undefined if untracked.
    */
   originalOf(path: string): string | null | undefined {
+    // Pruned turns hold the TRUE earliest content — check them first.
+    if (this.baseline.has(path)) return this.baseline.get(path);
     for (const c of this.checkpoints) {
       const f = c.files.find((x) => x.path === path);
       if (f) return f.content;
@@ -167,6 +184,9 @@ export class CheckpointManager {
     for (let i = idx; i < this.checkpoints.length; i++) {
       for (const s of this.checkpoints[i].skipped ?? []) skippedSet.add(s);
     }
+    // Restoring the OLDEST surviving checkpoint means going back to the session
+    // baseline — pruned turns' un-snapshottable files must be reported too.
+    if (idx === 0) for (const s of this.baselineSkipped) skippedSet.add(s);
 
     // Earliest backup per path across checkpoints[idx..] == pre-turn content.
     const target = new Map<string, string | null>();
@@ -175,6 +195,9 @@ export class CheckpointManager {
         if (!target.has(b.path)) target.set(b.path, b.content);
       }
     }
+    // Rewinding to the oldest surviving turn == rewinding to the session start:
+    // files whose only snapshot lived in a pruned turn must revert to baseline.
+    if (idx === 0) for (const [p, c] of this.baseline) if (!target.has(p)) target.set(p, c);
 
     let restored = 0;
     for (const [p, content] of target) {
@@ -196,13 +219,26 @@ export class CheckpointManager {
 
     const userText = this.checkpoints[idx].userText;
     this.checkpoints = this.checkpoints.slice(0, idx);
+    // Everything at/after idx is undone; if we went all the way back, the
+    // baseline has been applied to disk and is no longer pending.
+    if (idx === 0) {
+      this.baseline.clear();
+      this.baselineSkipped.clear();
+    }
     this.persist();
     return { restoredFiles: restored, skipped: [...skippedSet], userText, truncateLine };
   }
 
   clear(): void {
     this.checkpoints = [];
+    this.baseline.clear();
+    this.baselineSkipped.clear();
     this.persist();
+  }
+
+  /** Force any debounced snapshot write to disk (window closing / disposal). */
+  flush(): void {
+    if (this.persistTimer) this.persist();
   }
 
   private current(): Checkpoint | undefined {
@@ -224,11 +260,21 @@ export class CheckpointManager {
   }
 
   private load(): void {
+    this.checkpoints = [];
+    this.baseline = new Map();
+    this.baselineSkipped = new Set();
     try {
-      this.checkpoints = JSON.parse(fs.readFileSync(this.file(), "utf8"));
-      if (!Array.isArray(this.checkpoints)) this.checkpoints = [];
+      const raw = JSON.parse(fs.readFileSync(this.file(), "utf8"));
+      // Legacy files are a bare array; new ones carry the folded baseline too.
+      if (Array.isArray(raw)) {
+        this.checkpoints = raw;
+      } else if (raw && Array.isArray(raw.checkpoints)) {
+        this.checkpoints = raw.checkpoints;
+        for (const [p, c] of raw.baseline ?? []) this.baseline.set(p, c);
+        for (const s of raw.baselineSkipped ?? []) this.baselineSkipped.add(s);
+      }
     } catch {
-      this.checkpoints = [];
+      /* absent/corrupt — start clean */
     }
   }
 
@@ -250,7 +296,12 @@ export class CheckpointManager {
     }
     try {
       fs.mkdirSync(this.storageDir, { recursive: true });
-      fs.writeFileSync(this.file(), JSON.stringify(this.checkpoints), "utf8");
+      const payload = {
+        checkpoints: this.checkpoints,
+        baseline: [...this.baseline],
+        baselineSkipped: [...this.baselineSkipped],
+      };
+      fs.writeFileSync(this.file(), JSON.stringify(payload), "utf8");
     } catch {
       /* ignore persistence failure */
     }

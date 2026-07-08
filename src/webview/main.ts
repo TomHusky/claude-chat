@@ -611,6 +611,13 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   switch (m.kind) {
     case "session":
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
+      // The CLI reports the mode its process actually runs in — trust it over
+      // our local guess, so the picker can never claim "Auto" while the
+      // process is really asking for every permission.
+      if (m.permissionMode && m.permissionMode !== currentMode) {
+        currentMode = m.permissionMode;
+        syncPickers();
+      }
       // Persist the tab↔session binding so a window reload restores THIS tab to
       // THIS conversation (and never two tabs onto one session = two processes).
       if (m.sessionId) vscode.setState({ sessionId: m.sessionId });
@@ -2086,6 +2093,8 @@ function syncPickers() {
   const model = MODELS.find((x) => x.id === currentModel) || MODELS[0];
   modelLabel.textContent = model.label;
 }
+
+syncPickers(); // paint the real labels immediately (host `config` refines them)
 
 function closePickers() {
   modeMenu.classList.add("hidden");

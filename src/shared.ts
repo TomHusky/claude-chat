@@ -33,7 +33,9 @@ export const ICONS: Record<string, string> = {
 // ---- Extension host -> webview --------------------------------------------
 
 export type ToWebview =
-  | { kind: "session"; sessionId: string; model: string; cwd: string; tools: string[]; resumed?: boolean }
+  /** `permissionMode` is the mode the CLI process ACTUALLY runs in (from its
+   *  init event) — the picker syncs to this, never to a local guess. */
+  | { kind: "session"; sessionId: string; model: string; cwd: string; tools: string[]; resumed?: boolean; permissionMode?: string }
   | { kind: "busy"; busy: boolean }
   | { kind: "status"; label: string }
   | { kind: "block_start"; blockType: "text" | "thinking" | "tool_use"; toolId?: string; toolName?: string }

@@ -440,6 +440,9 @@ export class ClaudeProcess {
         cwd: ev.cwd,
         tools: ev.tools ?? [],
         resumed,
+        // Ground truth from the CLI — a resumed session may run a different
+        // mode than our local setting, and the picker must show what's real.
+        permissionMode: (ev as any).permissionMode,
       });
     } else if ((ev as any).subtype === "status") {
       const status = (ev as any).status;

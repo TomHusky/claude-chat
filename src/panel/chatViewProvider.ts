@@ -813,14 +813,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctx.proc.respondPermission(requestId, { behavior, suggestionId });
   }
 
+  /** Write a setting to the scope that actually WINS for `get()`. A plain
+   *  Global update is silently shadowed by a Workspace/Folder value, so the
+   *  picker would appear to change while every new process kept the old value. */
+  private async updateConfig(key: string, value: unknown): Promise<void> {
+    const insp = this.config().inspect(key);
+    const target =
+      insp?.workspaceFolderValue !== undefined
+        ? vscode.ConfigurationTarget.WorkspaceFolder
+        : insp?.workspaceValue !== undefined
+          ? vscode.ConfigurationTarget.Workspace
+          : vscode.ConfigurationTarget.Global;
+    await this.config().update(key, value, target);
+  }
+
+  /** Every live process (all tabs + background runs) — the settings below are
+   *  global, so applying them to only the current tab left other tabs on the
+   *  old mode, still asking for permissions the user thought they'd disabled. */
+  private allProcs(): ClaudeProcess[] {
+    const out: ClaudeProcess[] = [];
+    for (const c of this.sessions) if (c.proc) out.push(c.proc);
+    for (const c of this.detached.values()) if (c.proc) out.push(c.proc);
+    return out;
+  }
+
   private async setPermissionMode(ctx: SessionCtx, mode: string): Promise<void> {
-    await this.config().update("permissionMode", mode, vscode.ConfigurationTarget.Global);
-    await ctx.proc?.setPermissionMode(mode);
-    // No chat notice — the picker label already reflects the change.
+    await this.updateConfig("permissionMode", mode);
+    // Apply to every running process, not just this tab's.
+    await Promise.all(this.allProcs().map((p) => p.setPermissionMode(mode)));
+    // Keep every open picker in sync with the new global setting.
+    const cfg: ToWebview = {
+      kind: "config",
+      permissionMode: mode,
+      model: this.config().get<string>("model", ""),
+      effort: this.config().get<string>("effort", ""),
+    };
+    for (const c of this.sessions) this.post(c, cfg);
   }
 
   private async setModel(ctx: SessionCtx, model: string): Promise<void> {
-    await this.config().update("model", model, vscode.ConfigurationTarget.Global);
+    await this.updateConfig("model", model);
     // Model is a spawn argument; restart the process so it applies. Context is
     // preserved because the next send resumes the same session id.
     if (ctx.proc) {
@@ -832,7 +864,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async setEffort(ctx: SessionCtx, effort: string): Promise<void> {
-    await this.config().update("effort", effort, vscode.ConfigurationTarget.Global);
+    await this.updateConfig("effort", effort);
     // Effort is also a spawn argument — restart so it applies on the next message.
     if (ctx.proc) {
       ctx.proc.dispose();
@@ -1841,7 +1873,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div class="composer-bottom">
           <button id="btn-attach-file" class="composer-btn" title="附加文件/目录到会话">${ICONS.attach}</button>
           <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
-          <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji">⚡</span><span id="mode-label">Auto</span></button>
+          <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji"></span><span id="mode-label"></span></button>
           <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
           <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>
           <div class="spacer"></div>

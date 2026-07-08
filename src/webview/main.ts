@@ -142,6 +142,11 @@ let liveBlock: LiveBlock | null = null;
 let typewriterRAF = 0;
 let pinnedToBottom = true;
 let isBusy = false;
+/** Subscription quota spent: sending is blocked until the window resets.
+ *  Declared up here (not next to its handlers) because `refreshComposerHint()`
+ *  reads it and runs during module init — a later `let` would be a TDZ crash. */
+let rateLimited = false;
+let rlUnlockTimer = 0;
 let lastUserEl: HTMLElement | null = null;
 let userMsgCount = 0;
 const toolCards = new Map<string, HTMLElement>();
@@ -694,6 +699,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       messagesEl.appendChild(renderCompactionDivider(m.preTokens, m.postTokens));
       scrollToBottom();
       updateContextGauge(m.postTokens, lastCtxTotal);
+      break;
+    case "rate_limit":
+      renderRateLimit(m);
+      break;
+    case "rate_limit_cleared":
+      clearRateLimit();
       break;
     case "error":
       setGlow("error");
@@ -1755,6 +1766,14 @@ function clearComposer() {
 function doSend() {
   const payload = readComposer();
   if (!payload) return;
+  // Quota spent — bail BEFORE clearComposer() so the user doesn't lose what
+  // they typed. The banner already explains why nothing happened.
+  if (rateLimited) {
+    // Nudge the banner into view. Guarded: an exception here would abort doSend.
+    const b = messagesEl.querySelector(".rate-limit-banner.exhausted");
+    if (b && typeof b.scrollIntoView === "function") b.scrollIntoView({ block: "nearest" });
+    return;
+  }
   clearComposer();
   if (isBusy) {
     // A turn is running — queue this one to auto-run after the current finishes.
@@ -1874,6 +1893,14 @@ inputEl.addEventListener("input", () => {
  *  toggle send/stop buttons accordingly. */
 function refreshComposerHint() {
   const hasContent = inputEl.value.trim().length > 0 || pendingImages.length > 0;
+  if (rateLimited) {
+    // Blocked: no send, no queue. Keep the text — the quota will come back.
+    sendBtn.classList.add("hidden");
+    stopBtn.classList.add("hidden");
+    queueHint.classList.add("hidden");
+    inputEl.placeholder = "用量已达上限,等待额度恢复后才能继续发送";
+    return;
+  }
   if (isBusy) {
     stopBtn.classList.remove("hidden");
     sendBtn.classList.toggle("hidden", !hasContent); // clickable "add to queue" when there's content
@@ -2426,6 +2453,61 @@ function appendNotice(text: string, kind: "info" | "error") {
   scrollToBottom();
 }
 
+/** Subscription quota banner. `exhausted` is blocking — the composer is locked
+ *  until the window resets, so it must be impossible to miss (unlike a notice
+ *  the user can scroll past). */
+function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
+  const exhausted = m.level === "exhausted";
+  messagesEl.querySelector(".rate-limit-banner")?.remove(); // never stack banners
+
+  const box = el("div", `rate-limit-banner ${exhausted ? "exhausted" : "warning"}`);
+  const head = el("div", "rl-head");
+  head.append(
+    el("span", "rl-ico", exhausted ? "⛔" : "⚠"),
+    el("b", "rl-title", exhausted ? `${m.limitLabel}已用尽` : `${m.limitLabel}即将用尽`),
+  );
+  const cd = resetCountdown(m.resetsAt);
+  const when = m.resetsAt ? new Date(m.resetsAt * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  const body = el(
+    "div",
+    "rl-body",
+    exhausted
+      ? `已达到订阅限额,暂时无法继续对话。${when ? `将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
+      : `接近订阅限额。${when ? `${when} 重置${cd ? `(${cd})` : ""}。` : ""}`,
+  );
+  box.append(head, body);
+  messagesEl.appendChild(box);
+  scrollToBottom();
+
+  if (exhausted) {
+    rateLimited = true;
+    setGlow("error");
+    setBusy(false);
+    refreshComposerHint();
+    // The CLI only reports "cleared" from a live turn — but we just blocked
+    // sending, so no turn can ever run. Without this timer the user stays
+    // locked out forever. Unlock ourselves once the window is due to reset.
+    if (rlUnlockTimer) clearTimeout(rlUnlockTimer);
+    if (m.resetsAt) {
+      const ms = m.resetsAt * 1000 - Date.now() + 2000; // +2s slack
+      if (ms > 0 && ms < 2 ** 31 - 1) rlUnlockTimer = window.setTimeout(clearRateLimit, ms);
+      else if (ms <= 0) clearRateLimit(); // reset time already passed
+    }
+  }
+}
+
+function clearRateLimit() {
+  if (rlUnlockTimer) {
+    clearTimeout(rlUnlockTimer);
+    rlUnlockTimer = 0;
+  }
+  if (!rateLimited) return;
+  rateLimited = false;
+  messagesEl.querySelector(".rate-limit-banner.exhausted")?.remove();
+  setGlow("idle");
+  refreshComposerHint();
+}
+
 function addContextChip(label: string, text: string) {
   if (pendingContexts.some((c) => c.label === label)) return;
   pendingContexts.push({ label, text });
@@ -2465,14 +2547,20 @@ function setGlow(state: GlowState) {
   if (state !== "idle") appEl.classList.add(`glow-${state}`);
 }
 
-// The green "done" halo is an unread marker: it breathes until the user returns
-// to the composer. Focusing or typing IS that acknowledgement. `running` /
-// `waiting` / `error` are live state, so they must NOT be cleared this way.
-const ackDone = () => {
-  if (glowState === "done") setGlow("idle");
+// `done` (green) and `error` (red) are unread markers: they breathe until the
+// user returns to the composer. Focusing, clicking or typing IS that
+// acknowledgement. `running` / `waiting` stay — they're live state.
+const ackGlow = () => {
+  // A rate-limit block is ONGOING, not a past event — its red rim must survive
+  // until the quota resets. `running`/`waiting` are live state for the same reason.
+  if (rateLimited) return;
+  if (glowState === "done" || glowState === "error") setGlow("idle");
 };
-inputEl.addEventListener("focus", ackDone);
-inputEl.addEventListener("input", ackDone); // caret already inside, just typing
+inputEl.addEventListener("focus", ackGlow);
+inputEl.addEventListener("input", ackGlow); // typing counts as acknowledgement
+// `focus` never fires when the box is ALREADY focused (the common case: the user
+// hit Enter and never clicked away). Clicking it must still dismiss the marker.
+inputEl.addEventListener("mousedown", ackGlow);
 
 function setBusy(busy: boolean) {
   isBusy = busy;

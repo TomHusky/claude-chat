@@ -714,6 +714,31 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .notice.info { background: rgba(128,128,128,.12); color: var(--vscode-descriptionForeground); }
 .notice.error { background: var(--vscode-inputValidation-errorBackground, rgba(241,76,76,.15)); color: var(--vscode-errorForeground); border: 1px solid var(--vscode-errorForeground); }
 
+/* ---- Subscription quota banner. `exhausted` blocks sending, so it must read
+   as a wall, not as one more scrollable notice. ---- */
+.rate-limit-banner {
+  margin: 8px 2px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.rate-limit-banner .rl-head { display: flex; align-items: center; gap: 7px; }
+.rate-limit-banner .rl-ico { font-size: 14px; line-height: 1; }
+.rate-limit-banner .rl-title { font-weight: 600; }
+.rate-limit-banner .rl-body { margin-top: 4px; opacity: .85; }
+.rate-limit-banner.warning {
+  border-color: rgba(234, 179, 8, .55);
+  background: rgba(234, 179, 8, .10);
+  color: var(--vscode-foreground);
+}
+.rate-limit-banner.exhausted {
+  border-color: var(--vscode-errorForeground, #f14c4c);
+  background: var(--vscode-inputValidation-errorBackground, rgba(241, 76, 76, .13));
+  color: var(--vscode-foreground);
+}
+
 /* ---- Inline restore points (checkpoint dividers) ---- */
 .checkpoint-divider {
   display: flex;

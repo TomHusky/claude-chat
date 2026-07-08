@@ -135,9 +135,22 @@ export type ContentDelta =
   | { type: "input_json_delta"; partial_json: string }
   | { type: "signature_delta"; signature: string };
 
+/** Pushed by the CLI after each API response for subscription accounts.
+ *  `status` mirrors the CLI's own severity split:
+ *    allowed          → fine
+ *    warning / allowed_warning → approaching the cap
+ *    rejected / exhausted      → the cap is hit; the turn cannot run */
 export interface RateLimitEvent {
   type: "rate_limit_event";
-  rate_limit_info: Record<string, unknown>;
+  rate_limit_info: {
+    status?: "allowed" | "allowed_warning" | "warning" | "rejected" | "exhausted";
+    /** Unix SECONDS at which this window resets. */
+    resetsAt?: number;
+    rateLimitType?: "five_hour" | "seven_day" | string;
+    /** 0..1 — only present on some statuses. */
+    utilization?: number;
+    [k: string]: unknown;
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import {
   isCanUseTool,
   OutEvent,
   PermissionDecision,
+  RateLimitEvent,
   ResultEvent,
   StreamEvent,
   SystemInitEvent,
@@ -396,9 +397,43 @@ export class ClaudeProcess {
       case "result":
         this.handleResult(ev as ResultEvent);
         return;
+      case "rate_limit_event":
+        this.handleRateLimit(ev as unknown as RateLimitEvent);
+        return;
       default:
-        return; // rate_limit_event and friends are ignored for now
+        return;
     }
+  }
+
+  /** The CLI pushes this after every API response on subscription accounts.
+   *  It is the ONLY signal that the quota is spent — surface it, don't drop it. */
+  private lastRateLimitLevel?: "warning" | "exhausted";
+  private handleRateLimit(ev: RateLimitEvent): void {
+    const info = ev.rate_limit_info ?? {};
+    const status = info.status;
+    let level: "warning" | "exhausted" | undefined;
+    if (status === "rejected" || status === "exhausted") level = "exhausted";
+    else if (status === "warning" || status === "allowed_warning") level = "warning";
+
+    if (!level) {
+      // Back under the cap (the window reset). Tell the UI so it unlocks the
+      // composer — otherwise the user stays blocked forever.
+      if (this.lastRateLimitLevel === "exhausted") {
+        this.hooks.emit({ kind: "rate_limit_cleared" });
+      }
+      this.lastRateLimitLevel = undefined;
+      return;
+    }
+    // Fires on every turn — only announce a change, or the chat fills with dupes.
+    if (this.lastRateLimitLevel === level) return;
+    this.lastRateLimitLevel = level;
+
+    this.hooks.emit({
+      kind: "rate_limit",
+      level,
+      limitLabel: info.rateLimitType === "seven_day" ? "每周用量" : "5 小时用量",
+      resetsAt: typeof info.resetsAt === "number" ? info.resetsAt : undefined,
+    });
   }
 
   private handleControlRequest(ev: ControlRequest): void {

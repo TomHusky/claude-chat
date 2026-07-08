@@ -24,6 +24,10 @@ html, body {
   position: relative;
 }
 
+/* ---- Composer glow: a breathing halo around the input box. The user's eyes
+   already live here while typing, so it's the most natural feedback surface.
+   Only box-shadow/border-color animate; nothing moves, so no layout thrash. ---- */
+
 /* ---- Toolbar ---- */
 #toolbar {
   display: flex;
@@ -911,6 +915,73 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
   padding: 6px 8px 6px;
 }
 .input-wrap:focus-within { border-color: var(--vscode-focusBorder); }
+
+/* --- Breathing status glow on the composer (state class lives on #app) ---
+   Two stacked shadows: a tight rim that reads as a coloured border, and a wide
+   soft halo that bleeds outward. Both scale with the breath. */
+#app[class*="glow-"] .input-wrap {
+  --c: 224, 118, 47;
+  border-color: rgba(var(--c), .8);
+  will-change: box-shadow;
+}
+/* The focus ring must not override the status colour while a turn is live. */
+#app[class*="glow-"] .input-wrap:focus-within { border-color: rgba(var(--c), .95); }
+
+#app.glow-running .input-wrap { --c: 224, 118, 47; animation: composer-breathe 3.2s ease-in-out infinite; }
+#app.glow-waiting .input-wrap { --c: 234, 179, 8;  animation: composer-breathe 1.8s ease-in-out infinite; }
+/* error: pulse a few times to catch the eye, then hold steady — a border that
+   flashes forever is harassment, not a notification. */
+#app.glow-error .input-wrap {
+  --c: 217, 83, 79;
+  animation: composer-breathe 2.1s ease-in-out 4, composer-settle .4s ease-out 8.4s forwards;
+}
+/* done: breathes like `running`, and stays until the user focuses the composer
+   (i.e. acknowledges it) — see setGlow()'s focus handler. */
+#app.glow-done .input-wrap { --c: 63, 164, 91; animation: composer-breathe 3.2s ease-in-out infinite; }
+
+/* Feathered halo: five shadows with growing blur and falling alpha. A single
+   wide shadow has a visible outer edge where it stops; stacking them makes the
+   falloff continuous. All keyframes must use the SAME layer count, or the
+   browser can't interpolate between them. */
+@keyframes composer-breathe {
+  0%, 100% {
+    box-shadow:
+      0 0 0 1px rgba(var(--c), .20),
+      0 0 4px 0 rgba(var(--c), .14),
+      0 0 10px 0 rgba(var(--c), .09),
+      0 0 20px 2px rgba(var(--c), .05),
+      0 0 38px 8px rgba(var(--c), .02);
+  }
+  50% {
+    box-shadow:
+      0 0 0 1.5px rgba(var(--c), .55),
+      0 0 6px 0 rgba(var(--c), .36),
+      0 0 16px 1px rgba(var(--c), .24),
+      0 0 32px 4px rgba(var(--c), .14),
+      0 0 60px 14px rgba(var(--c), .06);
+  }
+}
+@keyframes composer-settle {
+  to {
+    box-shadow:
+      0 0 0 1.5px rgba(var(--c), .50),
+      0 0 6px 0 rgba(var(--c), .30),
+      0 0 15px 1px rgba(var(--c), .20),
+      0 0 28px 3px rgba(var(--c), .11),
+      0 0 52px 11px rgba(var(--c), .05);
+  }
+}
+/* Respect the OS "reduce motion" setting: keep the colour, drop the pulsing. */
+@media (prefers-reduced-motion: reduce) {
+  #app[class*="glow-"] .input-wrap {
+    animation: none;
+    box-shadow:
+      0 0 0 1.5px rgba(var(--c), .5),
+      0 0 6px 0 rgba(var(--c), .28),
+      0 0 16px 1px rgba(var(--c), .16),
+      0 0 32px 4px rgba(var(--c), .08);
+  }
+}
 #input {
   resize: none;
   background: transparent;

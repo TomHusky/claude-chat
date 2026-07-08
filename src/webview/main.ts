@@ -662,12 +662,17 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       setToolResult(m.toolUseId, m.content, m.isError);
       break;
     case "permission_request":
+      setGlow("waiting"); // parked on the user — the rim pulses faster
       attachPermission(m);
       break;
     case "permission_resolved":
+      if (isBusy) setGlow("running"); // answered — back to work
       resolvePermission(m.requestId, m.behavior);
       break;
     case "result":
+      // A turn the user cancelled is not a failure: no red rim.
+      if (userStopped) setGlow("idle");
+      else setGlow(m.isError ? "error" : "done");
       finalizeTurn();
       if (m.numTurns != null) {
         statusLine.textContent = `完成 · ${m.numTurns} 轮`;
@@ -678,6 +683,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "compacting":
       compacting = true;
+      setGlow("running");
       ctxGauge.classList.add("compacting");
       showWorking("正在压缩上下文…");
       break;
@@ -690,6 +696,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       updateContextGauge(m.postTokens, lastCtxTotal);
       break;
     case "error":
+      setGlow("error");
       finalizeTurn();
       // A fatal error may arrive with no busy:false (spawn failures kill the
       // proc before it ever reports); release the composer or it's stuck forever.
@@ -1761,6 +1768,7 @@ function doSend() {
 /** Actually start a turn from a payload (used for live sends and queued ones). */
 function performSend(p: QueueItem) {
   queuePaused = false; // a manual send re-arms the queue after a Stop
+  setGlow("running"); // immediate — don't wait for the host's busy event
   // NOTE: stoppingView is NOT cleared here. The stopped turn's deltas may still
   // be in flight; clearing the gate now would append them to this new bubble.
   // Only `setBusy(true)` — which the host always emits before the new turn's
@@ -1826,6 +1834,7 @@ sendBtn.onclick = doSend;
 let userStopped = false; // user hit Stop — append an interrupted marker on finalize
 stopBtn.onclick = () => {
   userStopped = true;
+  setGlow("idle"); // deliberate cancel — not a failure
   queuePaused = true; // halt the queue too — Stop shouldn't auto-fire the next task
   // Drop everything still in flight for this turn: deltas buffered in the pipe
   // (or a slow interrupt) would otherwise keep "typing" after the button
@@ -2436,8 +2445,41 @@ function clearContextChips() {
   contextChips.innerHTML = "";
 }
 
+/** Composer status glow: a breathing halo around the input box. */
+type GlowState = "idle" | "running" | "waiting" | "done" | "error";
+const appEl = $("app");
+let glowState: GlowState = "idle";
+
+/** Is the user's caret actually sitting in the composer right now? */
+function composerFocused(): boolean {
+  return document.hasFocus() && document.activeElement === inputEl;
+}
+
+function setGlow(state: GlowState) {
+  // Finishing while the user is already typing in the box needs no marker —
+  // and `focus` wouldn't fire again, so the halo could never be dismissed.
+  if (state === "done" && composerFocused()) state = "idle";
+  if (glowState === state) return;
+  glowState = state;
+  appEl.classList.remove("glow-running", "glow-waiting", "glow-done", "glow-error");
+  if (state !== "idle") appEl.classList.add(`glow-${state}`);
+}
+
+// The green "done" halo is an unread marker: it breathes until the user returns
+// to the composer. Focusing or typing IS that acknowledgement. `running` /
+// `waiting` / `error` are live state, so they must NOT be cleared this way.
+const ackDone = () => {
+  if (glowState === "done") setGlow("idle");
+};
+inputEl.addEventListener("focus", ackDone);
+inputEl.addEventListener("input", ackDone); // caret already inside, just typing
+
 function setBusy(busy: boolean) {
   isBusy = busy;
+  // Only light UP here. Turning the glow off is the job of whoever ends the turn
+  // (`result` / `error` / Stop), which knows WHY it ended — `setBusy(false)`
+  // fires on all of them and would otherwise erase the red/green rim instantly.
+  if (busy && glowState !== "waiting") setGlow("running");
   if (busy) stoppingView = false; // a new turn is live — resume rendering
   refreshComposerHint(); // toggles send/stop + the "加入等待队列" hint
   if (busy) {

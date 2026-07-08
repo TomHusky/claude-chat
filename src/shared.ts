@@ -147,7 +147,7 @@ export type FromWebview =
   | { type: "checkUpdate" }
   | { type: "refreshUsage" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
-  | { type: "editMessage"; checkpointId: string; text: string }
+  | { type: "editMessage"; checkpointId: string; text: string; images?: { mediaType: string; data: string }[] }
   | { type: "interrupt" }
   | { type: "compact" }
   | { type: "permission"; requestId: string; behavior: "allow" | "deny"; suggestionId?: string }

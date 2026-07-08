@@ -2312,11 +2312,20 @@ function regenerate(aEl: HTMLElement) {
   const userMsg = precedingUserMsg(aEl);
   if (!userMsg) return;
   const raw = userMsg.dataset.rawText || "";
-  if (!raw) return;
+  // Image-only messages have no text but are still regenerable.
+  if (!raw && !userMsg.querySelector(".msg-images img")) return;
   submitEdit(userMsg, userMsg.dataset.checkpointId || "", raw);
 }
 
 function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
+  // Carry the original message's images through the edit/regenerate — dropping
+  // them corrupted the visible history AND resent the turn without the image.
+  const imageUris = Array.from(msg.querySelectorAll<HTMLImageElement>(".msg-images img")).map((i) => i.src);
+  const images: { mediaType: string; data: string }[] = [];
+  for (const uri of imageUris) {
+    const m = /^data:([^;]+);base64,(.*)$/.exec(uri);
+    if (m) images.push({ mediaType: m[1], data: m[2] });
+  }
   // Remove this message's checkpoint divider (the one just above it), the
   // message itself, and everything after it.
   const prev = msg.previousElementSibling;
@@ -2333,7 +2342,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   liveBlock = null;
   toolCards.clear();
   userMsgCount = messagesEl.querySelectorAll(".msg.user").length;
-  appendUser(newText);
+  appendUser(newText, [], imageUris);
   finalizeTurn();
   // Enter busy state like performSend — the host rewinds + respawns before the
   // real busy:true arrives; without this the stop button is missing and a
@@ -2347,7 +2356,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   stoppingView = false;
   refreshComposerHint();
   showWorking();
-  send({ type: "editMessage", checkpointId, text: newText });
+  send({ type: "editMessage", checkpointId, text: newText, images: images.length ? images : undefined });
 }
 
 /** An image thumbnail that opens the lightbox on click. */

@@ -558,7 +558,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.handleSend(ctx, m.text, m.context, m.images, m.files);
           break;
         case "editMessage":
-          await this.editMessage(ctx, m.checkpointId, m.text);
+          await this.editMessage(ctx, m.checkpointId, m.text, m.images);
           break;
         case "interrupt":
           ctx.pendingPerm = undefined;
@@ -762,7 +762,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * (revert files + truncate transcript), then resend the new text as the turn.
    * The webview has already trimmed its own view, so we don't reload history.
    */
-  private async editMessage(ctx: SessionCtx, checkpointId: string, text: string): Promise<void> {
+  private async editMessage(
+    ctx: SessionCtx,
+    checkpointId: string,
+    text: string,
+    images?: { mediaType: string; data: string }[],
+  ): Promise<void> {
     if (checkpointId) {
       const res = ctx.checkpoints.restore(checkpointId);
       if (res) {
@@ -784,7 +789,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.refreshChangedFiles(ctx);
       }
     }
-    await this.handleSend(ctx, text);
+    await this.handleSend(ctx, text, undefined, images);
   }
 
   /** Save a chat image (data URI) to disk via the native save dialog. */

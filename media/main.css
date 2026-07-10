@@ -464,10 +464,33 @@ code.code-ref:hover { text-decoration: none; border-bottom: 1px solid currentCol
 .tool-why.warn { background: #d9a23e; }
 .tool-why:empty { display: none; }
 /* answered AskUserQuestion summary (history) */
-.askq-summary { display: flex; flex-direction: column; gap: 4px; padding: 4px 2px; }
-.askq-row { display: flex; gap: 8px; font-size: 12px; }
-.askq-q { flex: 0 0 auto; max-width: 45%; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.askq-a { flex: 1; min-width: 0; font-weight: 600; }
+/* Scoped to .askq-card so other tool cards keep the plain title colour.
+   Violet (~255°) deliberately: orange/yellow/green/red are already taken by the
+   composer's run/wait/done/fail states, and reusing one here would dilute them.
+   NOTE: VS Code puts `vscode-dark` / `vscode-light` / `vscode-high-contrast*` on
+   <body> (verified in a live webview). `prefers-color-scheme` does NOT follow
+   the VS Code theme — do not use it here. */
+.askq-card .tool-name { color: #6b4fbb; } /* light themes — 5.5:1 on #fff */
+body.vscode-dark .askq-card .tool-name,
+body.vscode-high-contrast .askq-card .tool-name { color: #a78bfa; } /* 5.6:1 on #1f1f1f */
+.askq-summary { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+/* Question above, answer below — questions are long sentences and were being
+   truncated to a useless fragment when both shared one line. */
+.askq-row { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.askq-q {
+  color: var(--vscode-descriptionForeground);
+  line-height: 1.5;
+  white-space: pre-wrap; /* wrap freely; keep any newlines the model wrote */
+  overflow-wrap: anywhere;
+}
+.askq-a {
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-left: 9px;
+  border-left: 2px solid rgba(139, 122, 216, .5); /* ties the answer to the title hue */
+}
 .askq-skip { font-size: 12px; color: var(--vscode-descriptionForeground); padding: 2px; }
 /* user-stopped marker at the end of an AI reply */
 .msg-interrupted {

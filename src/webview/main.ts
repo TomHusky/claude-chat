@@ -1116,6 +1116,36 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   wrap.append(card);
 
   const answered = (qi: number) => sel[qi].size > 0 || custom[qi].trim().length > 0;
+
+  /** Move to the next question. `delay` lets the ✓ feedback land before the flip.
+   *  `submitOnLast` — only Enter does this; clicking an option on the last page
+   *  leaves it up so the user can still revise earlier answers. */
+  const advance = (from: number, delay: number, submitOnLast = false) => {
+    if (from < questions.length - 1) {
+      setTimeout(() => {
+        if (!done && cur === from) {
+          cur = from + 1;
+          paint();
+        }
+      }, delay);
+    } else if (submitOnLast) {
+      setTimeout(() => {
+        if (done || cur !== from) return;
+        if (!submit.disabled) {
+          submit.click();
+          return;
+        }
+        // Some earlier question is still unanswered — jump to the first one
+        // instead of silently doing nothing.
+        const gap = questions.findIndex((_, qi) => !answered(qi));
+        if (gap >= 0) {
+          cur = gap;
+          paint();
+        }
+      }, delay);
+    }
+  };
+
   const updateFoot = () => {
     const multi = questions.length > 1;
     pager.style.display = multi ? "" : "none";
@@ -1160,17 +1190,8 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
           customInput.value = "";
           customRow.classList.remove("on");
           updateFoot();
-          // Single-select: auto-advance to the next question after a brief beat
-          // (so the ✓ feedback is visible). Last question stays for manual submit.
-          const from = cur;
-          if (from < questions.length - 1) {
-            setTimeout(() => {
-              if (!done && cur === from) {
-                cur = from + 1;
-                paint();
-              }
-            }, 320);
-          }
+          // Single-select: auto-advance after a brief beat so the ✓ is visible.
+          advance(cur, 320);
         }
       };
       rows.push(row);
@@ -1192,6 +1213,15 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
       }
       customRow.classList.toggle("on", customInput.value.trim().length > 0);
       updateFoot();
+    };
+    customInput.onkeydown = (e) => {
+      // Never let Enter/Escape reach the chat composer behind this picker.
+      e.stopPropagation();
+      if (e.key !== "Enter" || e.isComposing || (e as KeyboardEvent).keyCode === 229) return;
+      e.preventDefault();
+      if (!customInput.value.trim()) return; // empty answer: nothing to confirm
+      // Enter = "I'm done with this question" → next page, or submit on the last.
+      advance(cur, 120, true);
     };
     customRow.append(customInput);
     optsBox.append(customRow);
@@ -1786,7 +1816,6 @@ function doSend() {
 
 /** Actually start a turn from a payload (used for live sends and queued ones). */
 function performSend(p: QueueItem) {
-  queuePaused = false; // a manual send re-arms the queue after a Stop
   setGlow("running"); // immediate — don't wait for the host's busy event
   // NOTE: stoppingView is NOT cleared here. The stopped turn's deltas may still
   // be in flight; clearing the gate now would append them to this new bubble.
@@ -1813,14 +1842,15 @@ function performSend(p: QueueItem) {
 
 /** When the current turn ends, auto-run the next queued task (if any). */
 function flushQueue() {
-  // Stop means STOP: don't auto-launch the next queued prompt 150ms after the
-  // user halted the current one. The queue resumes on their next manual send.
-  if (queuePaused || isBusy || !taskQueue.length) return;
+  // Runs after every turn ends — including one the user stopped. Stopping while
+  // tasks are queued means "skip this reply, get on with my queue", so the queue
+  // must keep draining. (An empty queue makes this a no-op anyway, which is what
+  // a plain "I want it to stop" Stop looks like.)
+  if (isBusy || !taskQueue.length) return;
   const next = taskQueue.shift()!;
   renderQueue();
   performSend(next);
 }
-let queuePaused = false;
 
 function renderQueue() {
   if (!taskQueue.length) {
@@ -1854,7 +1884,6 @@ let userStopped = false; // user hit Stop — append an interrupted marker on fi
 stopBtn.onclick = () => {
   userStopped = true;
   setGlow("idle"); // deliberate cancel — not a failure
-  queuePaused = true; // halt the queue too — Stop shouldn't auto-fire the next task
   // Drop everything still in flight for this turn: deltas buffered in the pipe
   // (or a slow interrupt) would otherwise keep "typing" after the button
   // already flipped — the classic "stopped but still replying" bug.
@@ -2431,7 +2460,6 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   msgTokenBase = 0;
   lastMsgTokens = 0;
   isBusy = true;
-  queuePaused = false;
   // stoppingView stays as-is — see performSend; `setBusy(true)` reopens the gate.
   refreshComposerHint();
   showWorking();

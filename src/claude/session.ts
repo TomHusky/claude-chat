@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CTX_OPEN, CTX_CLOSE, SessionSummary, TimelineItem } from "../shared";
+import { CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, SessionSummary, TimelineItem } from "../shared";
 
 /**
  * Reads Claude Code's own on-disk session transcripts so we can list past
@@ -156,7 +156,7 @@ export class SessionStore {
           }
         }
         if (this.isRealUserText(o) || images.length) {
-          const { text, files } = splitAttachedContext(this.userText(o));
+          const { text, files, sls } = splitAttachedContext(this.userText(o));
           // Skip pure IDE-context injections (no real text, no images).
           if (text || images.length) {
             items.push({
@@ -164,13 +164,14 @@ export class SessionStore {
               text,
               files: files.length ? files : undefined,
               images: images.length ? images : undefined,
+              sls: sls || undefined,
             });
           }
         }
       } else if (o.type === "user" && typeof o.message?.content === "string") {
         if (this.isRealUserText(o)) {
-          const { text, files } = splitAttachedContext(o.message.content);
-          if (text) items.push({ type: "user", text, files: files.length ? files : undefined });
+          const { text, files, sls } = splitAttachedContext(o.message.content);
+          if (text) items.push({ type: "user", text, files: files.length ? files : undefined, sls: sls || undefined });
         }
       } else if (o.type === "assistant" && Array.isArray(o.message?.content)) {
         for (const b of o.message.content) {
@@ -371,8 +372,19 @@ export class SessionStore {
  * (new messages) — for older messages we fall back to the leading phrase. Only
  * file/dir names are surfaced (as chips); the embedded contents are dropped.
  */
-function splitAttachedContext(raw: string): { text: string; files: string[] } {
-  if (!raw) return { text: "", files: [] };
+function splitAttachedContext(raw: string): { text: string; files: string[]; sls: boolean } {
+  if (!raw) return { text: "", files: [], sls: false };
+  // Strip the SLS log-tool snippet (injected by the composer toggle) — surface it
+  // only as a flag/chip, never render its body.
+  let sls = false;
+  {
+    const o = raw.indexOf(SLS_CTX_OPEN);
+    const c = raw.indexOf(SLS_CTX_CLOSE);
+    if (o !== -1 && c !== -1 && c > o) {
+      sls = true;
+      raw = (raw.slice(0, o) + raw.slice(c + SLS_CTX_CLOSE.length)).trim();
+    }
+  }
   const files: string[] = [];
   const seen = new Set<string>();
   const addFile = (p: string) => {
@@ -393,7 +405,7 @@ function splitAttachedContext(raw: string): { text: string; files: string[] } {
   raw = raw.replace(/<ide_[a-z_]+>[\s\S]*?<\/ide_[a-z_]+>/g, ""); // ide_selection, ide_diagnostics, …
   raw = raw.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "");
   raw = raw.trim();
-  if (!raw) return { text: "", files };
+  if (!raw) return { text: "", files, sls };
 
   let block = "";
   let text = raw;
@@ -408,14 +420,14 @@ function splitAttachedContext(raw: string): { text: string; files: string[] } {
     block = raw;
     text = "";
   } else {
-    return { text: raw, files };
+    return { text: raw, files, sls };
   }
   const re = /^(?:文件|目录) (.+?)(?:\/ 包含:|：|:|（|\(|$)/gm;
   let m: RegExpExecArray | null;
   while ((m = re.exec(block))) {
     if (m[1].trim()) addFile(m[1]);
   }
-  return { text, files };
+  return { text, files, sls };
 }
 
 /** Build a data: URI from an Anthropic image content block (base64 source). */

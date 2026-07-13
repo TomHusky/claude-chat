@@ -182,6 +182,13 @@ html, body {
   color: var(--vscode-badge-foreground);
   padding: 1px 6px; border-radius: 4px;
 }
+.ctx-chip.sls-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: rgba(255,255,255,.16);
+  color: var(--vscode-button-foreground, #fff);
+  border: 1px solid rgba(255,255,255,.28);
+}
+.ctx-chip.sls-chip svg { width: 11px; height: 11px; opacity: .95; }
 
 /* ---- Images (in messages) + lightbox ---- */
 .msg-images { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }

@@ -148,9 +148,15 @@ export function contextWindowFor(model?: string, used = 0): number {
 export const CTX_OPEN = "<user-attached-context>";
 export const CTX_CLOSE = "</user-attached-context>";
 
+/** Sentinels wrapping the SLS log-tool usage snippet injected when the composer's
+ *  「SLS日志」toggle is on. Stripped from the displayed text on reload; surfaced
+ *  only as a small chip on the user message. */
+export const SLS_CTX_OPEN = "<sls-log-context>";
+export const SLS_CTX_CLOSE = "</sls-log-context>";
+
 /** A persisted/rehydratable timeline item (used when reloading a session). */
 export type TimelineItem =
-  | { type: "user"; text: string; context?: string; images?: string[]; files?: string[] }
+  | { type: "user"; text: string; context?: string; images?: string[]; files?: string[]; sls?: boolean }
   | { type: "image"; src: string } // standalone image (assistant/tool), data: URI
   | { type: "assistant_text"; text: string }
   | { type: "thinking"; text: string }

@@ -1380,7 +1380,7 @@ function renderHistory(showAll: boolean) {
       finalizeTurn();
       const cp = cpByOrdinal.get(userOrdinal);
       if (cp && userOrdinal > 0) messagesEl.appendChild(renderCheckpointDivider(cp.id)); // no divider above the very first message
-      const m = appendUser(it.text, it.files || [], it.images || []);
+      const m = appendUser(it.text, it.files || [], it.images || [], it.sls);
       if (cp) m.dataset.checkpointId = cp.id; // link message -> checkpoint (for edit)
     } else if (it.type === "image") {
       const body = ensureAssistant();
@@ -1776,6 +1776,7 @@ interface QueueItem {
   files: string[];
   labels: string[];
   imageUris: string[];
+  sls: boolean;
 }
 const taskQueue: QueueItem[] = [];
 const taskQueueEl = $("task-queue");
@@ -1791,6 +1792,7 @@ function readComposer(): QueueItem | null {
     files: attachedFiles.map((f) => f.path),
     labels: [...pendingContexts.map((c) => c.label), ...attachedFiles.map((f) => baseName(f.path))],
     imageUris: pendingImages.map((p) => p.uri),
+    sls: slsOn,
   };
 }
 
@@ -1838,7 +1840,7 @@ function performSend(p: QueueItem) {
   // be in flight; clearing the gate now would append them to this new bubble.
   // Only `setBusy(true)` — which the host always emits before the new turn's
   // first stream event — reopens rendering.
-  appendUser(p.text, p.labels, p.imageUris);
+  appendUser(p.text, p.labels, p.imageUris, p.sls);
   finalizeTurn();
   turnTokens = 0; // reset token counters for the new turn
   turnEst = 0;
@@ -1854,7 +1856,7 @@ function performSend(p: QueueItem) {
     context: p.context,
     images: p.images.length ? p.images : undefined,
     files: p.files.length ? p.files : undefined,
-    sls: slsOn || undefined,
+    sls: p.sls || undefined,
   });
 }
 
@@ -2352,13 +2354,19 @@ messagesEl.addEventListener("click", (e) => {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-function appendUser(text: string, contextLabels: string[] = [], images: string[] = []) {
+function appendUser(text: string, contextLabels: string[] = [], images: string[] = [], sls = false) {
   messagesEl.querySelector(".empty-state")?.remove();
   const msg = el("div", "msg user");
   msg.dataset.rawText = text;
   const body = el("div", "msg-body");
-  if (contextLabels.length) {
+  if (contextLabels.length || sls) {
     const ctx = el("div", "user-context");
+    if (sls) {
+      const chip = el("span", "ctx-chip sls-chip");
+      chip.innerHTML =
+        '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M3 8c0 1.1 2.24 2 5 2s5-.9 5-2"/></svg><span>SLS 日志</span>';
+      ctx.appendChild(chip);
+    }
     for (const l of contextLabels) ctx.appendChild(el("span", "ctx-chip", l));
     body.appendChild(ctx);
   }

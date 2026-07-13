@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
-import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, SlsConfig, ToWebview } from "../shared";
+import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, SlsConfig, ToWebview } from "../shared";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
@@ -1003,9 +1003,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       attached = attached ? `${fileCtx}\n\n${attached}` : fileCtx;
     }
     // SLS 开关打开：把日志工具用法作为隐藏上下文随本条消息带上（不改系统提示，逐条生效）。
+    // 用专用标记包起来，重载会话时解析器会剥掉正文、只留一个「SLS日志」chip，不整段渲染。
     if (sls) {
       const snip = this.slsSystemPromptSnippet();
-      if (snip) attached = attached ? `${snip}\n\n${attached}` : snip;
+      if (snip) {
+        const block = `${SLS_CTX_OPEN}\n${snip}\n${SLS_CTX_CLOSE}`;
+        attached = attached ? `${block}\n\n${attached}` : block;
+      }
     }
     const proc = await this.ensureProcess(ctx);
     if (!proc) {

@@ -100,6 +100,13 @@ const messagesEl = $("messages");
 const inputEl = $<HTMLTextAreaElement>("input");
 const sendBtn = $<HTMLButtonElement>("btn-send");
 const stopBtn = $<HTMLButtonElement>("btn-stop");
+const slsToggleBtn = $<HTMLButtonElement>("sls-toggle-btn");
+let slsOn = false;
+function setSlsOn(on: boolean) {
+  slsOn = on;
+  slsToggleBtn.classList.toggle("on", on);
+}
+slsToggleBtn.onclick = () => setSlsOn(!slsOn);
 const queueHint = $("queue-hint");
 const PLACEHOLDER_IDLE = inputEl.placeholder;
 const PLACEHOLDER_BUSY = "任务进行中 · 回车将内容加入等待队列";
@@ -719,6 +726,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "notice":
       if (m.message) appendNotice(m.message, "info");
       break;
+    case "prefill":
+      inputEl.value = m.text;
+      autoResize();
+      inputEl.focus();
+      inputEl.dispatchEvent(new Event("input"));
+      break;
     case "load_history":
       loadHistory(m.items, m.title, m.checkpoints, m.sessionId);
       break;
@@ -737,6 +750,10 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       currentMode = m.permissionMode || "default";
       currentModel = m.model || "";
       currentEffort = m.effort || "";
+      if (m.slsConfigured !== undefined) {
+        slsToggleBtn.classList.toggle("hidden", !m.slsConfigured);
+        if (!m.slsConfigured) setSlsOn(false);
+      }
       syncPickers();
       break;
     case "context_added":
@@ -1837,6 +1854,7 @@ function performSend(p: QueueItem) {
     context: p.context,
     images: p.images.length ? p.images : undefined,
     files: p.files.length ? p.files : undefined,
+    sls: slsOn || undefined,
   });
 }
 

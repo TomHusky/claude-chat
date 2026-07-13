@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.164",
+  "version": "0.1.176",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -92,6 +92,11 @@
         "command": "claude-chat.open",
         "title": "Claude: 打开新会话",
         "icon": "media/icon.svg"
+      },
+      {
+        "command": "claude-chat.slsConfig",
+        "title": "Claude: SLS 日志配置",
+        "icon": "$(database)"
       }
     ],
     "menus": {
@@ -110,6 +115,11 @@
           "command": "claude-chat.checkUpdate",
           "when": "view == claude-chat.chatView",
           "group": "navigation@1"
+        },
+        {
+          "command": "claude-chat.slsConfig",
+          "when": "view == claude-chat.chatView",
+          "group": "navigation@2"
         }
       ],
       "editor/title": [
@@ -199,6 +209,11 @@
           "type": "string",
           "default": "",
           "description": "追加到系统提示的全局指令（对接 claude --append-system-prompt）。强制中文请填：IMPORTANT: 无论用户用什么语言提问，你都必须只用简体中文回复。（软指令如「请用中文」可能被英文提问盖过，需用这种强指令。）留空则只用 CLAUDE.md / settings 默认配置。"
+        },
+        "claudeChat.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "SLS 日志查询引擎首次初始化时使用的 python3 解释器路径。留空则用 PATH 里的 python3（用于创建 ~/sls-tools/venv 并安装 aliyun-log-python-sdk）。"
         }
       }
     }

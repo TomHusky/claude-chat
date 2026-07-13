@@ -28,7 +28,19 @@ export const ICONS: Record<string, string> = {
   update: _s('<path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/>'),
   thumbUp: _s('<g transform="translate(.5 .5) scale(.625)" stroke-width="2.2"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></g>'),
   thumbDown: _s('<g transform="translate(.5 .5) scale(.625)" stroke-width="2.2"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></g>'),
+  database: _s('<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M3 8c0 1.1 2.24 2 5 2s5-.9 5-2"/>'),
 };
+
+/** SLS 连接配置。持久化在 `~/sls-tools/config.json`，供 `sls` CLI 与本面板共用。
+ *  dev/pro 是两个独立的 SLS Project；logs 把每个业务项目映射到 info/error 两个
+ *  logstore（两环境共用同一份映射，环境只切 Project）。 */
+export interface SlsConfig {
+  endpoint: string;
+  accessKeyId: string;
+  accessKeySecret: string;
+  projects: { dev: string; pro: string };
+  logs: Record<string, { info?: string; error?: string }>;
+}
 
 // ---- Extension host -> webview --------------------------------------------
 
@@ -76,11 +88,20 @@ export type ToWebview =
   | { kind: "checkpoints"; list: CheckpointSummary[] }
   // A restore point was created for the turn just sent (live).
   | { kind: "checkpoint_marker"; checkpointId: string; userText: string }
-  | { kind: "config"; permissionMode: string; model: string; effort: string }
+  | { kind: "config"; permissionMode: string; model: string; effort: string; slsConfigured?: boolean }
   | { kind: "context_added"; label: string; text: string }
   | { kind: "active_file"; path: string | null }
   | { kind: "attach_files"; paths: string[] }
-  | { kind: "changed_files"; files: ChangedFile[]; totalAdded: number; totalRemoved: number };
+  | { kind: "changed_files"; files: ChangedFile[]; totalAdded: number; totalRemoved: number }
+  // ---- SLS 日志配置面板 ----
+  /** 打开配置抽屉并回填当前配置；enginePresent 表示查询引擎(venv)是否已就绪。 */
+  | { kind: "sls_open"; config: SlsConfig; enginePresent: boolean }
+  /** slsLoad 的应答，仅回填表单不弹开抽屉。 */
+  | { kind: "sls_config"; config: SlsConfig; enginePresent: boolean }
+  /** 测试连接/保存的结果反馈。stores 为拉取到的 logstore 列表（成功时）。 */
+  | { kind: "sls_result"; action: "test" | "save"; ok: boolean; message: string; stores?: string[] }
+  /** 把一段文本预填进聊天输入框（供“让 Claude 生成映射”一键塞入 prompt）。 */
+  | { kind: "prefill"; text: string };
 
 export interface ChangedFile {
   path: string; // absolute
@@ -152,7 +173,7 @@ export type FromWebview =
   | { type: "ready" }
   | { type: "checkUpdate" }
   | { type: "refreshUsage" }
-  | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[] }
+  | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[]; sls?: boolean }
   | { type: "editMessage"; checkpointId: string; text: string; images?: { mediaType: string; data: string }[] }
   | { type: "interrupt" }
   | { type: "compact" }
@@ -183,4 +204,10 @@ export type FromWebview =
   | { type: "validateRefs"; refs: { id: string; path: string }[] }
   | { type: "runInTerminal"; code: string }
   | { type: "copy"; text: string }
-  | { type: "saveImage"; dataUri: string };
+  | { type: "saveImage"; dataUri: string }
+  // ---- SLS 日志配置面板 ----
+  | { type: "slsLoad" }
+  | { type: "slsSave"; config: SlsConfig }
+  | { type: "slsTest"; config: SlsConfig }
+  /** 让 Claude 扫描工作区 Spring Boot 配置生成日志映射（预填 prompt 到聊天）。 */
+  | { type: "slsGenerate" };

@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
-import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, ToWebview } from "../shared";
+import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, FromWebview, ICONS, SlsConfig, ToWebview } from "../shared";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
@@ -30,6 +30,7 @@ interface SessionCtx {
    *  visible chip on ready. NEVER silently attached at send time: what the
    *  composer shows must be exactly what gets sent. */
   pendingContext?: { label: string; text: string };
+  pendingPrefill?: string; // prompt to prefill the composer with, once the webview is ready
   pendingPerm?: ToWebview; // permission raised while this tab was hidden/closed
   blank: boolean; // a fresh "new chat" tab with no session yet
   ready: boolean; // its webview finished loading
@@ -49,6 +50,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** The chat tab the user most recently focused (target for global commands). */
   private activeCtx?: SessionCtx;
   private store: SessionStore;
+  private slsWatching = false; // guards the ~/sls-tools/config.json file watcher (set up once)
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private installedPending?: string; // version installed this session, awaiting a window reload to take effect
   private lastUsageAt = 0; // throttle for subscription-usage queries
@@ -190,6 +192,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postUpdateDot();
       }
     });
+    this.watchSlsConfig();
+  }
+
+  /** 监听 ~/sls-tools/config.json：外部（Claude 自己写、或手动改）改动后，侧边栏表单自动刷新。 */
+  private watchSlsConfig(): void {
+    if (this.slsWatching) return;
+    this.slsWatching = true;
+    const file = path.join(this.slsDir(), "config.json");
+    fs.watchFile(file, { interval: 2000 }, () => {
+      this.view?.webview.postMessage({
+        kind: "sls_config",
+        config: this.readSlsConfig(),
+        enginePresent: this.slsEngineReady(),
+      } satisfies ToWebview);
+    });
+    this.context.subscriptions.push({ dispose: () => fs.unwatchFile(file) });
   }
 
   /** Post to a specific webview (used to keep the sidebar's session list in sync). */
@@ -447,6 +465,238 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.reveal();
   }
 
+  // -- SLS 日志配置 --------------------------------------------------------
+
+  /** `~/sls-tools` —— 查询引擎与 config.json 的落盘位置（`sls` CLI 也读这里）。 */
+  private slsDir(): string {
+    return path.join(os.homedir(), "sls-tools");
+  }
+
+  /** venv 里的 python 是否已就绪（引擎能否真正发起查询）。 */
+  private slsEngineReady(): boolean {
+    return fs.existsSync(path.join(this.slsDir(), "venv", "bin", "python"));
+  }
+
+  /** 读取已保存的配置；文件不存在时返回空表单。 */
+  private readSlsConfig(): SlsConfig {
+    const empty: SlsConfig = { endpoint: "", accessKeyId: "", accessKeySecret: "", projects: { dev: "", pro: "" }, logs: {} };
+    try {
+      const raw = fs.readFileSync(path.join(this.slsDir(), "config.json"), "utf8");
+      const j = JSON.parse(raw) as Record<string, unknown>;
+      const projects = (j.projects as { dev?: string; pro?: string }) || {};
+      return {
+        endpoint: (j.endpoint as string) || "",
+        accessKeyId: (j.accessKeyId as string) || "",
+        accessKeySecret: (j.accessKeySecret as string) || "",
+        projects: { dev: projects.dev || "", pro: projects.pro || "" },
+        logs: (j.logs as SlsConfig["logs"]) || {},
+      };
+    } catch {
+      return empty;
+    }
+  }
+
+  /** 把 UI 配置写回 config.json，权限 600。 */
+  private writeSlsConfig(cfg: SlsConfig): void {
+    const out = {
+      endpoint: cfg.endpoint.trim(),
+      accessKeyId: cfg.accessKeyId.trim(),
+      accessKeySecret: cfg.accessKeySecret.trim(),
+      projects: { dev: (cfg.projects?.dev || "").trim(), pro: (cfg.projects?.pro || "").trim() },
+      logs: cfg.logs || {},
+    };
+    const dir = this.slsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, "config.json");
+    fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
+    fs.chmodSync(file, 0o600); // 确保已存在的文件也收紧权限
+  }
+
+  /** 把扩展自带的引擎脚本铺到 ~/sls-tools（同事首次用也能一键就绪）。 */
+  private provisionSlsFiles(): void {
+    const dir = this.slsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const srcDir = path.join(this.context.extensionUri.fsPath, "sls-engine");
+    for (const name of ["query.py", "sls", "requirements.txt"]) {
+      const src = path.join(srcDir, name);
+      if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dir, name));
+    }
+    try {
+      fs.chmodSync(path.join(dir, "sls"), 0o755);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 跑一条命令，收集 stdout/stderr（不抛异常，返回退出码）。 */
+  private runCmd(cmd: string, args: string[], cwd: string, timeoutMs = 120_000): Promise<{ code: number; out: string; err: string }> {
+    return new Promise((resolve) => {
+      const p = spawn(cmd, args, { cwd });
+      let out = "";
+      let err = "";
+      const timer = setTimeout(() => p.kill(), timeoutMs);
+      p.stdout.on("data", (d) => (out += d.toString()));
+      p.stderr.on("data", (d) => (err += d.toString()));
+      p.on("error", (e) => {
+        clearTimeout(timer);
+        resolve({ code: -1, out, err: err || String(e) });
+      });
+      p.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code: code ?? -1, out, err });
+      });
+    });
+  }
+
+  /** 确保 venv + SDK 就绪；缺失则创建并 pip 安装（较慢，调用方应包在进度里）。 */
+  private async ensureSlsEngine(): Promise<void> {
+    this.provisionSlsFiles();
+    if (this.slsEngineReady()) return;
+    const dir = this.slsDir();
+    const py = this.config().get<string>("pythonPath", "") || "python3";
+    const venv = await this.runCmd(py, ["-m", "venv", "venv"], dir, 120_000);
+    if (venv.code !== 0) throw new Error(`创建 venv 失败（python3 是否可用？）：${venv.err || venv.out}`);
+    const pip = path.join(dir, "venv", "bin", "pip");
+    const install = await this.runCmd(pip, ["install", "-q", "aliyun-log-python-sdk"], dir, 300_000);
+    if (install.code !== 0) throw new Error(`安装 SDK 失败：${install.err || install.out}`);
+  }
+
+  /** 用给定配置(可能未保存)逐个环境列 logstore，验证连通性。
+   *  返回各环境的 logstore 数量说明，以及所有 logstore 名的并集（供 UI 生成映射模板参考）。 */
+  private async slsTestConnection(cfg: SlsConfig): Promise<{ ok: boolean; message: string; stores?: string[] }> {
+    for (const [k, label] of [["endpoint", "Endpoint"], ["accessKeyId", "AccessKey ID"], ["accessKeySecret", "AccessKey Secret"]] as const) {
+      if (!cfg[k]?.trim()) return { ok: false, message: `请先填写 ${label}` };
+    }
+    const envs: { env: string; project: string }[] = [];
+    if (cfg.projects?.pro?.trim()) envs.push({ env: "pro", project: cfg.projects.pro.trim() });
+    if (cfg.projects?.dev?.trim()) envs.push({ env: "dev", project: cfg.projects.dev.trim() });
+    if (!envs.length) return { ok: false, message: "请至少填写 dev 或 pro 的 SLS Project 名" };
+
+    await this.ensureSlsEngine();
+    const dir = this.slsDir();
+    const py = path.join(dir, "venv", "bin", "python");
+    const tmp = path.join(os.tmpdir(), `sls-test-${randomUUID()}.json`);
+    fs.writeFileSync(tmp, JSON.stringify({
+      endpoint: cfg.endpoint.trim(),
+      accessKeyId: cfg.accessKeyId.trim(),
+      accessKeySecret: cfg.accessKeySecret.trim(),
+      projects: { dev: cfg.projects?.dev?.trim() || "", pro: cfg.projects?.pro?.trim() || "" },
+      logs: {},
+    }), { mode: 0o600 });
+    try {
+      const lines: string[] = [];
+      const union = new Set<string>();
+      for (const { env, project } of envs) {
+        const r = await this.runCmd(py, ["query.py", "logstores", "--config", tmp, "--project", project, "--json"], dir, 60_000);
+        if (r.code !== 0) {
+          return { ok: false, message: `${env}（${project}）连接失败：${(r.err || r.out || "").trim()}` };
+        }
+        let stores: string[] = [];
+        try {
+          stores = JSON.parse(r.out.trim());
+        } catch {
+          return { ok: false, message: `${env} 返回无法解析：${r.out.slice(0, 160)}` };
+        }
+        stores.forEach((s) => union.add(s));
+        lines.push(`${env}（${project}）：${stores.length} 个 logstore`);
+      }
+      return { ok: true, message: "连接成功\n" + lines.join("\n"), stores: [...union].sort() };
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** SLS 是否已配置到可用（有 endpoint 且有至少一个项目映射）——决定输入框是否显示开关。 */
+  private slsConfigured(): boolean {
+    const c = this.readSlsConfig();
+    return !!(c.endpoint && Object.keys(c.logs || {}).length);
+  }
+
+  /** 若 SLS 已配置好，生成一段系统提示，告诉每个会话「有 sls 工具、怎么用、dev=测试环境」。
+   *  没配 logs 就返回 ""，不干扰普通会话。 */
+  private slsSystemPromptSnippet(): string {
+    const cfg = this.readSlsConfig();
+    const apps = Object.keys(cfg.logs || {});
+    if (!cfg.endpoint || !apps.length) return "";
+    const sls = "~/sls-tools/sls";
+    return [
+      "## 阿里云 SLS 后端日志查询",
+      `你可以直接查询后端服务的线上日志：运行本机命令 \`${sls}\`（已配置好凭证，可直接用 Bash 调）。`,
+      "- 环境 --env：`dev` = 测试/开发环境，`pro` = 生产/线上环境（不传默认 pro）。用户说“测试环境/开发环境”用 dev，说“线上/生产/正式”用 pro。",
+      `- 业务项目 --app 可选值：${apps.join("、")}。`,
+      "- 日志类型 --kind：`error`=异常/报错日志(默认)，`info`=普通日志，`both`=两者都查。",
+      "- 时间 --from：默认最近 1 小时，可用 `30m`/`2h`/`1d` 或绝对时间；条数 `-n`（默认 20）。加 `--json` 得结构化输出。",
+      `- 示例：查测试环境 game-server 最近 1 小时的报错 → \`${sls} -q "*" --env dev --app game-server --kind error --from 1h\`；\`${sls} apps\` 列出全部项目映射。`,
+      "当用户要求查看/排查某环境某服务的日志、报错、异常、线上问题时，**主动用这个命令去查真实日志**，不要只翻本地代码或说无法获取。查询语句 -q 用 SLS 语法（如 `level: ERROR`、`* and 关键词`）。",
+    ].join("\n");
+  }
+
+  /** 「让 Claude 生成映射」：打开/复用一个聊天，把扫描工作区+生成映射的 prompt 预填进输入框。 */
+  private async generateSlsMapping(): Promise<void> {
+    if (!this.activeCtx) await this.openSession(undefined);
+    const ctx = this.activeCtx;
+    if (!ctx) {
+      vscode.window.showWarningMessage("请先打开一个聊天会话。");
+      return;
+    }
+    const cfgPath = path.join(this.slsDir(), "config.json");
+    const prompt = [
+      "根据当前工作区的 Spring Boot 项目生成 SLS 日志映射并写入配置，请尽量快、用 Grep 批量搜，别逐个模块慢慢读文件：",
+      "1. **一次 Grep 搜 `spring.application.name`**（基本都在各模块 application.yml/application.yaml），拿到所有服务名。若值是 ${xxx} 占位符，再看 pom.xml/build.gradle 的 artifactId 补全。",
+      "2. **info/异常的真实 logstore 名通常写在 logback 配置里**（logback-spring.xml，及按环境分的 logback-pre.xml / logback-pro.xml 等变体）的阿里云 SLS appender 里。**一次 Grep 搜 `logstore`/`logStore`/`logStoreName`/`project`/`aliyun`**（限定 logback*.xml），拿到每个服务在各环境实际用的 logstore（区分 info/error）与 project——这是权威来源，优先于按命名规律猜。",
+      "3. 各跑一次 `~/sls-tools/sls logstores --env pro` 和 `--env dev` 核对真实存在的 logstore 名（报连接错误就提示我先在侧边栏填好连接信息并保存）。",
+      "4. 把每个服务名匹配到 info / error logstore：以 logback 里读到的为准，用 `sls logstores` 结果核对是否真实存在；两者对不上或某服务没找到 logback 配置的，列出来让我确认，**不要瞎猜**。",
+      `5. 读取 ${cfgPath}，把映射写入其 "logs" 字段（endpoint / accessKeyId / accessKeySecret / projects 原样不动），格式 {"<app>": {"info": "<logstore>", "error": "<logstore>"}}，2 空格缩进整体写回。`,
+      "6. **最后必须单独用一个 ```json 代码块**输出最终的 logs 映射对象（就是要填进文本框的那部分，最外层是 {\"<app>\": {\"info\":..., \"error\":...}}）。严格要求：只输出这一个 JSON 对象、合法可解析、2 空格缩进、不含注释/省略号/多余字段/尾逗号，方便我直接整段复制粘贴。",
+      "7. 代码块之外再简要汇报：映射了哪些、哪些没匹配上需我手动补。",
+    ].join("\n");
+    this.reveal();
+    if (ctx.ready) this.post(ctx, { kind: "prefill", text: prompt });
+    else ctx.pendingPrefill = prompt;
+  }
+
+  /** 标题栏「日志配置」按钮：显示侧边栏并弹开配置抽屉，回填当前配置。 */
+  showSlsConfig(): void {
+    this.view?.show?.(true);
+    this.view?.webview.postMessage({
+      kind: "sls_open",
+      config: this.readSlsConfig(),
+      enginePresent: this.slsEngineReady(),
+    } satisfies ToWebview);
+  }
+
+  /** slsLoad / slsSave / slsTest 的共用处理，`reply` 决定回哪个 webview。 */
+  private async handleSlsMessage(m: FromWebview, reply: (e: ToWebview) => void): Promise<boolean> {
+    if (m.type === "slsLoad") {
+      reply({ kind: "sls_config", config: this.readSlsConfig(), enginePresent: this.slsEngineReady() });
+      return true;
+    }
+    if (m.type === "slsTest") {
+      try {
+        const res = await this.slsTestConnection(m.config);
+        reply({ kind: "sls_result", action: "test", ...res });
+      } catch (err) {
+        reply({ kind: "sls_result", action: "test", ok: false, message: String((err as Error)?.message ?? err) });
+      }
+      return true;
+    }
+    if (m.type === "slsSave") {
+      try {
+        this.writeSlsConfig(m.config);
+        await this.ensureSlsEngine();
+        reply({ kind: "sls_result", action: "save", ok: true, message: `已保存到 ${path.join(this.slsDir(), "config.json")}` });
+      } catch (err) {
+        reply({ kind: "sls_result", action: "save", ok: false, message: `保存或初始化失败：${String((err as Error)?.message ?? err)}` });
+      }
+      return true;
+    }
+    return false;
+  }
+
   async stop(): Promise<void> {
     await this.activeCtx?.proc?.interrupt();
   }
@@ -519,6 +769,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "renameSession":
           this.renameSession(m.sessionId, m.title);
           break;
+        case "slsLoad":
+        case "slsSave":
+        case "slsTest":
+          await this.handleSlsMessage(m, (e) => this.view?.webview.postMessage(e));
+          break;
+        case "slsGenerate":
+          await this.generateSlsMapping();
+          break;
       }
     } catch (err) {
       this.output.appendLine(`[onSidebarMessage:${m.type}] ${String(err)}`);
@@ -536,6 +794,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             permissionMode: this.config().get<string>("permissionMode", "default"),
             model: this.config().get<string>("model", ""),
             effort: this.config().get<string>("effort", ""),
+            slsConfigured: this.slsConfigured(),
           });
           this.loadCtxSession(ctx);
           this.postActiveFile();
@@ -544,6 +803,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             // a normal removable chip now (never attach anything invisibly).
             this.post(ctx, { kind: "context_added", ...ctx.pendingContext });
             ctx.pendingContext = undefined;
+          }
+          if (ctx.pendingPrefill) {
+            this.post(ctx, { kind: "prefill", text: ctx.pendingPrefill });
+            ctx.pendingPrefill = undefined;
           }
           if (this.lastUsage) this.post(ctx, this.lastUsage); // show cached usage immediately
           this.fetchUsage();
@@ -555,7 +818,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.fetchUsage(true);
           break;
         case "send":
-          await this.handleSend(ctx, m.text, m.context, m.images, m.files);
+          await this.handleSend(ctx, m.text, m.context, m.images, m.files, m.sls);
           break;
         case "editMessage":
           await this.editMessage(ctx, m.checkpointId, m.text, m.images);
@@ -729,6 +992,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     context?: string,
     images?: { mediaType: string; data: string }[],
     files?: string[],
+    sls?: boolean,
   ): Promise<void> {
     // ONLY what the webview sent — a host-side fallback here once re-attached a
     // selection whose chip the user had already removed (invisible attach).
@@ -737,6 +1001,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (files && files.length) {
       const fileCtx = this.buildFileContext(files);
       attached = attached ? `${fileCtx}\n\n${attached}` : fileCtx;
+    }
+    // SLS 开关打开：把日志工具用法作为隐藏上下文随本条消息带上（不改系统提示，逐条生效）。
+    if (sls) {
+      const snip = this.slsSystemPromptSnippet();
+      if (snip) attached = attached ? `${snip}\n\n${attached}` : snip;
     }
     const proc = await this.ensureProcess(ctx);
     if (!proc) {
@@ -865,6 +1134,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       permissionMode: mode,
       model: this.config().get<string>("model", ""),
       effort: this.config().get<string>("effort", ""),
+      slsConfigured: this.slsConfigured(),
     };
     for (const c of this.sessions) this.post(c, cfg);
     // Apply to every running process, not just this tab's.
@@ -1668,6 +1938,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/></svg>';
     const PENCIL =
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3.2H3.6a1 1 0 0 0-1 1v7.2a1 1 0 0 0 1 1h7.2a1 1 0 0 0 1-1V7.5"/><path d="M11 2.6a1.1 1.1 0 0 1 1.6 1.6L7.8 9 5.6 9.6 6.2 7.4z"/></svg>';
+    const EYE =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>';
+    const EYE_OFF =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M6.6 6.6a2 2 0 0 0 2.8 2.8M3 3l10 10M5.3 5.3C3 6.4 1.5 8 1.5 8s2.5 4.5 6.5 4.5c1 0 1.9-.2 2.7-.6M9.9 4.1C9.3 3.7 8.7 3.5 8 3.5"/></svg>';
 
     return /* html */ `<!DOCTYPE html>
 <html lang="zh">
@@ -1678,8 +1952,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px); color: var(--vscode-foreground); }
-  .head { display: flex; align-items: center; gap: 6px; padding: 8px 10px; position: sticky; top: 0; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border, transparent); }
+  html, body { height: 100%; }
+  body { margin: 0; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size, 13px); color: var(--vscode-foreground); display: flex; flex-direction: column; overflow: hidden; }
+  .head { display: flex; align-items: center; gap: 6px; padding: 8px 10px; flex: 0 0 auto; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-panel-border, transparent); }
   .head .ttl { font-weight: 600; opacity: .85; }
   .head .sp { flex: 1; }
   .abtn { background: none; border: none; color: var(--vscode-foreground); opacity: .8; cursor: pointer; font-size: 12px; padding: 3px 7px; border-radius: 5px; }
@@ -1687,15 +1962,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .abtn.primary { color: var(--vscode-button-background); font-weight: 600; }
   .abtn.danger { color: var(--vscode-errorForeground, #e55); }
   .abtn.hidden { display: none; }
-  .new { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); border-radius: 7px; background: none; color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
+  .new { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px; padding: 7px 10px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); border-radius: 7px; background: none; color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; flex: 0 0 auto; }
   .new:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
   .new svg { width: 15px; height: 15px; }
-  .upd-banner { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px 8px 0; padding: 7px 10px; border: 1px solid #d97757; border-radius: 7px; background: rgba(217,119,87,.12); color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; }
+  .upd-banner { display: flex; align-items: center; gap: 7px; width: calc(100% - 16px); margin: 8px 8px 0; padding: 7px 10px; border: 1px solid #d97757; border-radius: 7px; background: rgba(217,119,87,.12); color: var(--vscode-foreground); cursor: pointer; font-size: 12.5px; flex: 0 0 auto; }
   .upd-banner:hover { background: rgba(217,119,87,.22); }
   .upd-banner.hidden { display: none; }
   .upd-banner svg { width: 15px; height: 15px; color: #d97757; }
   .upd-banner b { font-weight: 600; }
-  .list { padding: 2px 6px 12px; }
+  .list { padding: 2px 6px 12px; flex: 1 1 auto; min-height: 40px; overflow-y: auto; }
   .empty { opacity: .5; text-align: center; padding: 26px 10px; font-size: 12px; }
   .row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 6px; cursor: pointer; position: relative; }
   .row:hover { background: var(--vscode-list-hoverBackground, rgba(127,127,127,.14)); }
@@ -1718,6 +1993,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .del:hover { opacity: 1; color: var(--vscode-errorForeground, #e55); }
   .row .edit svg, .row .del svg { width: 14px; height: 14px; }
   body.multi .row .edit, body.multi .row .del { display: none; }
+  /* ---- SLS 日志配置（会话列表下方）---- */
+  .sls-sec { border-top: 1px solid var(--vscode-panel-border, rgba(127,127,127,.25)); flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; background: var(--vscode-sideBar-background); }
+  .sls-toggle { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 10px 12px; font-size: 12px; font-weight: 600; opacity: .85; }
+  .sls-toggle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.14)); opacity: 1; }
+  .sls-caret { display: inline-block; transition: transform .15s; font-size: 10px; opacity: .7; }
+  .sls-sec.open .sls-caret { transform: rotate(90deg); }
+  .sls-form { padding: 2px 12px 16px; display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow-y: auto; }
+  .sls-form.hidden { display: none; }
+  .sls-f { display: flex; flex-direction: column; gap: 4px; }
+  .sls-f > span { font-size: 11px; font-weight: 600; opacity: .8; }
+  .sls-form input { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 12px; }
+  .sls-form input:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
+  .sls-pw { position: relative; }
+  .sls-pw input { padding-right: 30px; }
+  .sls-eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; background: none; border: none; cursor: pointer; color: var(--vscode-descriptionForeground); opacity: .75; border-radius: 4px; }
+  .sls-eye:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
+  .sls-eye svg { width: 15px; height: 15px; }
+  .sls-lsh { display: flex; align-items: center; justify-content: space-between; }
+  .sls-lsh > span { font-size: 11px; font-weight: 600; opacity: .8; }
+  .sls-mini { font-size: 11px; cursor: pointer; background: none; color: var(--vscode-button-background); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; padding: 2px 8px; }
+  .sls-mini:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
+  .sls-rows { display: flex; flex-direction: column; gap: 6px; }
+  .sls-row { display: flex; align-items: center; gap: 6px; }
+  .sls-row .a { flex: 0 0 34%; }
+  .sls-row .s { flex: 1; }
+  .sls-row .x { flex: 0 0 auto; width: 22px; height: 26px; line-height: 1; font-size: 15px; cursor: pointer; background: none; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; }
+  .sls-row .x:hover { color: var(--vscode-errorForeground, #e55); }
+  .sls-json { width: 100%; min-height: 120px; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 7px 8px; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11.5px; line-height: 1.5; }
+  .sls-json:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
+  .sls-json.bad { border-color: var(--vscode-errorForeground, #e55); }
+  .sls-lsh > span:last-child { display: inline-flex; gap: 6px; }
+  .sls-sub { font-size: 10.5px; opacity: .6; line-height: 1.5; }
+  .sls-sub code, .sls-hint code { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.18)); padding: 0 4px; border-radius: 3px; }
+  .sls-hint { font-size: 11px; opacity: .7; line-height: 1.5; margin: 0; }
+  .sls-status { font-size: 11.5px; line-height: 1.5; padding: 7px 9px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+  .sls-status.hidden { display: none; }
+  .sls-status.ok { background: rgba(63,185,80,.16); color: #3fb950; }
+  .sls-status.err { background: rgba(229,85,85,.14); color: var(--vscode-errorForeground, #e55); }
+  .sls-status.wait { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.14)); opacity: .85; }
+  .sls-imp { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; opacity: .85; }
+  .sls-acts { display: flex; gap: 8px; }
+  .sls-btn { flex: 1; cursor: pointer; font-size: 12.5px; padding: 7px 10px; border-radius: 6px; background: var(--vscode-button-secondaryBackground, rgba(127,127,127,.22)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); }
+  .sls-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: var(--vscode-button-background); }
+  .sls-btn:hover:not(:disabled) { opacity: .9; }
+  .sls-btn:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>
@@ -1730,10 +2050,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <button id="upd-banner" class="upd-banner hidden">${ICONS.update}<span>发现新版本 <b id="upd-ver"></b> · 点击更新</span></button>
   <button id="new" class="new">${ICONS.add}<span>新建会话</span></button>
   <div id="list" class="list"><div class="empty">暂无会话</div></div>
+
+  <div id="sls-sec" class="sls-sec">
+    <button id="sls-toggle" class="sls-toggle" title="配置阿里云 SLS 日志，让 Claude 直接查后端日志"><span class="sls-caret">▸</span><span>SLS 日志配置</span></button>
+    <div id="sls-form" class="sls-form hidden">
+      <p class="sls-hint">配置后 Claude 可直接查询阿里云 SLS 后端日志，不用再手动复制粘贴。建议用只读子账号 AccessKey，仅存本机（权限 600）。</p>
+      <label class="sls-f"><span>Endpoint（地域）</span><input id="sls-endpoint" type="text" placeholder="cn-hangzhou.log.aliyuncs.com" spellcheck="false" /></label>
+      <label class="sls-f"><span>AccessKey ID</span><input id="sls-ak-id" type="text" placeholder="LTAI…" spellcheck="false" autocomplete="off" /></label>
+      <div class="sls-f"><span>AccessKey Secret</span>
+        <div class="sls-pw"><input id="sls-ak-secret" type="password" placeholder="仅存本机" spellcheck="false" autocomplete="off" /><button id="sls-ak-eye" class="sls-eye" type="button" title="显示/隐藏"></button></div></div>
+      <label class="sls-f"><span>dev 环境 SLS Project</span><input id="sls-proj-dev" type="text" placeholder="dev 的 project 名" spellcheck="false" /></label>
+      <label class="sls-f"><span>pro 环境 SLS Project</span><input id="sls-proj-pro" type="text" placeholder="pro 的 project 名" spellcheck="false" /></label>
+      <div class="sls-f">
+        <div class="sls-lsh"><span>项目日志映射（JSON）</span>
+          <span><button id="sls-tpl" class="sls-mini" title="测试连接后可根据实际 logstore 生成模板">生成模板</button>
+          <button id="sls-gen" class="sls-mini" title="让 Claude 扫描工作区 Spring Boot 配置自动生成，需先填好连接信息并保存">AI 生成配置</button></span></div>
+        <textarea id="sls-logs" class="sls-json" spellcheck="false" placeholder='{&#10;  "order": { "info": "order-info", "error": "order-error" },&#10;  "user":  { "info": "user-info",  "error": "user-error" }&#10;}'></textarea>
+        <div class="sls-sub">每个业务项目 → info / 异常两个 logstore，dev/pro 共用此映射。查询示例：<code>sls -q "*" --env pro --app order</code>（默认查 error，加 <code>--kind info</code> 查 info）。</div>
+      </div>
+      <div id="sls-status" class="sls-status hidden"></div>
+      <div class="sls-acts">
+        <button id="sls-test" class="sls-btn">测试连接</button>
+        <button id="sls-save" class="sls-btn primary">保存</button>
+      </div>
+    </div>
+  </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const TRASH = ${JSON.stringify(TRASH)};
     const PENCIL = ${JSON.stringify(PENCIL)};
+    const EYE = ${JSON.stringify(EYE)}, EYE_OFF = ${JSON.stringify(EYE_OFF)};
     let sessions = [], activeId = null, runningIds = new Set(), multi = false;
     const sel = new Set();
     const $ = (id) => document.getElementById(id);
@@ -1825,9 +2171,123 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (m && m.kind === "update_available") {
         if (m.version) { $("upd-ver").textContent = "v" + m.version; $("upd-banner").classList.remove("hidden"); }
         else $("upd-banner").classList.add("hidden");
+      } else if (m && m.kind === "sls_open") {
+        slsFill(m.config); slsExpand();
+      } else if (m && m.kind === "sls_config") {
+        slsFill(m.config);
+      } else if (m && m.kind === "sls_result") {
+        slsSetBusy(false);
+        slsStatus(m.message, m.ok ? "ok" : "err");
+        slsLastStores = (m.ok && m.action === "test" && m.stores) ? m.stores : [];
+        slsShowStores(slsLastStores);
       }
     });
+
+    // ---- SLS 日志配置 ----
+    let slsBusy = false, slsLastStores = [];
+    function slsFill(cfg) {
+      cfg = cfg || {};
+      $("sls-endpoint").value = cfg.endpoint || "";
+      $("sls-ak-id").value = cfg.accessKeyId || "";
+      $("sls-ak-secret").value = cfg.accessKeySecret || "";
+      $("sls-ak-secret").type = "password"; $("sls-ak-eye").innerHTML = EYE; // 回填后回到隐藏态
+      const proj = cfg.projects || {};
+      $("sls-proj-dev").value = proj.dev || "";
+      $("sls-proj-pro").value = proj.pro || "";
+      const logs = cfg.logs || {};
+      $("sls-logs").value = Object.keys(logs).length ? JSON.stringify(logs, null, 2) : "";
+      $("sls-logs").classList.remove("bad");
+      slsStatus(""); slsShowStores([]);
+    }
+    // 解析 JSON 文本框 -> {ok, logs, error}
+    function slsParseLogs() {
+      const raw = $("sls-logs").value.trim();
+      if (!raw) return { ok: true, logs: {} };
+      try {
+        const obj = JSON.parse(raw);
+        if (typeof obj !== "object" || Array.isArray(obj)) return { ok: false, error: "最外层必须是对象 { 项目: {...} }" };
+        return { ok: true, logs: obj };
+      } catch (e) { return { ok: false, error: "JSON 格式错误：" + (e && e.message ? e.message : e) }; }
+    }
+    function slsCollect(logs) {
+      return {
+        endpoint: $("sls-endpoint").value.trim(),
+        accessKeyId: $("sls-ak-id").value.trim(),
+        accessKeySecret: $("sls-ak-secret").value.trim(),
+        projects: { dev: $("sls-proj-dev").value.trim(), pro: $("sls-proj-pro").value.trim() },
+        logs: logs || {},
+      };
+    }
+    function slsStatus(text, kind) {
+      const el = $("sls-status");
+      el.textContent = text || "";
+      el.className = "sls-status" + (text ? "" : " hidden") + (kind ? " " + kind : "");
+    }
+    function slsSetBusy(b) { slsBusy = b; $("sls-test").disabled = b; $("sls-save").disabled = b; }
+    function slsExpand() { $("sls-sec").classList.add("open"); $("sls-form").classList.remove("hidden"); $("sls-sec").scrollIntoView({ block: "nearest" }); }
+    // 测试成功后把拉到的 logstore 名列出来，供参考/生成模板
+    function slsShowStores(stores) {
+      const old = $("sls-imp"); if (old) old.remove();
+      if (!stores || !stores.length) return;
+      const wrap = document.createElement("div"); wrap.id = "sls-imp"; wrap.className = "sls-imp";
+      const span = document.createElement("span"); span.textContent = "共 " + stores.length + " 个 logstore：" + stores.join("、");
+      wrap.append(span); $("sls-status").after(wrap);
+    }
+    // 根据 logstore 名启发式生成 项目->{info,error} 映射模板
+    function slsGuessTemplate(stores) {
+      const tpl = {};
+      (stores || []).forEach((s) => {
+        const low = s.toLowerCase();
+        let kind = null;
+        if (/error|err|exception|异常/.test(low)) kind = "error";
+        else if (/info|stdout|std/.test(low)) kind = "info";
+        let app = s;
+        if (kind) app = s.replace(/[-_.]?(error|err|exception|info|stdout|std|异常)$/i, "").replace(/[-_.]+$/, "") || s;
+        if (!tpl[app]) tpl[app] = {};
+        if (kind) tpl[app][kind] = s; else if (!tpl[app].info) tpl[app].info = s;
+      });
+      return tpl;
+    }
+    $("sls-toggle").addEventListener("click", () => {
+      const open = $("sls-sec").classList.toggle("open");
+      $("sls-form").classList.toggle("hidden", !open);
+    });
+    $("sls-ak-eye").innerHTML = EYE;
+    $("sls-ak-eye").addEventListener("click", () => {
+      const inp = $("sls-ak-secret"), show = inp.type === "password";
+      inp.type = show ? "text" : "password";
+      $("sls-ak-eye").innerHTML = show ? EYE_OFF : EYE;
+    });
+    $("sls-gen").addEventListener("click", () => {
+      vscode.postMessage({ type: "slsGenerate" });
+      slsStatus("已在聊天里预填生成指令，回车即可让 Claude 扫描工作区并写入映射；写完这里会自动刷新。", "wait");
+    });
+    $("sls-tpl").addEventListener("click", () => {
+      if (!slsLastStores.length) { slsStatus("请先“测试连接”，拉到实际 logstore 后再生成模板", "wait"); return; }
+      const cur = slsParseLogs();
+      const base = cur.ok ? cur.logs : {};
+      const tpl = slsGuessTemplate(slsLastStores);
+      for (const app in tpl) base[app] = Object.assign({}, tpl[app], base[app]);
+      $("sls-logs").value = JSON.stringify(base, null, 2);
+      $("sls-logs").classList.remove("bad");
+      slsStatus("已按 logstore 名生成映射模板，请核对 info/error 是否对应正确", "ok");
+    });
+    $("sls-test").addEventListener("click", () => {
+      if (slsBusy) return;
+      slsSetBusy(true); slsStatus("正在测试连接…（首次会自动安装查询引擎，稍等十几秒）", "wait");
+      vscode.postMessage({ type: "slsTest", config: slsCollect({}) });
+    });
+    $("sls-save").addEventListener("click", () => {
+      if (slsBusy) return;
+      const r = slsParseLogs();
+      if (!r.ok) { $("sls-logs").classList.add("bad"); slsStatus(r.error, "err"); return; }
+      $("sls-logs").classList.remove("bad");
+      slsSetBusy(true); slsStatus("正在保存…", "wait");
+      vscode.postMessage({ type: "slsSave", config: slsCollect(r.logs) });
+    });
+
     vscode.postMessage({ type: "listSessions" });
+    vscode.postMessage({ type: "slsLoad" });
   </script>
 </body>
 </html>`;
@@ -1903,6 +2363,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <button id="btn-attach-file" class="composer-btn" title="附加文件/目录到会话">${ICONS.attach}</button>
           <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
           <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji"></span><span id="mode-label"></span></button>
+          <button id="sls-toggle-btn" class="composer-pick sls-toggle-btn hidden" title="打开后，本条消息会带上 SLS 日志工具用法，Claude 可直接查后端日志"><span class="sls-dot"></span><span>SLS日志</span></button>
           <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
           <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>
           <div class="spacer"></div>

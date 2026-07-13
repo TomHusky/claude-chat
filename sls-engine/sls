@@ -1,0 +1,4 @@
+#!/bin/zsh
+# SLS 日志查询包装脚本 —— 用 venv 里的 python 跑 query.py
+DIR="${0:A:h}"
+exec "$DIR/venv/bin/python" "$DIR/query.py" "$@"

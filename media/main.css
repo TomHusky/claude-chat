@@ -843,6 +843,13 @@ body.vscode-high-contrast .askq-card .tool-name { color: #a78bfa; } /* 5.6:1 on 
 .composer-pick .pick-caret { opacity: .55; font-size: 10px; margin-left: 1px; }
 #model-label, #mode-label { white-space: nowrap; }
 
+/* SLS 日志开关（输入框底部，仅配置了 SLS 时显示） */
+.sls-toggle-btn { display: inline-flex; align-items: center; gap: 5px; }
+.sls-toggle-btn .sls-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: .5; }
+.sls-toggle-btn.on { color: var(--vscode-button-foreground, #fff); background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
+.sls-toggle-btn.on:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
+.sls-toggle-btn.on .sls-dot { background: #3fb950; opacity: 1; }
+
 .pick-backdrop { position: fixed; inset: 0; z-index: 40; }
 .pick-backdrop.hidden, .pick-menu.hidden { display: none; }
 .pick-menu {

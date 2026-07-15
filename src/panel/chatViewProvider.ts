@@ -51,6 +51,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private activeCtx?: SessionCtx;
   private store: SessionStore;
   private slsWatching = false; // guards the ~/sls-tools/config.json file watcher (set up once)
+  private lastActiveFilePath?: string; // path last posted as the active-file auto-chip (to detect its close)
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private installedPending?: string; // version installed this session, awaiting a window reload to take effect
   private lastUsageAt = 0; // throttle for subscription-usage queries
@@ -91,6 +92,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postActiveFile();
         void this.keepFilesLeft(ed);
       }),
+      // A file was closed — if it's the one currently auto-attached, re-evaluate and
+      // allow clearing the auto-chip (posts the new active file, or null if none left).
+      vscode.workspace.onDidCloseTextDocument((doc) => {
+        if (doc.uri.scheme !== "file") return;
+        this.postActiveFile(doc.uri.fsPath === this.lastActiveFilePath);
+      }),
     );
   }
 
@@ -98,9 +105,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    *  Keyed by sessionId — kept alive in the background; reopening re-adopts them. */
   private readonly detached = new Map<string, SessionCtx>();
 
-  /** Tell the webview which file is shown (for the default chip). Never clears
-   *  it just because focus moved to the chat — only updates to a real file. */
-  private postActiveFile(): void {
+  /** Tell the webview which file is shown (for the default auto-chip). Normally
+   *  never clears just because focus moved to the chat — only updates to a real
+   *  file. But when `allowClear` is set (the tracked file was just CLOSED) and no
+   *  file is active anymore, it posts null so the auto-chip goes away. */
+  private postActiveFile(allowClear = false): void {
     if (!this.activeCtx) return;
     let p: string | undefined;
     const ed = vscode.window.activeTextEditor;
@@ -110,7 +119,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const input = vscode.window.tabGroups.activeTabGroup?.activeTab?.input as { uri?: vscode.Uri } | undefined;
       if (input?.uri && input.uri.scheme === "file") p = input.uri.fsPath;
     }
-    if (p) this.post(this.activeCtx, { kind: "active_file", path: p });
+    if (p) {
+      this.lastActiveFilePath = p;
+      this.post(this.activeCtx, { kind: "active_file", path: p });
+    } else if (allowClear) {
+      this.lastActiveFilePath = undefined;
+      this.post(this.activeCtx, { kind: "active_file", path: null });
+    }
   }
 
   /** Build a context block from attached files/dirs (embedded content / listing). */
@@ -1025,8 +1040,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Record the transcript length *before* this turn so a restore point can
     // truncate the conversation back to exactly here.
     const lineBefore = ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0;
+    if (!proc.sendUserMessage(text, attached, images)) {
+      // The process died between ensureProcess and here — never leave the UI
+      // spinning on a dropped message. Clear the corpse so retry respawns.
+      // Note: create the checkpoint only *after* a successful write — otherwise a
+      // dropped send leaves an orphan checkpoint that shifts every restore marker.
+      this.output.appendLine("[claude] send dropped: process not writable (exited mid-send)");
+      if (ctx.proc === proc) ctx.proc = undefined;
+      this.post(ctx, { kind: "error", message: "claude 进程已退出，本条消息未送出——请重新发送（会自动重启进程）。" });
+      this.post(ctx, { kind: "busy", busy: false });
+      return;
+    }
+    // Record the checkpoint only now that the message is actually on the wire.
     const checkpointId = ctx.checkpoints.beginTurn(text || "(图片)", lineBefore);
-    proc.sendUserMessage(text, attached, images);
     this.post(ctx, { kind: "checkpoint_marker", checkpointId, userText: text });
   }
 
@@ -1324,6 +1350,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // handshake finishes, and sendUserMessage on an uninitialized proc silently
     // drops the message. Wait for the in-flight start instead.
     if (ctx.starting) return ctx.starting;
+    // A dead process must never be handed to a sender — sends would be dropped
+    // and the UI spins forever. Discard and respawn (with --resume) instead.
+    if (ctx.proc?.isExited) {
+      this.output.appendLine("[claude] discarding exited process, respawning");
+      ctx.proc = undefined;
+    }
     if (ctx.proc) return Promise.resolve(ctx.proc);
     ctx.starting = this.spawnProcess(ctx).finally(() => {
       ctx.starting = undefined;
@@ -1358,8 +1390,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
     );
     ctx.proc = proc;
+    const t0 = Date.now();
     try {
       await proc.start();
+      this.output.appendLine(`[claude] spawned+initialized in ${Date.now() - t0}ms (resume=${isResume})`);
     } catch (err) {
       this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
       proc.dispose(); // reap the half-started child
@@ -1385,6 +1419,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
         if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
       }
+    }
+    // Keep a trace of anomalies in the output channel — 同事反馈"卡住"时可以看这里。
+    if ((e.kind === "error" || e.kind === "notice") && (e as { message: string }).message) {
+      this.output.appendLine(`[${new Date().toISOString()}] [${e.kind}] ${(e as { message: string }).message}`);
     }
     // post() safely no-ops if this ctx's panel was closed (detached/background).
     this.post(ctx, e);

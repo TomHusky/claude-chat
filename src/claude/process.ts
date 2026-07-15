@@ -78,6 +78,7 @@ export class ClaudeProcess {
   private busy = false;
   private pendingMode?: string; // mode change requested before the handshake finished
   private readonly seenToolIds = new Set<string>();
+  private stderrTail = "";
 
   constructor(
     private readonly opts: ClaudeProcessOptions,
@@ -90,6 +91,11 @@ export class ClaudeProcess {
 
   get isBusy(): boolean {
     return this.busy;
+  }
+
+  /** CLI 进程是否已退出——退出后的实例不可再发送，调用方应丢弃并重建。 */
+  get isExited(): boolean {
+    return this.exited;
   }
 
   /** Spawn the CLI and perform the initialize handshake. */
@@ -120,10 +126,9 @@ export class ClaudeProcess {
     this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => this.onLine(line));
 
-    let stderrBuf = "";
     this.proc.stderr.on("data", (d: Buffer) => {
       // Keep only the tail — the CLI is chatty and the buffer must not grow forever.
-      stderrBuf = (stderrBuf + d.toString()).slice(-4096);
+      this.stderrTail = (this.stderrTail + d.toString()).slice(-4096);
     });
 
     this.proc.on("close", (code) => {
@@ -139,8 +144,8 @@ export class ClaudeProcess {
         this.pendingPermissions.delete(requestId);
         this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
       }
-      if (code && code !== 0 && stderrBuf.trim()) {
-        this.hooks.emit({ kind: "error", message: `claude 进程退出 (code ${code}): ${stderrBuf.trim().slice(0, 800)}` });
+      if (code && code !== 0 && this.stderrTail.trim()) {
+        this.hooks.emit({ kind: "error", message: `claude 进程退出 (code ${code}): ${this.stderrTail.trim().slice(0, 800)}` });
       }
       this.setBusy(false);
       this.hooks.onClose(code);
@@ -190,9 +195,12 @@ export class ClaudeProcess {
 
   // -- Sending -------------------------------------------------------------
 
-  /** Send a user turn. `context` is prepended; `images` are attached as blocks. */
-  sendUserMessage(text: string, context?: string, images?: { mediaType: string; data: string }[]): void {
-    if (!this.proc || !this.initialized) return;
+  /** Send a user turn. `context` is prepended; `images` are attached as blocks.
+   *  Returns false when the process can't take input (exited / not initialized /
+   *  stdin gone) — the caller MUST surface that, or the UI spins forever on a
+   *  message that was silently dropped. */
+  sendUserMessage(text: string, context?: string, images?: { mediaType: string; data: string }[]): boolean {
+    if (!this.proc || !this.initialized || this.exited || this.proc.stdin.destroyed) return false;
     const body = context ? `${context}\n\n${text}` : text;
     this.setBusy(true);
     const content: Array<Record<string, unknown>> = [];
@@ -201,13 +209,14 @@ export class ClaudeProcess {
     }
     content.push({ type: "text", text: body });
     this.write({ type: "user", message: { role: "user", content } });
+    return true;
   }
 
   /** Run `/compact`: ask the CLI to summarize and shrink the conversation
    *  context. The CLI streams a `compacting` status, then a `compact_boundary`
    *  system event with pre/post token counts, then a normal `result`. */
   compact(): void {
-    if (!this.proc || !this.initialized) return;
+    if (!this.proc || !this.initialized || this.exited || this.proc.stdin.destroyed) return;
     this.setBusy(true);
     this.write({ type: "user", message: { role: "user", content: [{ type: "text", text: "/compact" }] } });
   }

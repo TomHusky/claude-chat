@@ -393,6 +393,7 @@ function updateActiveLine() {
 let tickTimer = 0;
 let turnTokens = 0; // exact output tokens (only arrives at each message's end)
 let turnEst = 0; // live estimate from streamed chars (the CLI doesn't stream counts)
+let turnThinkTokens = 0; // real thinking-token count from the CLI (system/thinking_tokens)
 let msgTokenBase = 0; // sum of PREVIOUS messages' finals within this turn
 let lastMsgTokens = 0; // the current message's cumulative count so far
 // The CLI doesn't stream status text in -p mode, so (like Claude Code's TUI) we
@@ -411,7 +412,8 @@ function fmtTokens(n: number): string {
   return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
 }
 function setPillTokens() {
-  const n = Math.max(turnTokens, Math.round(turnEst));
+  // 真实思考 token > 精确输出 token > 字符估算：优先展示 CLI 报的真实数，退回估算。
+  const n = Math.max(turnTokens, turnThinkTokens, Math.round(turnEst));
   const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
   if (tk) tk.textContent = n > 0 ? `${fmtTokens(n)} tokens` : "";
 }
@@ -619,7 +621,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       m.kind === "tool_input" ||
       m.kind === "tool_input_partial" ||
       m.kind === "status" ||
-      m.kind === "tokens")
+      m.kind === "tokens" ||
+      m.kind === "thinking_tokens")
   ) {
     return;
   }
@@ -641,8 +644,12 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       setBusy(m.busy);
       break;
     case "status":
-      break; // no live "思考中" status
+      // Host-driven transient hint (e.g. cold-start context loading). Cleared
+      // as soon as the stream produces anything, or when the turn ends.
+      statusLine.textContent = m.label;
+      break;
     case "block_start":
+      statusLine.textContent = "";
       onBlockStart(m.blockType, m.toolId, m.toolName);
       break;
     case "text_delta":
@@ -653,6 +660,11 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "tokens":
       onTokens(m.output);
+      break;
+    case "thinking_tokens":
+      // 真实思考 token 累计数（单调递增）——盖掉字符估算，让思考阶段的数字更准。
+      turnThinkTokens = Math.max(turnThinkTokens, m.tokens);
+      setPillTokens();
       break;
     case "context":
       updateContextGauge(m.used, m.total);
@@ -1340,9 +1352,10 @@ function renderHistory(showAll: boolean) {
     if (ordinal >= 0) cpByOrdinal.set(ordinal, c);
   });
 
-  // Fold everything before the last HISTORY_TURN_LIMIT turns behind a banner.
-  // IMPORTANT: everything is RENDERED (hidden with CSS) — re-rendering from
-  // historyState on expand used to wipe all live messages sent since load.
+  // Long transcripts: render ONLY the last HISTORY_TURN_LIMIT turns now; older
+  // items render lazily when the banner is clicked. Rendering everything up
+  // front (markdown + highlight on thousands of hidden nodes) made big sessions
+  // take seconds to open with the UI frozen.
   let cutoff = 0;
   if (!showAll && userTotal > HISTORY_TURN_LIMIT) {
     const target = userTotal - HISTORY_TURN_LIMIT; // fold this many user turns
@@ -1357,26 +1370,50 @@ function renderHistory(showAll: boolean) {
       }
     }
     const banner = el("div", "history-expand", `▾ 显示更早的 ${target} 条消息`);
-    banner.onclick = () => {
-      Array.from(messagesEl.querySelectorAll(".history-folded")).forEach((n) => n.classList.remove("history-folded"));
-      banner.remove();
-    };
+    const cut = cutoff;
+    banner.onclick = () => expandHistory(banner, cut, cpByOrdinal);
     messagesEl.appendChild(banner);
   }
 
-  // Elements appended while i < cutoff get folded after the loop.
-  const foldBoundary = () => messagesEl.children.length;
-  let foldEnd = 0;
+  renderItemRange(items, cutoff, items.length, cpByOrdinal);
+  finalizeTurn();
+  updateEmptyState();
+  scrollToBottom();
+}
 
+/** Render the folded (older) portion in place of the banner. The recent/live
+ *  DOM is detached into a fragment first — the append-style render helpers and
+ *  their finalize sweeps then can't touch it — and re-attached afterwards. */
+function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<number, { id: string }>) {
+  if (!historyState) return;
+  const items = historyState.items;
+  banner.remove();
+  const savedAssistant = assistantEl, savedLive = liveBlock, savedLastUser = lastUserEl;
+  const tail = document.createDocumentFragment();
+  while (messagesEl.firstChild) tail.appendChild(messagesEl.firstChild);
+  const anchor = tail.firstElementChild; // first previously-visible node — keep the viewport on it
+  assistantEl = null;
+  liveBlock = null;
+  lastUserEl = null;
+  renderItemRange(items, 0, cutoff, cpByOrdinal);
+  finalizeTurn();
+  assistantEl = savedAssistant;
+  liveBlock = savedLive;
+  lastUserEl = savedLastUser;
+  messagesEl.appendChild(tail);
+  userMsgCount = messagesEl.querySelectorAll(".msg.user").length;
+  anchor?.scrollIntoView({ block: "start" });
+}
+
+/** Append items[from..to) to messagesEl. Checkpoint ordinals stay correct for
+ *  any sub-range because user turns are counted from the start of `items`. */
+function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOrdinal: Map<number, { id: string }>) {
   let userOrdinal = -1;
-  for (let i = 0; i < items.length; i++) {
+  for (let i = 0; i < from; i++) if (items[i].type === "user") userOrdinal++;
+  for (let i = from; i < to; i++) {
     const it = items[i];
-    if (it.type === "user") userOrdinal++;
-    if (cutoff && i === cutoff) {
-      finalizeTurn(); // close the folded portion's last assistant bubble
-      foldEnd = foldBoundary();
-    }
     if (it.type === "user") {
+      userOrdinal++;
       finalizeTurn();
       const cp = cpByOrdinal.get(userOrdinal);
       if (cp && userOrdinal > 0) messagesEl.appendChild(renderCheckpointDivider(cp.id)); // no divider above the very first message
@@ -1410,14 +1447,6 @@ function renderHistory(showAll: boolean) {
       if (it.result != null) setToolResult(it.toolId, it.result, !!it.isError);
     }
   }
-  finalizeTurn();
-  // Hide the folded portion (children after the banner, before foldEnd).
-  if (cutoff && foldEnd > 1) {
-    const kids = Array.from(messagesEl.children);
-    for (let k = 1; k < foldEnd; k++) kids[k]?.classList.add("history-folded");
-  }
-  updateEmptyState();
-  scrollToBottom();
 }
 
 /** Show a branded placeholder when the conversation is empty (new session). */
@@ -1844,6 +1873,7 @@ function performSend(p: QueueItem) {
   finalizeTurn();
   turnTokens = 0; // reset token counters for the new turn
   turnEst = 0;
+  turnThinkTokens = 0;
   msgTokenBase = 0;
   lastMsgTokens = 0;
   isBusy = true;
@@ -2483,6 +2513,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   // second Enter could race a concurrent turn.
   turnTokens = 0;
   turnEst = 0;
+  turnThinkTokens = 0;
   msgTokenBase = 0;
   lastMsgTokens = 0;
   isBusy = true;

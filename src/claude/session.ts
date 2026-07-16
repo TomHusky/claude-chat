@@ -146,7 +146,12 @@ export class SessionStore {
             if (idx !== undefined) {
               const item = items[idx];
               if (item.type === "tool") {
-                item.result = stringify(b.content);
+                // Display-only cap: a session can hold many multi-MB tool
+                // outputs, and shipping them all to the webview made big
+                // sessions take seconds to open. The transcript keeps the
+                // full result; only the history card view is truncated.
+                const s = stringify(b.content);
+                item.result = s.length > 50_000 ? s.slice(0, 50_000) + "\n…（输出过长，历史视图已截断）" : s;
                 item.isError = !!b.is_error;
               }
             }
@@ -206,9 +211,15 @@ export class SessionStore {
   lastContextUsage(sessionId: string): { used: number; model?: string } | undefined {
     const file = this.findFile(sessionId);
     if (!file) return undefined;
+    // Only the transcript tail matters here (the LAST usage / compact boundary
+    // wins) — a full parse was a second multi-MB read on every session open.
+    return this.scanUsage(this.readTailLines(file, 512 * 1024)) ?? this.scanUsage(this.readLines(file));
+  }
+
+  private scanUsage(objs: any[]): { used: number; model?: string } | undefined {
     let used: number | undefined;
     let model: string | undefined;
-    for (const o of this.readLines(file)) {
+    for (const o of objs) {
       const msg = (o as any)?.message;
       const u = msg?.usage;
       if (o.type === "assistant" && u) {
@@ -308,6 +319,35 @@ export class SessionStore {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /** Parse only the last `bytes` of a transcript (first partial line dropped).
+   *  Falls back to a full read for small files. */
+  private readTailLines(file: string, bytes: number): any[] {
+    try {
+      const size = fs.statSync(file).size;
+      if (size <= bytes) return this.readLines(file);
+      const fd = fs.openSync(file, "r");
+      const buf = Buffer.alloc(bytes);
+      try {
+        fs.readSync(fd, buf, 0, bytes, size - bytes);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const out: any[] = [];
+      for (const line of buf.toString("utf8").split("\n").slice(1)) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          out.push(JSON.parse(t));
+        } catch {
+          /* skip */
+        }
+      }
+      return out;
+    } catch {
+      return [];
     }
   }
 

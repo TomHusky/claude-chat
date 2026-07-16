@@ -39,6 +39,12 @@ interface SessionCtx {
    *  clobbered when a second send races the first one's spawn await. */
   sendSeq?: number;
   stopSeq?: number;
+  /** The next send is the first turn of a freshly-resumed BIG session with no
+   *  warm cache — show an honest "loading context" hint instead of a dead spinner. */
+  coldStart?: boolean;
+  /** When this ctx last entered the background pool. Drives LRU eviction — the
+   *  oldest IDLE background process is reaped first once the pool exceeds its cap. */
+  lastUsedAt?: number;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -60,6 +66,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private layoutFixing = false; // guards re-entrancy while sliding a file group left
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
+  // -- Prompt-cache prewarmer (big sessions) --
+  private readonly prewarmStarted = new Map<string, number>(); // sessionId -> ts (dedupe in-flight)
+  private readonly prewarmDone = new Map<string, number>(); // sessionId -> ts of last completed warm
+  private prewarmProc?: ClaudeProcess; // at most one warm-up runs at a time (they're token-expensive)
+  private keepWarmTimer?: ReturnType<typeof setInterval>; // periodic re-warm for idle open tabs
+  /** 正在跑的预热（warmKey + 完成 promise）。发送撞上同会话的预热时等它完成再发：
+   *  两个请求并发冷啃同一段大上下文会互相拖慢（实测比先焐后发慢好几倍）。 */
+  private prewarmInflight?: { key: string; promise: Promise<void> };
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -99,6 +113,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         this.postActiveFile(doc.uri.fsPath === this.lastActiveFilePath);
       }),
     );
+
+    // 保温：预热只在打开会话那一刻跑一次，tab 一直开着不动的话 ~1h 后服务端缓存
+    // 过期，下一条消息就变成"冷发送"（大会话实测五六十秒）。这里每 5 分钟对所有
+    // 打开的 tab 补一次 maybePrewarm —— 它自带全部守卫（>1MB、50min 内焐过不重复、
+    // 额度>80% 跳过、同时只跑一个），所以静息成本为零，只在快过期时才真正花钱。
+    this.keepWarmTimer = setInterval(() => {
+      if (this.activeCtx) this.maybePrewarm(this.activeCtx); // 活跃 tab 优先
+      for (const ctx of this.sessions) if (ctx !== this.activeCtx) this.maybePrewarm(ctx);
+    }, 5 * 60_000);
   }
 
   /** Chat tabs whose panel was closed while their reply was still streaming.
@@ -361,15 +384,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     panel.onDidDispose(() => this.onPanelClosed(ctx));
   }
 
-  /** A chat tab was closed. If its reply is still streaming, keep the process
-   *  running in the background and stash the ctx so reopening re-attaches it;
-   *  otherwise dispose the process. */
+  /** A chat tab was closed. 有限常驻：只要它已经有一个活进程(不管在不在忙)，就把
+   *  进程转后台保活并把 ctx 存进 detached，重开时秒级复用（上下文还在进程内存里，
+   *  省掉 --resume 全量重读）。超过后台上限就按 LRU 回收空闲的。空白 tab / 进程已死
+   *  没什么可复用的，直接清理。 */
   private onPanelClosed(ctx: SessionCtx): void {
     this.sessions.delete(ctx);
     if (this.activeCtx === ctx) this.activeCtx = undefined;
-    if (ctx.proc?.isBusy && ctx.sessionId) {
-      // 后台继续跑,重开再接管 — keep it alive, suppress its (now-dead) UI posts.
+    if (ctx.proc && !ctx.proc.isExited && ctx.sessionId) {
+      ctx.lastUsedAt = Date.now();
       this.detached.set(ctx.sessionId, ctx);
+      this.trimBackground(); // 超上限就砍掉最久未用的空闲后台进程
     } else {
       ctx.proc?.dispose();
       ctx.proc = undefined;
@@ -377,6 +402,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.broadcastRunning();
     this.refreshSessions();
+  }
+
+  /** 后台常驻进程上限：超了按最久未用(LRU)回收，防止一堆闲置进程堆积吃内存。 */
+  private static readonly MAX_BACKGROUND = 5;
+
+  /** Reap idle background processes once the pool exceeds its cap, oldest first.
+   *  NEVER touches a busy one — it's actively streaming a reply that closing the
+   *  tab kept alive; killing it would silently drop that turn. Busy procs still
+   *  count toward the cap (they cost memory too), they're just not eligible to
+   *  be evicted, so the cap is soft while several background replies run. */
+  private trimBackground(): void {
+    let overflow = this.detached.size - ChatViewProvider.MAX_BACKGROUND;
+    if (overflow <= 0) return;
+    const idle = [...this.detached.values()]
+      .filter((c) => c.proc && !c.proc.isBusy && c.sessionId)
+      .sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
+    for (const c of idle) {
+      if (overflow <= 0) break;
+      c.checkpoints.flush(); // 落盘防丢 baseline，跟 dispose() 一致
+      c.proc?.dispose();
+      c.proc = undefined;
+      this.detached.delete(c.sessionId!);
+      overflow--;
+      this.output.appendLine(`[claude] LRU 回收后台进程 ${c.sessionId!.slice(0, 8)}（后台剩 ${this.detached.size}）`);
+    }
   }
 
   /** Re-adopt a panel restored by VS Code after a window reload/restart. Without
@@ -492,32 +542,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return fs.existsSync(path.join(this.slsDir(), "venv", "bin", "python"));
   }
 
-  /** 读取已保存的配置；文件不存在时返回空表单。 */
+  /** 把 j.projects 归一化成「环境名 -> project 字符串」的映射，只保留字符串值。 */
+  private normalizeProjects(raw: unknown): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (raw && typeof raw === "object") {
+      for (const [env, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof v === "string" && env.trim()) out[env.trim()] = v;
+      }
+    }
+    return out;
+  }
+
+  /** 读取已保存的配置；文件不存在时返回空表单（种子 dev/pro 两个空环境）。 */
   private readSlsConfig(): SlsConfig {
-    const empty: SlsConfig = { endpoint: "", accessKeyId: "", accessKeySecret: "", projects: { dev: "", pro: "" }, logs: {} };
+    const seed = (): Record<string, string> => ({ dev: "", pro: "" });
     try {
       const raw = fs.readFileSync(path.join(this.slsDir(), "config.json"), "utf8");
       const j = JSON.parse(raw) as Record<string, unknown>;
-      const projects = (j.projects as { dev?: string; pro?: string }) || {};
+      const projects = this.normalizeProjects(j.projects);
       return {
         endpoint: (j.endpoint as string) || "",
         accessKeyId: (j.accessKeyId as string) || "",
         accessKeySecret: (j.accessKeySecret as string) || "",
-        projects: { dev: projects.dev || "", pro: projects.pro || "" },
+        // 完全没有任何环境时，回填 dev/pro 两个空行方便填写。
+        projects: Object.keys(projects).length ? projects : seed(),
         logs: (j.logs as SlsConfig["logs"]) || {},
       };
     } catch {
-      return empty;
+      return { endpoint: "", accessKeyId: "", accessKeySecret: "", projects: seed(), logs: {} };
     }
   }
 
-  /** 把 UI 配置写回 config.json，权限 600。 */
+  /** 把 UI 配置写回 config.json，权限 600。环境名/Project 都去空白，丢掉环境名为空的行。 */
   private writeSlsConfig(cfg: SlsConfig): void {
+    const projects: Record<string, string> = {};
+    for (const [env, proj] of Object.entries(cfg.projects || {})) {
+      const name = (env || "").trim();
+      if (name) projects[name] = (proj || "").trim();
+    }
     const out = {
       endpoint: cfg.endpoint.trim(),
       accessKeyId: cfg.accessKeyId.trim(),
       accessKeySecret: cfg.accessKeySecret.trim(),
-      projects: { dev: (cfg.projects?.dev || "").trim(), pro: (cfg.projects?.pro || "").trim() },
+      projects,
       logs: cfg.logs || {},
     };
     const dir = this.slsDir();
@@ -582,20 +649,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     for (const [k, label] of [["endpoint", "Endpoint"], ["accessKeyId", "AccessKey ID"], ["accessKeySecret", "AccessKey Secret"]] as const) {
       if (!cfg[k]?.trim()) return { ok: false, message: `请先填写 ${label}` };
     }
-    const envs: { env: string; project: string }[] = [];
-    if (cfg.projects?.pro?.trim()) envs.push({ env: "pro", project: cfg.projects.pro.trim() });
-    if (cfg.projects?.dev?.trim()) envs.push({ env: "dev", project: cfg.projects.dev.trim() });
-    if (!envs.length) return { ok: false, message: "请至少填写 dev 或 pro 的 SLS Project 名" };
+    // pro 优先测（更常用），其余环境按填写顺序；空 Project 的环境跳过。
+    const entries = Object.entries(cfg.projects || {})
+      .map(([env, project]) => ({ env: env.trim(), project: (project || "").trim() }))
+      .filter((e) => e.env && e.project);
+    const envs = entries.sort((a, b) => (a.env === "pro" ? -1 : b.env === "pro" ? 1 : 0));
+    if (!envs.length) return { ok: false, message: "请至少给一个环境填写 SLS Project 名" };
 
     await this.ensureSlsEngine();
     const dir = this.slsDir();
     const py = path.join(dir, "venv", "bin", "python");
     const tmp = path.join(os.tmpdir(), `sls-test-${randomUUID()}.json`);
+    const projSnapshot: Record<string, string> = {};
+    for (const { env, project } of envs) projSnapshot[env] = project;
     fs.writeFileSync(tmp, JSON.stringify({
       endpoint: cfg.endpoint.trim(),
       accessKeyId: cfg.accessKeyId.trim(),
       accessKeySecret: cfg.accessKeySecret.trim(),
-      projects: { dev: cfg.projects?.dev?.trim() || "", pro: cfg.projects?.pro?.trim() || "" },
+      projects: projSnapshot,
       logs: {},
     }), { mode: 0o600 });
     try {
@@ -638,14 +709,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const apps = Object.keys(cfg.logs || {});
     if (!cfg.endpoint || !apps.length) return "";
     const sls = "~/sls-tools/sls";
+    // 环境说明按实际配置动态生成：dev/pro 给出「测试/生产」语义，其余自定义环境
+    // 原样列出让模型按名字理解。默认环境优先取 pro，没有 pro 就取第一个。
+    const envNames = Object.entries(cfg.projects || {}).filter(([, p]) => (p || "").trim()).map(([e]) => e.trim());
+    const defEnv = envNames.includes("pro") ? "pro" : (envNames[0] || "pro");
+    const hint = (e: string) => (e === "dev" ? "（测试/开发环境）" : e === "pro" ? "（生产/线上环境）" : "");
+    const envLine = envNames.length
+      ? `- 环境 --env 可选值：${envNames.map((e) => `\`${e}\`${hint(e)}`).join("、")}；不传默认 \`${defEnv}\`。用户说“测试环境/开发环境”用 \`dev\`，说“线上/生产/正式”用 \`pro\`。`
+      : "- 环境 --env：`dev` = 测试/开发环境，`pro` = 生产/线上环境（不传默认 pro）。";
     return [
       "## 阿里云 SLS 后端日志查询",
       `你可以直接查询后端服务的线上日志：运行本机命令 \`${sls}\`（已配置好凭证，可直接用 Bash 调）。`,
-      "- 环境 --env：`dev` = 测试/开发环境，`pro` = 生产/线上环境（不传默认 pro）。用户说“测试环境/开发环境”用 dev，说“线上/生产/正式”用 pro。",
+      envLine,
       `- 业务项目 --app 可选值：${apps.join("、")}。`,
       "- 日志类型 --kind：`error`=异常/报错日志(默认)，`info`=普通日志，`both`=两者都查。",
       "- 时间 --from：默认最近 1 小时，可用 `30m`/`2h`/`1d` 或绝对时间；条数 `-n`（默认 20）。加 `--json` 得结构化输出。",
-      `- 示例：查测试环境 game-server 最近 1 小时的报错 → \`${sls} -q "*" --env dev --app game-server --kind error --from 1h\`；\`${sls} apps\` 列出全部项目映射。`,
+      `- 示例：查 ${defEnv} 环境 game-server 最近 1 小时的报错 → \`${sls} -q "*" --env ${defEnv} --app game-server --kind error --from 1h\`；\`${sls} apps\` 列出全部项目映射。`,
       "当用户要求查看/排查某环境某服务的日志、报错、异常、线上问题时，**主动用这个命令去查真实日志**，不要只翻本地代码或说无法获取。查询语句 -q 用 SLS 语法（如 `level: ERROR`、`* and 关键词`）。",
     ].join("\n");
   }
@@ -991,6 +1070,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const title = this.store.list().find((s) => s.id === sid)?.title;
     this.post(ctx, { kind: "load_history", items, sessionId: sid, title, checkpoints: ctx.checkpoints.list() });
     this.postSessionContext(ctx, sid);
+    // 打开会话就后台起进程 + --resume：把本地重读上下文的耗时提前，跟用户读历史/打字重叠，
+    // 而不是全压在按下发送那一刻（这是"发消息才卡十几秒"的主因之一）。
+    this.maybePrespawn(ctx);
+    // 大会话且缓存已凉：趁用户读历史/打字的空档，后台把服务端 prompt cache 焐热。
+    this.maybePrewarm(ctx);
     if (ctx.proc?.isBusy) {
       this.post(ctx, { kind: "busy", busy: true });
       // Replay an unanswered prompt; keep it stashed in case the tab closes again
@@ -1032,6 +1116,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post(ctx, { kind: "busy", busy: false });
       return;
     }
+    // 本会话的预热正在跑：等它焐完再发（上限 45s 兜底）。实测两个请求并发冷啃
+    // 同一段大上下文会互相拖慢（比先焐后发慢好几倍）；等到缓存写完那一刻立即
+    // 发出，等价于"手动等 10 秒再发"，但事件驱动、小会话零等待。
+    const inflight = this.prewarmInflight;
+    if (inflight && ctx.sessionId && inflight.key === this.warmKey(ctx.sessionId)) {
+      const t0 = Date.now();
+      await Promise.race([inflight.promise, new Promise<void>((r) => setTimeout(r, 45_000))]);
+      this.output.appendLine(`[prewarm] 发送等待预热 ${Date.now() - t0}ms 后放行`);
+    }
     // The user hit Stop after this send started (e.g. while spawning) — drop it.
     if ((ctx.stopSeq ?? -1) >= mySeq) {
       this.post(ctx, { kind: "busy", busy: false });
@@ -1054,6 +1147,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Record the checkpoint only now that the message is actually on the wire.
     const checkpointId = ctx.checkpoints.beginTurn(text || "(图片)", lineBefore);
     this.post(ctx, { kind: "checkpoint_marker", checkpointId, userText: text });
+    // 冷启动的第一轮：底部状态栏给一行安静的提示（首个流事件到达即清除）。
+    // 不往聊天里塞通知 —— 与官方一致，界面保持干净。
+    if (ctx.coldStart) {
+      ctx.coldStart = false;
+      if (this.cacheCold(ctx.sessionId ?? "")) {
+        this.post(ctx, { kind: "status", label: "正在读取会话上下文…大会话首次响应较慢" });
+      }
+    }
   }
 
   /**
@@ -1178,13 +1279,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private async setModel(ctx: SessionCtx, model: string): Promise<void> {
     await this.updateConfig("model", model);
-    // Model is a spawn argument; restart the process so it applies. Context is
-    // preserved because the next send resumes the same session id.
-    if (ctx.proc) {
-      ctx.proc.dispose();
-      ctx.proc = undefined;
-      ctx.starting = undefined;
+    // Hot-swap on every live process via the control channel — NOT a restart.
+    // Disposing here forced the next message to respawn + `--resume` the whole
+    // transcript (seconds of dead spinner on large sessions); `set_model` keeps
+    // the warm process alive and applies on the next turn, like the official ext.
+    // updateConfig already persisted it, so any future respawn still uses it.
+    const results = await Promise.allSettled(this.allProcs().map((p) => p.setModel(model)));
+    const failed = results.filter((r) => r.status === "rejected").length;
+    if (failed) {
+      this.post(ctx, { kind: "error", message: `有 ${failed} 个会话未能切换模型，请重试或新建会话。` });
     }
+    // Prompt cache 按模型隔离：切到新模型后这个会话的缓存必然是冷的，趁着
+    // 用户还没发消息先焐热，避免下一条撞上 1~2 分钟的静默读取。
+    this.maybePrewarm(ctx);
     // No chat notice — the picker label already reflects the change.
   }
 
@@ -1394,6 +1501,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       await proc.start();
       this.output.appendLine(`[claude] spawned+initialized in ${Date.now() - t0}ms (resume=${isResume})`);
+      // 恢复的大会话且缓存冷：第一轮会等很久，标记好在发送时给出诚实提示。
+      ctx.coldStart = isResume && this.cacheCold(sessionId);
     } catch (err) {
       this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
       proc.dispose(); // reap the half-started child
@@ -1405,6 +1514,134 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
     return proc;
+  }
+
+  // -- Prompt-cache prewarmer ----------------------------------------------
+  // 大会话的痛点：服务端 prompt cache 过期(1h)后，第一轮要全量重读上下文
+  // (实测 11MB 会话冷启动 ~37s，热缓存 ~6s)。打开大会话时后台用
+  // `--fork-session --no-session-persistence` 发一轮微型请求：发送的前缀
+  // (系统提示+历史)与真实会话完全一致，把缓存焐热；fork+不落盘保证绝不碰
+  // 用户的真实 transcript。官方插件都没做这个。
+
+  private static readonly PREWARM_MIN_SIZE = 1_000_000; // <1MB 的会话冷启动本来就不慢
+  private static readonly PREWARM_FRESH_MS = 50 * 60_000; // 缓存 TTL 1h，提前 10min 视为过期
+  private static readonly PREWARM_RETRY_MS = 10 * 60_000; // 失败/未完成的预热最少隔 10min 再试
+  private static readonly PREWARM_MAX_IDLE_MS = 3 * 24 * 3600_000; // 超过 3 天未活动的会话不预热（多半是翻旧账）
+
+  private transcriptSize(sid: string): number {
+    const f = this.store.findFile(sid);
+    if (!f) return 0;
+    try {
+      return fs.statSync(f).size;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** 缓存按 (会话, 模型) 记录 —— prompt cache 是按模型隔离的，切模型后同一
+   *  会话的缓存对新模型而言是冷的。 */
+  private warmKey(sid: string): string {
+    return `${sid}|${this.config().get<string>("model", "") || "default"}`;
+  }
+
+  /** 这个会话当前是否大且缓存大概率是冷的（驱动预热与冷启动提示）。 */
+  private cacheCold(sid: string): boolean {
+    if (this.transcriptSize(sid) < ChatViewProvider.PREWARM_MIN_SIZE) return false;
+    const done = this.prewarmDone.get(this.warmKey(sid)) ?? 0;
+    return Date.now() - done >= ChatViewProvider.PREWARM_FRESH_MS;
+  }
+
+  /** 会话打开即后台预启动真实进程并 --resume，让本地重读上下文的开销与用户读历史/打字
+   *  重叠，而不是全压在按下发送那一刻。fire-and-forget：ensureProcess 自带 starting/复用
+   *  去重，重复调用安全；真正起不来（如 claudePath 配错）时 spawnProcess 会自行报错。 */
+  private maybePrespawn(ctx: SessionCtx): void {
+    if (!this.config().get<boolean>("prespawnOnOpen", true)) return;
+    if (!ctx.sessionId) return;        // 新会话无需 resume，首启动本来就快
+    if (ctx.proc || ctx.starting) return; // 已有活进程 / 正在启动
+    void this.ensureProcess(ctx);
+  }
+
+  /** Best-effort：失败静默（顶多损失一次预热），绝不打扰正常使用。 */
+  private maybePrewarm(ctx: SessionCtx): void {
+    if (!this.config().get<boolean>("prewarmCache", true)) return;
+    const sid = ctx.sessionId;
+    if (!sid || !this.cacheCold(sid)) return;
+    if (ctx.proc?.isBusy) return; // 正在跑的真实轮次本身就在焐缓存
+    if (this.prewarmProc) return; // 同时只跑一个，预热是要花 token 的
+    // 超过 3 天没动过的会话大概率是翻旧账（查资料），不是要续聊 —— 不花这笔预热
+    // token。真续聊了，第一轮回复会刷新 transcript 的 mtime，之后保温恢复正常。
+    {
+      const f = this.store.findFile(sid);
+      try {
+        if (f && Date.now() - fs.statSync(f).mtimeMs > ChatViewProvider.PREWARM_MAX_IDLE_MS) {
+          this.output.appendLine(`[prewarm] ${sid.slice(0, 8)} skipped: 会话超过 3 天未活动`);
+          return;
+        }
+      } catch {
+        /* stat 失败不拦截 */
+      }
+    }
+    // 5小时额度快用完时不再预热 —— 把剩余额度留给真实对话。
+    const pct = (this.lastUsage as { sessionPct?: number } | undefined)?.sessionPct;
+    if (pct !== undefined && pct >= 80) {
+      this.output.appendLine(`[prewarm] skipped: 5h usage at ${pct}%`);
+      return;
+    }
+    const key = this.warmKey(sid);
+    const started = this.prewarmStarted.get(key) ?? 0;
+    if (Date.now() - started < ChatViewProvider.PREWARM_RETRY_MS) return;
+    this.prewarmStarted.set(key, Date.now());
+
+    const t0 = Date.now();
+    let done = false;
+    // 完成信号：让撞上预热的真实发送可以等到"焐好那一刻"立即发出（见 handleSend）。
+    let signalDone: () => void = () => undefined;
+    const inflight = { key, promise: new Promise<void>((r) => (signalDone = r)) };
+    this.prewarmInflight = inflight;
+    const cleanup = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (ok) this.prewarmDone.set(key, Date.now());
+      this.output.appendLine(`[prewarm] ${sid.slice(0, 8)} ${ok ? "warmed" : "aborted"} in ${Date.now() - t0}ms`);
+      if (this.prewarmProc === proc) this.prewarmProc = undefined;
+      if (this.prewarmInflight === inflight) this.prewarmInflight = undefined;
+      signalDone(); // 无论成败都放行等待中的发送 —— 失败就按原来的冷发送走
+      proc.dispose();
+    };
+    // 系统提示/历史前缀必须与 spawnProcess 完全一致 —— 缓存按前缀精确匹配。
+    // effort 是请求级参数、不进缓存前缀，预热用 low 省 token（不用思考半天）。
+    const proc = new ClaudeProcess(
+      {
+        claudePath: this.config().get<string>("claudePath", "claude"),
+        cwd: this.cwd(),
+        model: this.config().get<string>("model", "") || undefined,
+        effort: "low",
+        permissionMode: this.config().get<string>("permissionMode", "default"),
+        resumeSessionId: sid,
+        forkNoPersist: true,
+        maxTurns: 1, // 一轮即停：即使模型想调工具也不会执行
+        addDirs: this.workspaceDirs(),
+        appendSystemPrompt: this.config().get<string>("appendSystemPrompt", "") || undefined,
+      },
+      {
+        emit: (e) => {
+          if (e.kind === "result") cleanup(!e.isError);
+        },
+        onPermission: (req) => proc.respondPermission(req.requestId, { behavior: "deny", message: "预热请求，无需工具。" }),
+        onSessionId: () => undefined, // fork 出的新 id 与任何 tab 无关
+        onClose: () => cleanup(false),
+      },
+    );
+    this.prewarmProc = proc;
+    const timer = setTimeout(() => cleanup(false), 180_000); // 硬上限 3min
+    this.output.appendLine(`[prewarm] ${sid.slice(0, 8)} start (${Math.round(this.transcriptSize(sid) / 1024)}KB)`);
+    void proc
+      .start()
+      .then(() => {
+        if (!proc.sendUserMessage("这是一条缓存预热消息：请只回复“ok”两个字母，不要调用任何工具。")) cleanup(false);
+      })
+      .catch(() => cleanup(false));
   }
 
   /** Is this ctx still attached to a live, displayable panel? */
@@ -1436,6 +1673,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (e.kind === "result") {
       this.refreshSessions();
       this.fetchUsage(); // throttled — subscription usage moved after this turn
+      // 一轮真实对话本身就把缓存焐热了 —— 记下来，别再浪费 token 去预热。
+      if (ctx.sessionId) this.prewarmDone.set(this.warmKey(ctx.sessionId), Date.now());
     }
   }
 
@@ -1954,12 +2193,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
+    if (this.keepWarmTimer) clearInterval(this.keepWarmTimer);
+    this.keepWarmTimer = undefined;
     // Flush debounced snapshot writes first — a hard window close within 500ms
     // of the last file edit would otherwise lose that file's baseline.
     for (const ctx of this.sessions) ctx.checkpoints.flush();
     for (const ctx of this.detached.values()) ctx.checkpoints.flush();
     for (const ctx of this.sessions) ctx.proc?.dispose();
     for (const ctx of this.detached.values()) ctx.proc?.dispose();
+    this.prewarmProc?.dispose();
+    this.prewarmProc = undefined;
     this.sessions.clear();
     this.detached.clear();
     this.terminal?.dispose();
@@ -2056,15 +2299,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .sls-lsh > span { font-size: 11px; font-weight: 600; opacity: .8; }
   .sls-mini { font-size: 11px; cursor: pointer; background: none; color: var(--vscode-button-background); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; padding: 2px 8px; }
   .sls-mini:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
-  .sls-rows { display: flex; flex-direction: column; gap: 6px; }
-  .sls-row { display: flex; align-items: center; gap: 6px; }
-  .sls-row .a { flex: 0 0 34%; }
-  .sls-row .s { flex: 1; }
-  .sls-row .x { flex: 0 0 auto; width: 22px; height: 26px; line-height: 1; font-size: 15px; cursor: pointer; background: none; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; }
-  .sls-row .x:hover { color: var(--vscode-errorForeground, #e55); }
-  .sls-json { width: 100%; min-height: 120px; resize: vertical; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 7px 8px; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11.5px; line-height: 1.5; }
+  /* 用系统内置滚动条；resize:none 去掉右下角那个丑陋的缩放手柄方块。 */
+  .sls-json { width: 100%; min-height: 120px; resize: none; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 7px 8px; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11.5px; line-height: 1.5; }
   .sls-json:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
   .sls-json.bad { border-color: var(--vscode-errorForeground, #e55); }
+  /* 可增删的环境行：[环境名][Project 名][删除] */
+  .sls-envs { display: flex; flex-direction: column; gap: 6px; }
+  .sls-env-row { display: flex; align-items: center; gap: 6px; }
+  .sls-env-row .env { flex: 0 0 33%; min-width: 0; }
+  .sls-env-row .proj { flex: 1 1 auto; min-width: 0; }
+  .sls-env-row .del { flex: 0 0 auto; width: 26px; height: 30px; line-height: 1; font-size: 15px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; padding: 0; background: none;
+    color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; }
+  .sls-env-row .del:hover { color: var(--vscode-errorForeground, #e55); border-color: var(--vscode-errorForeground, #e55); }
+  /* 查看态：只读、隐藏删除按钮、视觉弱化，一眼能看出不可编辑。 */
+  .sls-envs.view .sls-env-row .del { display: none; }
+  .sls-envs.view .sls-env-row input { cursor: default; opacity: .7; border-style: dashed; background: transparent; }
+  /* 编辑态末尾的「新增环境」按钮：整行虚线框。 */
+  .sls-env-add-btn { width: 100%; padding: 6px; margin-top: 2px; font: inherit; font-size: 12px; cursor: pointer;
+    background: none; color: var(--vscode-descriptionForeground);
+    border: 1px dashed var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.4))); border-radius: 6px; }
+  .sls-env-add-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder, #3794ff); }
+  /* 头部小按钮进入「保存」态时高亮成主按钮色。 */
+  .sls-mini.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+  .sls-mini.primary:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
   .sls-lsh > span:last-child { display: inline-flex; gap: 6px; }
   .sls-sub { font-size: 10.5px; opacity: .6; line-height: 1.5; }
   .sls-sub code, .sls-hint code { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.18)); padding: 0 4px; border-radius: 3px; }
@@ -2101,14 +2359,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <label class="sls-f"><span>AccessKey ID</span><input id="sls-ak-id" type="text" placeholder="LTAI…" spellcheck="false" autocomplete="off" /></label>
       <div class="sls-f"><span>AccessKey Secret</span>
         <div class="sls-pw"><input id="sls-ak-secret" type="password" placeholder="仅存本机" spellcheck="false" autocomplete="off" /><button id="sls-ak-eye" class="sls-eye" type="button" title="显示/隐藏"></button></div></div>
-      <label class="sls-f"><span>dev 环境 SLS Project</span><input id="sls-proj-dev" type="text" placeholder="dev 的 project 名" spellcheck="false" /></label>
-      <label class="sls-f"><span>pro 环境 SLS Project</span><input id="sls-proj-pro" type="text" placeholder="pro 的 project 名" spellcheck="false" /></label>
+      <div class="sls-f">
+        <div class="sls-lsh"><span>环境 SLS Project</span>
+          <span><button id="sls-env-edit" class="sls-mini" type="button" title="编辑环境（增删 / 改名）">编辑环境</button></span></div>
+        <div id="sls-envs" class="sls-envs view"></div>
+        <div class="sls-sub"><code>dev</code>=测试/开发、<code>pro</code>=生产/线上；也可自定义环境名。点“编辑环境”增删，改完点“保存”一起提交，留空的行自动忽略。</div>
+      </div>
       <div class="sls-f">
         <div class="sls-lsh"><span>项目日志映射（JSON）</span>
           <span><button id="sls-tpl" class="sls-mini" title="测试连接后可根据实际 logstore 生成模板">生成模板</button>
           <button id="sls-gen" class="sls-mini" title="让 Claude 扫描工作区 Spring Boot 配置自动生成，需先填好连接信息并保存">AI 生成配置</button></span></div>
         <textarea id="sls-logs" class="sls-json" spellcheck="false" placeholder='{&#10;  "order": { "info": "order-info", "error": "order-error" },&#10;  "user":  { "info": "user-info",  "error": "user-error" }&#10;}'></textarea>
-        <div class="sls-sub">每个业务项目 → info / 异常两个 logstore，dev/pro 共用此映射。查询示例：<code>sls -q "*" --env pro --app order</code>（默认查 error，加 <code>--kind info</code> 查 info）。</div>
+        <div class="sls-sub">每个业务项目 → info / 异常两个 logstore，各环境共用此映射。查询示例：<code>sls -q "*" --env pro --app order</code>（默认查 error，加 <code>--kind info</code> 查 info）。</div>
       </div>
       <div id="sls-status" class="sls-status hidden"></div>
       <div class="sls-acts">
@@ -2226,16 +2488,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     // ---- SLS 日志配置 ----
-    let slsBusy = false, slsLastStores = [];
+    let slsBusy = false, slsLastStores = [], slsEnvEditing = false;
+    // 已提交的环境数据（数组保留顺序，允许编辑时出现空行）。查看态从这里渲染。
+    let slsEnvEntries = [];
+    // 造一行 [环境名][Project 名][删除]；readonly 由当前是否编辑态决定。
+    function slsMakeEnvRow(env, project) {
+      const row = document.createElement("div");
+      row.className = "sls-env-row";
+      const envIn = document.createElement("input");
+      envIn.type = "text"; envIn.className = "env"; envIn.placeholder = "环境名"; envIn.spellcheck = false;
+      envIn.value = env || ""; envIn.readOnly = !slsEnvEditing;
+      const projIn = document.createElement("input");
+      projIn.type = "text"; projIn.className = "proj"; projIn.placeholder = "SLS Project 名"; projIn.spellcheck = false;
+      projIn.value = project || ""; projIn.readOnly = !slsEnvEditing;
+      const del = document.createElement("button");
+      del.type = "button"; del.className = "del"; del.title = "删除此环境"; del.textContent = "×";
+      del.addEventListener("click", () => row.remove());
+      row.append(envIn, projIn, del);
+      return row;
+    }
+    // 按当前 slsEnvEditing 重绘环境区：查看态只读弱化、无新增；编辑态可改可删 + 末尾「新增环境」。
+    function slsRenderEnvs() {
+      const box = $("sls-envs");
+      box.innerHTML = "";
+      box.classList.toggle("view", !slsEnvEditing);
+      const entries = slsEnvEntries.length ? slsEnvEntries : [{ env: "dev", project: "" }, { env: "pro", project: "" }];
+      for (const e of entries) box.appendChild(slsMakeEnvRow(e.env, e.project));
+      if (slsEnvEditing) {
+        const add = document.createElement("button");
+        add.type = "button"; add.className = "sls-env-add-btn"; add.textContent = "+ 新增环境";
+        add.addEventListener("click", () => {
+          const row = slsMakeEnvRow("", "");
+          box.insertBefore(row, add);
+          row.querySelector(".env").focus();
+        });
+        box.appendChild(add);
+      }
+      const btn = $("sls-env-edit");
+      btn.textContent = slsEnvEditing ? "保存" : "编辑环境";
+      btn.title = slsEnvEditing ? "保存环境改动" : "编辑环境（增删 / 改名）";
+      btn.classList.toggle("primary", slsEnvEditing);
+    }
+    function slsFillEnvs(projects) {
+      slsEnvEntries = Object.entries(projects || {}).map(([env, project]) => ({ env, project }));
+      slsEnvEditing = false; // 外部刷新/回填一律回到查看态
+      slsRenderEnvs();
+    }
     function slsFill(cfg) {
       cfg = cfg || {};
       $("sls-endpoint").value = cfg.endpoint || "";
       $("sls-ak-id").value = cfg.accessKeyId || "";
       $("sls-ak-secret").value = cfg.accessKeySecret || "";
       $("sls-ak-secret").type = "password"; $("sls-ak-eye").innerHTML = EYE; // 回填后回到隐藏态
-      const proj = cfg.projects || {};
-      $("sls-proj-dev").value = proj.dev || "";
-      $("sls-proj-pro").value = proj.pro || "";
+      slsFillEnvs(cfg.projects || {});
       const logs = cfg.logs || {};
       $("sls-logs").value = Object.keys(logs).length ? JSON.stringify(logs, null, 2) : "";
       $("sls-logs").classList.remove("bad");
@@ -2251,12 +2556,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return { ok: true, logs: obj };
       } catch (e) { return { ok: false, error: "JSON 格式错误：" + (e && e.message ? e.message : e) }; }
     }
+    // 从环境行收集 { 环境名: project }；环境名为空的行丢弃，重名后者覆盖前者。
+    function slsCollectEnvs() {
+      const projects = {};
+      for (const row of $("sls-envs").querySelectorAll(".sls-env-row")) {
+        const env = row.querySelector(".env").value.trim();
+        if (env) projects[env] = row.querySelector(".proj").value.trim();
+      }
+      return projects;
+    }
     function slsCollect(logs) {
       return {
         endpoint: $("sls-endpoint").value.trim(),
         accessKeyId: $("sls-ak-id").value.trim(),
         accessKeySecret: $("sls-ak-secret").value.trim(),
-        projects: { dev: $("sls-proj-dev").value.trim(), pro: $("sls-proj-pro").value.trim() },
+        projects: slsCollectEnvs(),
         logs: logs || {},
       };
     }
@@ -2299,6 +2613,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const inp = $("sls-ak-secret"), show = inp.type === "password";
       inp.type = show ? "text" : "password";
       $("sls-ak-eye").innerHTML = show ? EYE_OFF : EYE;
+    });
+    // 头部按钮：查看态 → 进入编辑；编辑态 → 校验并一起保存整份配置、回到查看态。
+    $("sls-env-edit").addEventListener("click", () => {
+      if (slsBusy) return;
+      if (!slsEnvEditing) { slsEnvEditing = true; slsRenderEnvs(); return; }
+      const r = slsParseLogs();
+      if (!r.ok) { $("sls-logs").classList.add("bad"); slsStatus(r.error, "err"); return; }
+      $("sls-logs").classList.remove("bad");
+      // 收集编辑态的环境行为已提交数据（丢弃环境名为空的行），再退出编辑态。
+      slsEnvEntries = [];
+      for (const row of $("sls-envs").querySelectorAll(".sls-env-row")) {
+        const env = row.querySelector(".env").value.trim();
+        if (env) slsEnvEntries.push({ env, project: row.querySelector(".proj").value.trim() });
+      }
+      slsEnvEditing = false;
+      slsRenderEnvs();
+      slsSetBusy(true); slsStatus("正在保存…", "wait");
+      vscode.postMessage({ type: "slsSave", config: slsCollect(r.logs) });
     });
     $("sls-gen").addEventListener("click", () => {
       vscode.postMessage({ type: "slsGenerate" });

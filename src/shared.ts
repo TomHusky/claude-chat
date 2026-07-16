@@ -32,13 +32,14 @@ export const ICONS: Record<string, string> = {
 };
 
 /** SLS 连接配置。持久化在 `~/sls-tools/config.json`，供 `sls` CLI 与本面板共用。
- *  dev/pro 是两个独立的 SLS Project；logs 把每个业务项目映射到 info/error 两个
- *  logstore（两环境共用同一份映射，环境只切 Project）。 */
+ *  projects 是「环境名 -> SLS Project」的映射，可自由增删环境（默认种子 dev/pro）；
+ *  logs 把每个业务项目映射到 info/error 两个 logstore（各环境共用同一份映射，环境只切
+ *  Project）。 */
 export interface SlsConfig {
   endpoint: string;
   accessKeyId: string;
   accessKeySecret: string;
-  projects: { dev: string; pro: string };
+  projects: Record<string, string>;
   logs: Record<string, { info?: string; error?: string }>;
 }
 
@@ -68,6 +69,7 @@ export type ToWebview =
     }
   | { kind: "permission_resolved"; requestId: string; behavior: "allow" | "deny"; auto?: boolean }
   | { kind: "tokens"; output: number }
+  | { kind: "thinking_tokens"; tokens: number }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }

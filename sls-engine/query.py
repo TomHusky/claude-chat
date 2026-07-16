@@ -56,14 +56,21 @@ def load_config(path):
 
 
 def resolve_project(cfg, args):
-    """返回 (project 名, env)。--project 显式覆盖；否则按 --env 从 projects 取。"""
-    env = (getattr(args, "env", None) or "pro").lower()
+    """返回 (project 名, env)。--project 显式覆盖；否则按 --env 从 projects 取。
+    环境名可自定义，先精确匹配、再大小写不敏感匹配，兼容 dev/Dev/PRO 之类写法。"""
+    env = getattr(args, "env", None) or "pro"
     if getattr(args, "project", None):
         return args.project, env
     projects = cfg.get("projects", {})
     proj = projects.get(env)
+    if not proj:  # 大小写不敏感兜底
+        for k, v in projects.items():
+            if k.lower() == env.lower():
+                proj, env = v, k
+                break
     if not proj:
-        die(f"环境 {env!r} 未配置 SLS Project（在配置里填 projects.{env}）")
+        avail = "、".join(projects.keys()) or "(无)"
+        die(f"环境 {env!r} 未配置 SLS Project（已配置的环境：{avail}）")
     return proj, env
 
 
@@ -106,7 +113,12 @@ def cmd_projects(cfg, args):
 def cmd_apps(cfg, args):
     logs = cfg.get("logs", {})
     projects = cfg.get("projects", {})
-    print(f"# 环境: dev={projects.get('dev', '(未配置)')}  pro={projects.get('pro', '(未配置)')}")
+    # 环境可自由增删——按配置里实际存在的逐个列出，别再假设只有 dev/pro。
+    if projects:
+        envs = "  ".join(f"{env}={proj or '(未配置)'}" for env, proj in projects.items())
+    else:
+        envs = "(未配置)"
+    print(f"# 环境: {envs}")
     if not logs:
         print("(logs 映射为空)")
         return
@@ -216,7 +228,7 @@ def build_parser():
 
     def add_query_args(sp):
         sp.add_argument("-q", "--q", default="*", help="SLS 查询语句，默认 *")
-        sp.add_argument("--env", choices=["dev", "pro"], help="环境(选 dev/pro 的 Project)，默认 pro")
+        sp.add_argument("--env", help="环境名(对应 projects 里的 key，可自定义)，默认 pro")
         sp.add_argument("-a", "--app", help="业务项目名（logs 映射里的 key）")
         sp.add_argument("--kind", choices=["info", "error", "both"], help="查 info / error / both，默认 error")
         sp.add_argument("-l", "--logstore", help="直接指定 logstore（覆盖 --app/--kind）")
@@ -231,7 +243,7 @@ def build_parser():
     sub.add_parser("projects", help="列出所有 SLS Project").add_argument("--config")
     sub.add_parser("apps", help="列出已配置的业务项目及其 info/error logstore").add_argument("--config")
     sp_ls = sub.add_parser("logstores", help="列出某环境 Project 下所有 logstore")
-    sp_ls.add_argument("--env", choices=["dev", "pro"])
+    sp_ls.add_argument("--env")
     sp_ls.add_argument("-p", "--project")
     sp_ls.add_argument("--json", action="store_true")
     sp_ls.add_argument("--config")

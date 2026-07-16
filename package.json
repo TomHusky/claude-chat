@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.182",
+  "version": "0.1.198",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -204,6 +204,16 @@
           "type": "boolean",
           "default": true,
           "description": "Before each file edit, snapshot the file so restore points can revert workspace changes."
+        },
+        "claudeChat.prewarmCache": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开大会话(>1MB)时后台预热服务端 prompt cache：首次响应从 1~2 分钟降到几秒。代价是每次预热消耗一次全量上下文的 input token（走缓存写价格）。额度紧张时可关闭；5 小时用量超 80% 时自动跳过。"
+        },
+        "claudeChat.prespawnOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "打开/切换到已有会话时立即后台启动并 --resume 进程，让读取上下文的耗时和你读历史、打字的时间重叠，而不是全压在按下发送那一刻（官方交互式就是打开即 resume）。几乎不额外花 token，只是把本来要花的启动开销提前。"
         },
         "claudeChat.appendSystemPrompt": {
           "type": "string",

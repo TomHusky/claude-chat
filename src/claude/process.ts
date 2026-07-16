@@ -29,6 +29,14 @@ export interface ClaudeProcessOptions {
   addDirs?: string[];
   /** Extra instruction appended to the default system prompt (e.g. reply language). */
   appendSystemPrompt?: string;
+  /** Fork the resumed session into a new id AND write nothing to disk. Used by
+   *  the cache prewarmer: it must send the exact same prompt prefix as a real
+   *  turn (to warm the server-side prompt cache) without touching the user's
+   *  transcript. Only meaningful together with `resumeSessionId`. */
+  forkNoPersist?: boolean;
+  /** Cap agentic turns (`--max-turns`). The prewarmer uses 1: even if the model
+   *  answers with a tool call, the CLI stops before executing anything. */
+  maxTurns?: number;
   env?: NodeJS.ProcessEnv;
 }
 
@@ -77,6 +85,7 @@ export class ClaudeProcess {
   private currentModel?: string; // model id from the init event (for context window)
   private busy = false;
   private pendingMode?: string; // mode change requested before the handshake finished
+  private pendingModel?: string; // model change requested before the handshake finished
   private readonly seenToolIds = new Set<string>();
   private stderrTail = "";
 
@@ -160,13 +169,12 @@ export class ClaudeProcess {
     if (this.pendingMode) {
       const mode = this.pendingMode;
       this.pendingMode = undefined;
-      // A refused mode switch must not fail the whole spawn — the process is
-      // usable, just in its spawn-time mode.
-      try {
-        await this.setPermissionMode(mode);
-      } catch {
-        /* keep the spawned mode */
-      }
+      try { await this.setPermissionMode(mode); } catch { /* keep the spawned mode */ }
+    }
+    if (this.pendingModel !== undefined) {
+      const model = this.pendingModel;
+      this.pendingModel = undefined;
+      try { await this.setModel(model); } catch { /* keep the spawned model */ }
     }
   }
 
@@ -188,6 +196,8 @@ export class ClaudeProcess {
     if (this.opts.effort) a.push("--effort", this.opts.effort);
     if (this.opts.resumeSessionId) a.push("--resume", this.opts.resumeSessionId);
     else if (this.opts.sessionId) a.push("--session-id", this.opts.sessionId);
+    if (this.opts.forkNoPersist) a.push("--fork-session", "--no-session-persistence");
+    if (this.opts.maxTurns) a.push("--max-turns", String(this.opts.maxTurns));
     for (const dir of this.opts.addDirs ?? []) a.push("--add-dir", dir);
     if (this.opts.appendSystemPrompt) a.push("--append-system-prompt", this.opts.appendSystemPrompt);
     return a;
@@ -290,6 +300,20 @@ export class ClaudeProcess {
     // Let rejections propagate — swallowing them made a refused mode switch look
     // like success while the process kept asking for every permission.
     await this.sendControlRequest({ subtype: "set_permission_mode", mode });
+  }
+
+  /** Hot-swap the model on the running process — the same control request the
+   *  official extension uses. Avoids tearing the process down and paying a full
+   *  `--resume` transcript reload on the next message. `model === ""` means the
+   *  user picked "默认", which maps to the CLI's own default (model: null). */
+  async setModel(model: string): Promise<void> {
+    if (!this.proc || this.exited) return;
+    if (!this.initialized) {
+      // Mid-handshake: a control request now would wait out the 30s timeout.
+      this.pendingModel = model;
+      return;
+    }
+    await this.sendControlRequest({ subtype: "set_model", model: model || null });
   }
 
   dispose(): void {
@@ -529,6 +553,12 @@ export class ClaudeProcess {
         preTokens: md.pre_tokens ?? 0,
         postTokens: md.post_tokens ?? 0,
       });
+    } else if ((ev as any).subtype === "thinking_tokens") {
+      // CLI 在扩展思考时会推真实的思考 token 累计数（官方 UI 的 "· Nk tokens" 就来自这里）。
+      // 字段名各版本可能不同，几个候选都试；取到正数才发，webview 用它盖掉字符估算值。
+      const e = ev as any;
+      const n = Number(e.tokens ?? e.thinking_tokens ?? e.count ?? e.output_tokens ?? 0);
+      if (Number.isFinite(n) && n > 0) this.hooks.emit({ kind: "thinking_tokens", tokens: n });
     }
   }
 

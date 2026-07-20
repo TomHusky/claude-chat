@@ -70,11 +70,15 @@ export type ToWebview =
   | { kind: "permission_resolved"; requestId: string; behavior: "allow" | "deny"; auto?: boolean }
   | { kind: "tokens"; output: number }
   | { kind: "thinking_tokens"; tokens: number }
+  /** 纯诊断信息：只进输出通道日志，绝不显示到界面。 */
+  | { kind: "diag"; message: string }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
   | { kind: "result"; isError: boolean; costUsd?: number; durationMs?: number; numTurns?: number }
-  | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekSonnetPct?: number }
+  /** weekModel*: 除 "all models" 外的按模型周限额行（CLI 输出哪个模型就显示哪个，
+   *  如 Sonnet / Fable —— 不写死模型名，跟着官方 /usage 文案走）。 */
+  | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekModelPct?: number; weekModelName?: string }
   | { kind: "compacting" }
   | { kind: "compacted"; trigger: string; preTokens: number; postTokens: number }
   /** Subscription quota. `exhausted` blocks further turns until `resetsAt`. */
@@ -182,6 +186,9 @@ export type FromWebview =
   | { type: "checkUpdate" }
   | { type: "refreshUsage" }
   | { type: "send"; text: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[]; sls?: boolean }
+  /** 从 OS（Finder 等）拖入工作区外的文件/目录：webview 拿不到绝对路径，只能读出
+   *  内容传给宿主，由宿主镜像写盘后再按普通路径附加。rel 含顶层名（如 "dir/a.ts"）。 */
+  | { type: "importDropped"; roots: { name: string; isDir: boolean }[]; files: { rel: string; base64: string }[]; skipped?: number }
   | { type: "editMessage"; checkpointId: string; text: string; images?: { mediaType: string; data: string }[] }
   | { type: "interrupt" }
   | { type: "compact" }

@@ -553,6 +553,11 @@ export class ClaudeProcess {
         preTokens: md.pre_tokens ?? 0,
         postTokens: md.post_tokens ?? 0,
       });
+    } else if ((ev as any).subtype === "api_retry") {
+      // API 限流/过载时 CLI 自动退避重试——用户会感知为"莫名静默很久"。
+      // 不打扰界面，只上报给 provider 记日志（diag 事件 webview 直接忽略）。
+      const e = ev as any;
+      this.hooks.emit({ kind: "diag", message: `api_retry: ${JSON.stringify({ attempt: e.attempt ?? e.retry_count, delay: e.delay_ms ?? e.retry_in, error: e.error }).slice(0, 300)}` });
     } else if ((ev as any).subtype === "thinking_tokens") {
       // CLI 在扩展思考时会推真实的思考 token 累计数（官方 UI 的 "· Nk tokens" 就来自这里）。
       // 字段名各版本可能不同，几个候选都试；取到正数才发，webview 用它盖掉字符估算值。

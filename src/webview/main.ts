@@ -480,12 +480,14 @@ type UsageData = {
   sessionReset?: string;
   weekPct?: number;
   weekReset?: string;
-  weekSonnetPct?: number;
+  /** 按模型的周限额（模型名跟着 CLI /usage 输出走：Sonnet / Fable …）。 */
+  weekModelPct?: number;
+  weekModelName?: string;
 };
 let lastUsageData: UsageData = {};
 const usageMenu = $("usage-menu");
-function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string, weekSonnetPct?: number) {
-  lastUsageData = { sessionPct, sessionReset, weekPct, weekReset, weekSonnetPct };
+function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string, weekModelPct?: number, weekModelName?: string) {
+  lastUsageData = { sessionPct, sessionReset, weekPct, weekReset, weekModelPct, weekModelName };
   const parts: string[] = [];
   if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
   if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
@@ -551,7 +553,10 @@ function buildUsageMenu() {
   let html = `<div class="pick-head usage-head">套餐用量</div>`;
   html += usageRow("5 小时限额", d.sessionPct, cnResetSession(d.sessionReset));
   html += usageRow("每周 · 全部模型", d.weekPct, cnResetWeek(d.weekReset));
-  html += usageRow("仅 Sonnet", d.weekSonnetPct, "");
+  // 按模型的周限额行：CLI 输出了才显示（模型名原样带出，Sonnet/Fable 都通用）。
+  if (typeof d.weekModelPct === "number") {
+    html += usageRow(`仅 ${d.weekModelName || "特定模型"}`, d.weekModelPct, "");
+  }
   usageMenu.innerHTML = html;
 }
 /** Anchor the popover directly above the usage pill (right edges aligned). */
@@ -703,7 +708,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       }
       break;
     case "usage":
-      renderUsage(m.sessionPct, m.sessionReset, m.weekPct, m.weekReset, m.weekSonnetPct);
+      renderUsage(m.sessionPct, m.sessionReset, m.weekPct, m.weekReset, m.weekModelPct, m.weekModelName);
       break;
     case "compacting":
       compacting = true;
@@ -2164,6 +2169,8 @@ window.addEventListener(
     dropZone.classList.remove("drag-over");
     const dt = e.dataTransfer;
     if (!dt) return;
+    // ① VS Code 资源管理器（含其他窗口）拖入：uri-list 里直接有 file:// 路径。
+    let added = 0;
     const raw =
       dt.getData("application/vnd.code.uri-list") || dt.getData("text/uri-list") || dt.getData("text/plain") || "";
     for (const line of raw.split(/[\r\n]+/)) {
@@ -2171,14 +2178,109 @@ window.addEventListener(
       if (!s || s.startsWith("#")) continue;
       try {
         const u = new URL(s);
-        if (u.protocol === "file:") addFile(decodeURIComponent(u.pathname));
+        if (u.protocol === "file:") {
+          addFile(decodeURIComponent(u.pathname));
+          added++;
+        }
       } catch {
-        if (s.startsWith("/")) addFile(s);
+        if (s.startsWith("/")) {
+          addFile(s);
+          added++;
+        }
       }
     }
+    if (added) return;
+    // ② OS（Finder 等）拖入：没有 uri-list。老 Electron 的 File.path 能直接拿到
+    // 绝对路径；新版拿不到就走 ③。
+    const plainFiles = dt.files ? Array.from(dt.files) : [];
+    if (plainFiles.length && plainFiles.every((f) => (f as any).path)) {
+      for (const f of plainFiles) addFile((f as any).path);
+      return;
+    }
+    // ③ 兜底：webview 里读出内容传给宿主镜像写盘（目录用 webkitGetAsEntry 递归）。
+    // entries 必须在 drop 事件同步阶段抓取 —— dataTransfer 一出事件就失效。
+    const entries = dt.items ? Array.from(dt.items).map((it) => (it as any).webkitGetAsEntry?.()).filter(Boolean) : [];
+    if (entries.length) void importDroppedEntries(entries);
+    else if (plainFiles.length) void importDroppedPlainFiles(plainFiles);
   },
   true,
 );
+
+// ---- 工作区外拖入的镜像导入（Finder 等来源，webview 拿不到绝对路径时） ----------
+const DROP_MAX_FILE = 10 * 1024 * 1024; // 单文件上限 10MB
+const DROP_MAX_TOTAL = 30 * 1024 * 1024; // 单次拖入总量 30MB
+const DROP_MAX_COUNT = 300; // 单次拖入文件数上限
+
+function bufToB64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function importDroppedPlainFiles(files: File[]): Promise<void> {
+  const out: { rel: string; base64: string }[] = [];
+  let skipped = 0;
+  let total = 0;
+  for (const f of files) {
+    if (f.size > DROP_MAX_FILE || total + f.size > DROP_MAX_TOTAL || out.length >= DROP_MAX_COUNT) {
+      skipped++;
+      continue;
+    }
+    total += f.size;
+    out.push({ rel: f.name, base64: bufToB64(await f.arrayBuffer()) });
+  }
+  if (out.length || skipped) {
+    send({ type: "importDropped", roots: out.map((o) => ({ name: o.rel, isDir: false })), files: out, skipped: skipped || undefined });
+  }
+}
+
+async function importDroppedEntries(entries: any[]): Promise<void> {
+  const out: { rel: string; file: File }[] = [];
+  const stat = { bytes: 0, skipped: 0 };
+  const roots: { name: string; isDir: boolean }[] = [];
+  const entryFile = (en: any) => new Promise<File>((res, rej) => en.file(res, rej));
+  const readBatch = (rd: any) => new Promise<any[]>((res, rej) => rd.readEntries(res, rej));
+  async function collect(en: any, prefix: string): Promise<void> {
+    if (en.isFile) {
+      let f: File;
+      try {
+        f = await entryFile(en);
+      } catch {
+        stat.skipped++;
+        return;
+      }
+      if (f.size > DROP_MAX_FILE || stat.bytes + f.size > DROP_MAX_TOTAL || out.length >= DROP_MAX_COUNT) {
+        stat.skipped++;
+        return;
+      }
+      stat.bytes += f.size;
+      out.push({ rel: prefix + en.name, file: f });
+    } else if (en.isDirectory) {
+      const rd = en.createReader();
+      for (;;) {
+        // readEntries 按批返回（Chromium 每批最多 100），必须循环读到空为止。
+        let batch: any[];
+        try {
+          batch = await readBatch(rd);
+        } catch {
+          break;
+        }
+        if (!batch.length) break;
+        for (const child of batch) await collect(child, prefix + en.name + "/");
+      }
+    }
+  }
+  for (const en of entries) {
+    roots.push({ name: en.name, isDir: !!en.isDirectory });
+    await collect(en, "");
+  }
+  const files: { rel: string; base64: string }[] = [];
+  for (const o of out) files.push({ rel: o.rel, base64: bufToB64(await o.file.arrayBuffer()) });
+  if (files.length || roots.length) {
+    send({ type: "importDropped", roots, files, skipped: stat.skipped || undefined });
+  }
+}
 
 // ---- Mode / model / effort pickers (popup menus, like Claude's UI) ----------
 const SVG = (p: string) =>

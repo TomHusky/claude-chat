@@ -45,6 +45,8 @@ interface SessionCtx {
   /** When this ctx last entered the background pool. Drives LRU eviction — the
    *  oldest IDLE background process is reaped first once the pool exceeds its cap. */
   lastUsedAt?: number;
+  /** 本条消息写入 CLI 的时刻；首个流事件到达时用来算真实等待并记日志（然后清掉）。 */
+  sendAt?: number;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -119,6 +121,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 打开的 tab 补一次 maybePrewarm —— 它自带全部守卫（>1MB、50min 内焐过不重复、
     // 额度>80% 跳过、同时只跑一个），所以静息成本为零，只在快过期时才真正花钱。
     this.keepWarmTimer = setInterval(() => {
+      // 有会话正在回复时避让：预热是全量上下文的大请求，跟真实对话抢并发可能
+      // 触发 API 限流重试，反而拖慢用户正在等的那条。下个 tick 再补不迟。
+      for (const ctx of this.sessions) if (ctx.proc?.isBusy) return;
+      for (const ctx of this.detached.values()) if (ctx.proc?.isBusy) return;
       if (this.activeCtx) this.maybePrewarm(this.activeCtx); // 活跃 tab 优先
       for (const ctx of this.sessions) if (ctx !== this.activeCtx) this.maybePrewarm(ctx);
     }, 5 * 60_000);
@@ -194,6 +200,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Wrap in sentinels so reloading a session can separate this auto-embedded
     // file dump from the user's actual message (only chips are shown in history).
     return `${CTX_OPEN}\n用户附带了以下文件作为上下文：\n\n${parts.join("\n\n")}\n${CTX_CLOSE}`;
+  }
+
+  /** 工作区外拖入（Finder 等）：webview 拿不到绝对路径，把读出的内容镜像写到扩展
+   *  存储目录，再按普通绝对路径附加——后续 buildFileContext / Read 工具都照常工作。
+   *  顺手清理 7 天前的旧镜像，防止 globalStorage 无限膨胀。 */
+  private importDropped(
+    ctx: SessionCtx,
+    roots: { name: string; isDir: boolean }[],
+    files: { rel: string; base64: string }[],
+    skipped?: number,
+  ): void {
+    const base = path.join(this.storageDir(), "dropped");
+    try {
+      for (const d of fs.readdirSync(base)) {
+        const ts = Number(d);
+        if (Number.isFinite(ts) && Date.now() - ts > 7 * 24 * 3600_000) {
+          fs.rmSync(path.join(base, d), { recursive: true, force: true });
+        }
+      }
+    } catch {
+      /* base 不存在等 —— 忽略 */
+    }
+    // 去掉 ".."、盘符、前导斜杠，防止 rel 逃出镜像目录。
+    const safe = (rel: string) =>
+      rel
+        .split(/[\\/]+/)
+        .filter((s) => s && s !== ".." && s !== ".")
+        .join(path.sep);
+    const dir = path.join(base, String(Date.now()));
+    for (const f of files) {
+      const rel = safe(f.rel);
+      if (!rel) continue;
+      try {
+        const dest = path.join(dir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, Buffer.from(f.base64, "base64"));
+      } catch (err) {
+        this.output.appendLine(`[dropped] 写入失败 ${f.rel}: ${String(err)}`);
+      }
+    }
+    const paths: string[] = [];
+    for (const r of roots) {
+      const rel = safe(r.name);
+      if (!rel) continue;
+      const p = path.join(dir, rel);
+      try {
+        if (r.isDir) fs.mkdirSync(p, { recursive: true }); // 空目录也保留
+      } catch {
+        /* ignore */
+      }
+      if (fs.existsSync(p)) paths.push(p);
+    }
+    if (skipped) {
+      this.output.appendLine(`[dropped] 跳过 ${skipped} 个文件（超出单文件 10MB / 总量 30MB / 300 个上限）`);
+    }
+    this.output.appendLine(`[dropped] 镜像 ${files.length} 个文件到 ${dir}`);
+    if (paths.length) this.post(ctx, { kind: "attach_files", paths });
   }
 
   /** Send a code block to a dedicated integrated terminal and run it. */
@@ -974,6 +1037,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (picked?.length) this.post(ctx, { kind: "attach_files", paths: picked.map((u) => u.fsPath) });
           break;
         }
+        case "importDropped":
+          this.importDropped(ctx, m.roots, m.files, m.skipped);
+          break;
         case "openDiff":
           await this.openDiff(ctx, m.path);
           break;
@@ -1144,6 +1210,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.post(ctx, { kind: "busy", busy: false });
       return;
     }
+    ctx.sendAt = Date.now(); // 埋点：首个流事件到达时计算真实等待时长
+    this.output.appendLine(
+      `[${new Date().toISOString()}] [send] session=${ctx.sessionId?.slice(0, 8)} 正文${text.length}字 附加${attached?.length ?? 0}字 图片${images?.length ?? 0}`,
+    );
     // Record the checkpoint only now that the message is actually on the wire.
     const checkpointId = ctx.checkpoints.beginTurn(text || "(图片)", lineBefore);
     this.post(ctx, { kind: "checkpoint_marker", checkpointId, userText: text });
@@ -1657,9 +1727,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
       }
     }
+    // 纯诊断事件：只进日志，绝不进界面（用户明确要求界面保持干净）。
+    if (e.kind === "diag") {
+      this.output.appendLine(`[${new Date().toISOString()}] [diag] session=${ctx.sessionId?.slice(0, 8)} ${e.message}`);
+      return;
+    }
     // Keep a trace of anomalies in the output channel — 同事反馈"卡住"时可以看这里。
     if ((e.kind === "error" || e.kind === "notice") && (e as { message: string }).message) {
       this.output.appendLine(`[${new Date().toISOString()}] [${e.kind}] ${(e as { message: string }).message}`);
+    }
+    // status 事件很少（compacting 等 CLI 阶段提示）——全记下来，排查"莫名卡住"用。
+    if (e.kind === "status" && e.label) {
+      this.output.appendLine(`[${new Date().toISOString()}] [status] ${e.label}`);
+    }
+    // 埋点：本条消息发出后第一个流事件到达 = 用户真实等待的时长。偏大时结合上面
+    // 的 [status] 行（API 重试）与 [prewarm] 行就能定位卡在哪一段。
+    if (
+      ctx.sendAt &&
+      (e.kind === "block_start" || e.kind === "text_delta" || e.kind === "thinking_delta" || e.kind === "context" || e.kind === "tokens")
+    ) {
+      this.output.appendLine(
+        `[${new Date().toISOString()}] [ttfb] session=${ctx.sessionId?.slice(0, 8)} 首个流事件延迟 ${Date.now() - ctx.sendAt}ms`,
+      );
+      ctx.sendAt = undefined;
     }
     // post() safely no-ops if this ctx's panel was closed (detached/background).
     this.post(ctx, e);
@@ -1671,6 +1761,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     // After a turn, a new session's title becomes available — sync list + tab title.
     if (e.kind === "result") {
+      ctx.sendAt = undefined; // 秒错的轮次没有流事件——别把时间戳漏进下一轮的测量
+      this.output.appendLine(
+        `[${new Date().toISOString()}] [turn] session=${ctx.sessionId?.slice(0, 8)} 完成 ${e.durationMs}ms 轮次${e.numTurns}${e.isError ? " (出错)" : ""}`,
+      );
       this.refreshSessions();
       this.fetchUsage(); // throttled — subscription usage moved after this turn
       // 一轮真实对话本身就把缓存焐热了 —— 记下来，别再浪费 token 去预热。
@@ -1696,10 +1790,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Query the Claude subscription usage (5h session + weekly quota) by running
-   * the CLI's `/usage` slash command headlessly and parsing its text output.
-   * Throttled so it doesn't itself burn quota on every turn. Posts a `usage`
-   * message to the webview (which shows it where the per-turn cost used to be).
+   * Query the Claude subscription usage (5h session + weekly + per-model weekly)
+   * by running the CLI's `/usage` slash command headlessly and parsing its text.
+   * 只走官方 CLI，不直调内部接口（第三方挪用 OAuth token 有账号风险）。
+   * 按模型的周限额行（如 Fable）需要 CLI ≥2.1.2xx 才会输出。
+   * Throttled so it doesn't itself burn quota on every turn.
    */
   private fetchUsage(force = false): void {
     if (this.usageInFlight) return;
@@ -2761,19 +2856,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 /** Parse the CLI `/usage` text into the current-session + weekly quota
  *  percentages (and the weekly reset). Mirrors the official panel. Returns
  *  undefined if nothing recognizable was found (e.g. API-key accounts). */
-function parseUsage(text: string): { sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekSonnetPct?: number } | undefined {
+function parseUsage(text: string): { sessionPct?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekModelPct?: number; weekModelName?: string } | undefined {
   if (!text) return undefined;
   const reset = (s?: string) => s?.replace(/\s*\(.*?\)\s*$/, "").trim() || undefined; // drop "(Asia/Shanghai)"
   const sess = /Current session:\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
-  const week = /Current week \(all models\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/i.exec(text);
-  const sonnet = /Current week \(Sonnet only\):\s*(\d+)%\s*used/i.exec(text);
-  if (!sess && !week) return undefined;
+  // 按模型的周限额行不写死模型名（Sonnet/Opus/Fable 随账号计划变），"all models"
+  // 归全部模型，其余第一条按模型行原样带出名字显示。
+  let weekPct: number | undefined;
+  let weekReset: string | undefined;
+  let weekModelPct: number | undefined;
+  let weekModelName: string | undefined;
+  const weekRe = /Current week \(([^)]+)\):\s*(\d+)%\s*used(?:\s*·\s*resets\s*([^\n(]+))?/gi;
+  let m: RegExpExecArray | null;
+  while ((m = weekRe.exec(text))) {
+    const label = m[1].trim();
+    if (/^all models$/i.test(label)) {
+      weekPct = parseInt(m[2], 10);
+      weekReset = reset(m[3]);
+    } else if (weekModelPct === undefined) {
+      weekModelName = label.replace(/\s+only$/i, "").trim();
+      weekModelPct = parseInt(m[2], 10);
+    }
+  }
+  if (!sess && weekPct === undefined && weekModelPct === undefined) return undefined;
   return {
     sessionPct: sess ? parseInt(sess[1], 10) : undefined,
     sessionReset: reset(sess?.[2]),
-    weekPct: week ? parseInt(week[1], 10) : undefined,
-    weekReset: reset(week?.[2]),
-    weekSonnetPct: sonnet ? parseInt(sonnet[1], 10) : undefined,
+    weekPct,
+    weekReset,
+    weekModelPct,
+    weekModelName,
   };
 }
 

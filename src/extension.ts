@@ -26,6 +26,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.moveToRight", () => moveToRight()),
     vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
     vscode.commands.registerCommand("claude-chat.slsConfig", () => provider.showSlsConfig()),
+    vscode.commands.registerCommand("claude-chat.qqConfig", () => provider.showQQConfig()),
     vscode.commands.registerCommand("claude-chat.openInEditor", () => provider.openInEditor()),
     // The icon on FILE editors' title bar: always start a FRESH conversation
     // (openInEditor would resurrect the last session).

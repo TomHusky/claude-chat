@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
-import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, SlsConfig, ToWebview } from "../shared";
+import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, QQConfig, SlsConfig, ToWebview } from "../shared";
+import { QQBot, QQIncoming, QQState, splitForQQ } from "../qq/bot";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
@@ -73,6 +74,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly prewarmDone = new Map<string, number>(); // sessionId -> ts of last completed warm
   private prewarmProc?: ClaudeProcess; // at most one warm-up runs at a time (they're token-expensive)
   private keepWarmTimer?: ReturnType<typeof setInterval>; // periodic re-warm for idle open tabs
+  // -- QQ 开放平台机器人（远程操控，专用后台会话）--
+  private qqBot?: QQBot;
+  private qqProc?: ClaudeProcess; // 机器人专用的 Claude 进程（与聊天 tab 完全隔离）
+  private qqSessionId?: string;
+  private qqState: QQState = "offline";
+  /** QQ 配置的独立 webview 面板——与侧边栏零耦合，坏也只坏它自己。 */
+  private qqPanel?: vscode.WebviewPanel;
+  /** 当前正在处理的 QQ 消息（收集回复用）。机器人一次只处理一条，避免串台。 */
+  private qqTurn?: { target: QQIncoming; text: string; done: boolean };
+  private readonly qqQueue: QQIncoming[] = [];
+  /** 轮次忙标记。命令处理期间 qqTurn 为空，只靠它防止并发跑第二条。 */
+  private qqRunning = false;
   /** 正在跑的预热（warmKey + 完成 promise）。发送撞上同会话的预热时等它完成再发：
    *  两个请求并发冷啃同一段大上下文会互相拖慢（实测比先焐后发慢好几倍）。 */
   private prewarmInflight?: { key: string; promise: Promise<void> };
@@ -294,6 +307,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     });
     this.watchSlsConfig();
+    // QQ 机器人是纯宿主侧功能（界面在独立面板，与侧边栏零耦合）。上次开着就自动
+    // 续上；任何失败只记日志，绝不影响侧边栏/聊天主链路。
+    try {
+      if (this.qqStored().enabled && !this.qqBot) {
+        void this.startQQBot().catch((e) => this.output.appendLine(`[qq] 自动启动失败: ${String(e)}`));
+      }
+    } catch (e) {
+      this.output.appendLine(`[qq] 初始化异常(已隔离): ${String(e)}`);
+    }
   }
 
   /** 监听 ~/sls-tools/config.json：外部（Claude 自己写、或手动改）改动后，侧边栏表单自动刷新。 */
@@ -359,6 +381,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    * (closed mid-reply, still running), re-adopt it. Otherwise create a fresh tab.
    */
   async openSession(sessionId?: string): Promise<void> {
+    this.output.appendLine(`[${new Date().toISOString()}] [open] ${sessionId ? sessionId.slice(0, 8) : "新会话"}`);
     // Already open in a live tab — just reveal it.
     if (sessionId) {
       for (const ctx of this.sessions) {
@@ -934,6 +957,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "slsGenerate":
           await this.generateSlsMapping();
           break;
+        case "webviewError":
+          this.output.appendLine(`[${new Date().toISOString()}] [webview] 侧边栏脚本错误: ${m.message}`);
+          break;
       }
     } catch (err) {
       this.output.appendLine(`[onSidebarMessage:${m.type}] ${String(err)}`);
@@ -944,6 +970,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private async onPanelMessage(ctx: SessionCtx, m: FromWebview): Promise<void> {
     try {
       switch (m.type) {
+        case "webviewError":
+          this.output.appendLine(`[${new Date().toISOString()}] [webview] 聊天面板脚本错误: ${m.message}`);
+          break;
         case "ready":
           ctx.ready = true;
           this.post(ctx, {
@@ -985,6 +1014,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ctx.stopSeq = ctx.sendSeq ?? 0; // cancel every send already in flight (incl. mid-spawn)
           this.post(ctx, { kind: "busy", busy: false }); // instant UI feedback regardless of CLI latency
           void ctx.proc?.interrupt(); // fire-and-forget — don't block the message loop on the round-trip
+          break;
+        case "newContext":
+          await this.newContext(ctx, m);
           break;
         case "compact": {
           // Resume/spawn the process so it holds the full transcript, then /compact it.
@@ -1149,6 +1181,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.refreshSessions();
     this.refreshChangedFiles(ctx);
+  }
+
+  /** `/clear`：在同一个 tab 里换一段全新的上下文。旧会话不删除（仍在列表里可翻），
+   *  只是这个 tab 从此与它脱钩：进程杀掉、sessionId 清空，下次发送会 mint 新 id
+   *  且不带 --resume，模型因此完全看不到之前的历史。 */
+  private async newContext(
+    ctx: SessionCtx,
+    m: { text?: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[]; sls?: boolean },
+  ): Promise<void> {
+    const old = ctx.sessionId;
+    ctx.proc?.dispose();
+    ctx.proc = undefined;
+    ctx.starting = undefined;
+    ctx.sessionId = undefined;
+    ctx.blank = true;
+    ctx.coldStart = false;
+    ctx.pendingPerm = undefined;
+    ctx.sendAt = undefined;
+    // 新上下文配新的检查点账本——旧会话的还原点不该落到新对话头上。
+    ctx.checkpoints.flush();
+    ctx.checkpoints = new CheckpointManager(this.storageDir());
+    this.output.appendLine(`[${new Date().toISOString()}] [clear] ${old?.slice(0, 8) ?? "空"} → 新上下文`);
+    this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+    this.refreshChangedFiles(ctx);
+    this.refreshSessions();
+    if (m.text || m.images?.length) {
+      await this.handleSend(ctx, m.text ?? "", m.context, m.images, m.files, m.sls);
+    }
   }
 
   private async handleSend(
@@ -1712,6 +1772,640 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (!proc.sendUserMessage("这是一条缓存预热消息：请只回复“ok”两个字母，不要调用任何工具。")) cleanup(false);
       })
       .catch(() => cleanup(false));
+  }
+
+  // -- QQ 开放平台机器人 ----------------------------------------------------
+  // 远程操控：QQ 消息 -> 专用后台 ClaudeProcess -> 回复发回 QQ。刻意不复用
+  // SessionCtx（它强依赖 panel），这样完全不干扰用户在 VS Code 里开的 tab；
+  // 这个会话是真实 transcript，仍会出现在侧边栏列表里可点开查看。
+
+  private static readonly QQ_STATE_KEY = "claudeChat.qq";
+  private static readonly QQ_SECRET_KEY = "claudeChat.qq.appSecret";
+  private static readonly QQ_SESSION_KEY = "claudeChat.qq.sessionId";
+
+  /** 「QQ 机器人」独立配置面板：自己的 HTML、脚本和消息通道，完全不碰侧边栏。 */
+  showQQConfig(): void {
+    if (this.qqPanel) {
+      this.qqPanel.reveal();
+      void this.postQQConfig();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "claude-chat.qq",
+      "QQ 机器人",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    this.qqPanel = panel;
+    panel.webview.html = this.qqHtml();
+    panel.webview.onDidReceiveMessage(async (m: FromWebview) => {
+      try {
+        switch (m.type) {
+          case "webviewError":
+            this.output.appendLine(`[${new Date().toISOString()}] [webview] QQ面板脚本错误: ${m.message}`);
+            break;
+          case "qqLoad":
+            await this.postQQConfig();
+            break;
+          case "qqSave":
+            await this.saveQQConfig(m.config);
+            break;
+          case "qqToggle":
+            await this.toggleQQBot(m.enabled);
+            break;
+        }
+      } catch (err) {
+        this.output.appendLine(`[qq] 面板消息处理失败(${m.type}): ${String(err)}`);
+      }
+    });
+    panel.onDidDispose(() => {
+      if (this.qqPanel === panel) this.qqPanel = undefined;
+    });
+  }
+
+  private qqHtml(): string {
+    const nonce = randomUUID().replace(/-/g, "");
+    return /* html */ `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'" />
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 0; display: flex; justify-content: center; }
+  .wrap { width: 100%; max-width: 560px; padding: 24px 20px 40px; box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; }
+  h2 { margin: 0; font-size: 16px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--vscode-descriptionForeground); opacity: .45; }
+  .dot.connecting { background: #e0a33e; opacity: 1; }
+  .dot.online { background: #3fb950; opacity: 1; }
+  .warn { font-size: 11.5px; line-height: 1.7; padding: 9px 11px; border-radius: 6px;
+    background: var(--vscode-inputValidation-warningBackground, rgba(224,163,62,.14));
+    border: 1px solid var(--vscode-inputValidation-warningBorder, rgba(224,163,62,.5)); }
+  label.f { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+  label.f > span { font-weight: 600; opacity: .85; }
+  input[type=text], input[type=password], textarea { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, rgba(127,127,127,.35)); border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
+  textarea { min-height: 72px; resize: none; font-family: var(--vscode-editor-font-family, monospace); }
+  .check { display: flex; align-items: center; gap: 7px; font-size: 12px; cursor: pointer; }
+  .status { font-size: 12px; line-height: 1.6; padding: 7px 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all;
+    background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.12)); }
+  .status.hidden { display: none; }
+  .status.ok { color: #3fb950; }
+  .status.err { color: var(--vscode-errorForeground, #e5534b); }
+  .acts { display: flex; gap: 10px; }
+  button.btn { flex: 1; padding: 7px 0; font: inherit; font-size: 12.5px; cursor: pointer; border-radius: 6px;
+    border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); background: none; color: var(--vscode-foreground); }
+  button.btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+  button.btn:hover { filter: brightness(1.1); }
+  .mini { font-size: 11.5px; cursor: pointer; background: none; color: var(--vscode-button-background); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; padding: 2px 9px; }
+  .sub { font-size: 11px; opacity: .65; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2><span id="dot" class="dot"></span>QQ 机器人 · 远程操控 Claude</h2>
+  <div class="warn">⚠ 开启后，白名单内的 QQ 用户可通过消息驱动 Claude <b>读写本机代码、执行命令</b>（远程无法逐条确认，工具请求会自动放行）。白名单是唯一安全边界，务必只填你自己的 openid。</div>
+  <label class="f"><span>AppID</span><input id="appid" type="text" placeholder="q.qq.com 机器人管理端获取" spellcheck="false" /></label>
+  <label class="f"><span>AppSecret</span><input id="secret" type="password" placeholder="仅存本机（加密）" spellcheck="false" autocomplete="off" /></label>
+  <label class="f"><span>白名单 openid（每行一个）</span><textarea id="allowed" spellcheck="false" placeholder="先开启并给机器人发一条消息，机器人会把你的 openid 回给你（这里也会弹出一键填入按钮）"></textarea></label>
+  <label class="check"><input id="sandbox" type="checkbox" /><span>使用沙箱环境（q.qq.com 的沙箱配置）</span></label>
+  <div id="status" class="status hidden"></div>
+  <div class="acts">
+    <button id="save" class="btn">保存</button>
+    <button id="power" class="btn primary">开启机器人</button>
+  </div>
+  <div class="sub">私聊需你先主动给机器人发消息；群里需 @机器人。消息走独立的后台会话（在侧边栏列表可见），不影响你打开的聊天 tab。机器人会话的权限模式见设置 claudeChat.qqBotPermissionMode。</div>
+</div>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  window.addEventListener("error", (e) => {
+    try { vscode.postMessage({ type: "webviewError", message: (e.message || "?") + " @qq:" + e.lineno }); } catch {}
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    try { vscode.postMessage({ type: "webviewError", message: "unhandledrejection@qq: " + String(e.reason).slice(0, 300) }); } catch {}
+  });
+  const $ = (id) => document.getElementById(id);
+  let enabled = false;
+  function status(text, kind) {
+    const el = $("status");
+    el.textContent = text || "";
+    el.className = "status" + (text ? "" : " hidden") + (kind ? " " + kind : "");
+  }
+  function fill(cfg, hasSecret) {
+    $("appid").value = cfg.appId || "";
+    $("allowed").value = cfg.allowed || "";
+    $("sandbox").checked = !!cfg.sandbox;
+    enabled = !!cfg.enabled;
+    $("secret").value = "";
+    $("secret").placeholder = hasSecret ? "已保存（留空则不修改）" : "仅存本机（加密）";
+    $("power").textContent = enabled ? "停止机器人" : "开启机器人";
+  }
+  function setDot(state, detail) {
+    $("dot").className = "dot " + state;
+    if (state === "online") status("机器人已上线，可在 QQ 私聊或群里 @ 它", "ok");
+    else if (state === "connecting") status("正在连接…");
+    else if (detail) status("已断开：" + detail, "err");
+  }
+  window.addEventListener("message", (ev) => {
+    const m = ev.data;
+    if (!m) return;
+    if (m.kind === "qq_config") fill(m.config, m.hasSecret);
+    else if (m.kind === "qq_state") setDot(m.state, m.detail);
+    else if (m.kind === "qq_result") status(m.message, m.ok ? "ok" : "err");
+    else if (m.kind === "qq_pairing") {
+      const box = $("allowed");
+      if (box.value.split(/[\\s,，;；]+/).some((s) => s.trim() === m.openId)) return;
+      const el = $("status");
+      el.className = "status";
+      el.textContent = "捕获到 openid：" + m.openId + " ";
+      const btn = document.createElement("button");
+      btn.className = "mini";
+      btn.textContent = "填入白名单并保存";
+      btn.onclick = () => {
+        box.value = (box.value.trim() ? box.value.trim() + "\\n" : "") + m.openId;
+        $("save").click();
+      };
+      el.appendChild(btn);
+    }
+  });
+  $("save").addEventListener("click", () => {
+    vscode.postMessage({ type: "qqSave", config: {
+      appId: $("appid").value.trim(),
+      appSecret: $("secret").value,
+      allowed: $("allowed").value,
+      sandbox: $("sandbox").checked,
+      enabled,
+    } });
+  });
+  $("power").addEventListener("click", () => {
+    enabled = !enabled;
+    $("power").textContent = enabled ? "停止机器人" : "开启机器人";
+    vscode.postMessage({ type: "qqToggle", enabled });
+  });
+  vscode.postMessage({ type: "qqLoad" });
+</script>
+</body>
+</html>`;
+  }
+
+  /** 非敏感配置存 globalState，AppSecret 存 SecretStorage（加密，不落明文）。 */
+  private qqStored(): Omit<QQConfig, "appSecret"> {
+    const d = this.context.globalState.get<Omit<QQConfig, "appSecret">>(ChatViewProvider.QQ_STATE_KEY);
+    return { appId: d?.appId ?? "", allowed: d?.allowed ?? "", sandbox: !!d?.sandbox, enabled: !!d?.enabled };
+  }
+
+  private async postQQConfig(target?: vscode.Webview): Promise<void> {
+    const secret = await this.context.secrets.get(ChatViewProvider.QQ_SECRET_KEY);
+    const e: ToWebview = {
+      kind: "qq_config",
+      config: { ...this.qqStored(), appSecret: "" }, // 永不回传明文密钥
+      hasSecret: !!secret,
+    };
+    (target ?? this.qqPanel?.webview)?.postMessage(e);
+    (target ?? this.qqPanel?.webview)?.postMessage({ kind: "qq_state", state: this.qqState } satisfies ToWebview);
+  }
+
+  private setQQState(state: QQState, detail?: string): void {
+    this.qqState = state;
+    try {
+      this.qqPanel?.webview.postMessage({ kind: "qq_state", state, detail } satisfies ToWebview);
+    } catch { /* 面板可能正在销毁 */ }
+  }
+
+  private async saveQQConfig(cfg: QQConfig): Promise<void> {
+    await this.context.globalState.update(ChatViewProvider.QQ_STATE_KEY, {
+      appId: cfg.appId.trim(),
+      allowed: cfg.allowed.trim(),
+      sandbox: !!cfg.sandbox,
+      enabled: this.qqStored().enabled, // 开关由 qqToggle 单独管理
+    });
+    // 空字符串表示"保持原密钥不变"（界面从不回填明文，用户不改就不该被清空）。
+    if (cfg.appSecret.trim()) {
+      await this.context.secrets.store(ChatViewProvider.QQ_SECRET_KEY, cfg.appSecret.trim());
+    }
+    this.qqPanel?.webview.postMessage({ kind: "qq_result", ok: true, message: "已保存" } satisfies ToWebview);
+    if (this.qqStored().enabled) await this.startQQBot(); // 已开启则用新配置重连
+  }
+
+  private async toggleQQBot(enabled: boolean): Promise<void> {
+    await this.context.globalState.update(ChatViewProvider.QQ_STATE_KEY, { ...this.qqStored(), enabled });
+    if (enabled) await this.startQQBot();
+    else this.stopQQBot();
+  }
+
+  private async startQQBot(): Promise<void> {
+    this.stopQQBot(); // 重连前先拆掉旧连接
+    const cfg = this.qqStored();
+    const secret = (await this.context.secrets.get(ChatViewProvider.QQ_SECRET_KEY)) ?? "";
+    const allowed = cfg.allowed.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
+    if (!cfg.appId || !secret) {
+      this.setQQState("offline", "缺少 AppID / AppSecret");
+      this.qqPanel?.webview.postMessage({ kind: "qq_result", ok: false, message: "请先填写 AppID 和 AppSecret 并保存" } satisfies ToWebview);
+      return;
+    }
+    // 白名单为空不再拒绝启动——openid 只能从消息事件里拿到，必须先能连上、
+    // 让用户发一条消息完成"配对"。此时机器人只回 openid，不执行任何指令。
+    if (!allowed.length) {
+      this.qqPanel?.webview.postMessage({
+        kind: "qq_result",
+        ok: true,
+        message: "配对模式：白名单为空，机器人只会回你的 openid、不执行指令。请在 QQ 里给它发一条消息。",
+      } satisfies ToWebview);
+    }
+    this.qqBot = new QQBot(
+      { appId: cfg.appId, appSecret: secret, sandbox: cfg.sandbox, allowedOpenIds: allowed },
+      {
+        onLog: (line) => this.output.appendLine(`[${new Date().toISOString()}] ${line}`),
+        onState: (state, detail) => this.setQQState(state, detail),
+        onMessage: (msg) => this.onQQMessage(msg),
+        onPairing: (openId) => {
+          try {
+            this.qqPanel?.webview.postMessage({ kind: "qq_pairing", openId } satisfies ToWebview);
+          } catch { /* 面板未开——openid 也会通过 QQ 回复和输出日志给到用户 */ }
+        },
+      },
+    );
+    void this.qqBot.start();
+  }
+
+  private stopQQBot(): void {
+    this.qqBot?.stop();
+    this.qqBot = undefined;
+    this.qqProc?.dispose();
+    this.qqProc = undefined;
+    this.qqTurn = undefined;
+    this.qqRunning = false; // 不重置的话重启后队列永远不再被消费
+    this.qqQueue.length = 0;
+    this.setQQState("offline");
+  }
+
+  /** 排队处理——机器人一次只跑一轮，避免多条消息串到同一个进程里互相打断。 */
+  private onQQMessage(msg: QQIncoming): void {
+    this.qqQueue.push(msg);
+    if (!this.qqRunning) void this.runQQTurn();
+  }
+
+  private async runQQTurn(): Promise<void> {
+    if (this.qqRunning) return; // 命令处理期间 qqTurn 是空的，得靠独立的忙标记防并发
+    const msg = this.qqQueue.shift();
+    if (!msg) return;
+    this.qqRunning = true;
+    // 命令优先：本地处理、不花模型 token。返回 true = 已消费。
+    try {
+      if (await this.handleQQCommand(msg)) {
+        this.qqBot?.forget(msg.msgId);
+        this.qqRunning = false;
+        if (this.qqQueue.length) void this.runQQTurn();
+        return;
+      }
+    } catch (err) {
+      this.output.appendLine(`[qq] 命令处理失败: ${String(err)}`);
+      await this.qqBot?.reply(msg, `❌ 命令执行出错\n${String((err as Error)?.message ?? err)}`);
+      this.qqRunning = false;
+      if (this.qqQueue.length) void this.runQQTurn();
+      return;
+    }
+    this.qqTurn = { target: msg, text: "", done: false };
+    const proc = await this.ensureQQProcess();
+    if (!proc) {
+      await this.qqBot?.reply(msg, "❌ 启动 Claude 失败\n请在 VS Code 输出面板查看 Claude Chat 日志");
+      this.finishQQTurn();
+      return;
+    }
+    if (!proc.sendUserMessage(msg.text)) {
+      this.qqProc = undefined; // 进程已死，下条消息会重建
+      await this.qqBot?.reply(msg, "❌ Claude 进程已退出，请重试");
+      this.finishQQTurn();
+    }
+  }
+
+  private finishQQTurn(): void {
+    const t = this.qqTurn;
+    this.qqTurn = undefined;
+    this.qqRunning = false;
+    if (t) this.qqBot?.forget(t.target.msgId);
+    if (this.qqQueue.length) void this.runQQTurn();
+  }
+
+  // -- QQ 机器人命令 --------------------------------------------------------
+  // 手机上没有界面可点，所有配置只能靠文字命令。未知的 / 命令原样透传给 Claude
+  // （CLI 自己的 skills 不能被吃掉）。
+
+  private static readonly QQ_RUNTIME_KEY = "claudeChat.qq.runtime";
+  /** 机器人专属的模型/强度覆盖——刻意不改全局设置，免得手机上一句话把你桌面的配置也换了。 */
+  private qqRuntime(): { model?: string; effort?: string } {
+    return this.context.globalState.get<{ model?: string; effort?: string }>(ChatViewProvider.QQ_RUNTIME_KEY) ?? {};
+  }
+
+  private static readonly QQ_MODELS = ["默认", "opus", "sonnet", "haiku", "fable"];
+  private static readonly QQ_EFFORTS = ["低", "low", "medium", "high", "xhigh", "max"];
+
+  /** QQ 是纯文本消息（不渲染 Markdown），排版只能靠分隔线 / emoji / 方块进度条。 */
+  private static readonly QQ_HR = "━━━━━━━━━━━━━";
+
+  /** 10 格方块进度条，用量一眼可见；≥90% 变红灯提示。
+   *  非零用量至少点亮 1 格——否则 4% 会显示成全空，看着像根本没用。 */
+  private static qqBar(pct: number): string {
+    const p = Math.max(0, Math.min(100, Math.round(pct)));
+    const filled = p > 0 ? Math.max(1, Math.round(p / 10)) : 0;
+    const light = p >= 90 ? "🔴" : p >= 70 ? "🟡" : "🟢";
+    return `${light} ${"▰".repeat(filled)}${"▱".repeat(10 - filled)} ${p}%`;
+  }
+
+  /** 把 CLI 的英文重置串（"Jul 27 at 2am" / "Jul 20 at 12:10pm"）转成中文。 */
+  private static qqCnReset(raw: string): string {
+    const MON: Record<string, number> = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+    const m = /([A-Za-z]{3,})\s+(\d{1,2})(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?/i.exec(raw);
+    if (!m) return raw;
+    const mon = MON[m[1].slice(0, 3).toLowerCase()];
+    if (!mon) return raw;
+    let hh = m[3] != null ? parseInt(m[3], 10) : undefined;
+    const mm = m[4] != null ? m[4] : "00";
+    const ap = (m[5] || "").toLowerCase();
+    if (hh != null) {
+      if (ap === "pm" && hh < 12) hh += 12;
+      if (ap === "am" && hh === 12) hh = 0;
+    }
+    const date = `${mon}月${parseInt(m[2], 10)}日`;
+    return hh != null ? `${date} ${String(hh).padStart(2, "0")}:${mm}` : date;
+  }
+
+  /** 重置时间的展示串：优先用精确时间戳，否则解析 CLI 的英文串。 */
+  private static qqResetText(at?: number, raw?: string): string {
+    if (typeof at === "number" && Number.isFinite(at)) {
+      const d = new Date(at);
+      const hh = String(d.getHours()).padStart(2, "0");
+      const mm = String(d.getMinutes()).padStart(2, "0");
+      return `${d.getMonth() + 1}月${d.getDate()}日 ${hh}:${mm} 重置`;
+    }
+    return raw ? `${ChatViewProvider.qqCnReset(raw)} 重置` : "";
+  }
+
+  private qqHelpText(): string {
+    const hr = ChatViewProvider.QQ_HR;
+    return [
+      "🤖 Claude 机器人 · 命令",
+      hr,
+      "📝 对话",
+      "· /clear [消息]  清空上下文重新开始",
+      "· /compact  压缩上下文，保留要点",
+      "· /stop  中断当前回复",
+      "",
+      "⚙️ 设置",
+      "· /model [名称]  opus / sonnet / haiku / fable",
+      "· /effort [档位]  low / medium / high / xhigh / max",
+      "",
+      "📊 信息",
+      "· /status  当前状态",
+      "· /usage  用量查询",
+      "· /help  本帮助",
+      hr,
+      "💡 不带参数可查看当前值；其它 / 命令会原样交给 Claude Code",
+    ].join("\n");
+  }
+
+  private qqUsageText(): string {
+    const u = this.lastUsage as
+      | {
+          sessionPct?: number;
+          sessionResetAt?: number;
+          sessionReset?: string;
+          weekPct?: number;
+          weekReset?: string;
+          weekModelPct?: number;
+          weekModelName?: string;
+        }
+      | undefined;
+    if (!u || (u.sessionPct === undefined && u.weekPct === undefined)) {
+      return "📊 订阅用量\n" + ChatViewProvider.QQ_HR + "\n⚠️ 暂时取不到用量数据，请稍后再试";
+    }
+    const block = (title: string, pct?: number, reset?: string) => {
+      if (pct === undefined) return "";
+      return [title, ChatViewProvider.qqBar(pct), reset ? `   ⏱ ${reset}` : ""].filter(Boolean).join("\n");
+    };
+    const parts = [
+      block("⏳ 5 小时限额", u.sessionPct, ChatViewProvider.qqResetText(u.sessionResetAt, u.sessionReset)),
+      block("📅 每周 · 全部模型", u.weekPct, ChatViewProvider.qqResetText(undefined, u.weekReset)),
+      block(`🎯 每周 · 仅 ${u.weekModelName || "特定模型"}`, u.weekModelPct),
+    ].filter(Boolean);
+    return "📊 订阅用量\n" + ChatViewProvider.QQ_HR + "\n" + parts.join("\n\n");
+  }
+
+  /** 处理机器人命令。返回 true = 已消费（不再交给 Claude）。
+   *  `/clear 消息` 会先清空再把 msg.text 改写成剩余内容并返回 false，让它走正常轮次。 */
+  private async handleQQCommand(msg: QQIncoming): Promise<boolean> {
+    const t = msg.text.trim();
+    if (!t.startsWith("/")) return false;
+    const sp = t.search(/\s/);
+    const cmd = (sp === -1 ? t : t.slice(0, sp)).toLowerCase();
+    const arg = sp === -1 ? "" : t.slice(sp + 1).trim();
+    const reply = (s: string) => this.qqBot?.reply(msg, s) ?? Promise.resolve();
+    const rt = this.qqRuntime();
+
+    switch (cmd) {
+      case "/help":
+        await reply(this.qqHelpText());
+        return true;
+
+      case "/status": {
+        const busy = this.qqProc?.isBusy;
+        await reply(
+          [
+            "📊 机器人状态",
+            ChatViewProvider.QQ_HR,
+            `🧠 模型　　${rt.model || this.config().get<string>("model", "") || "默认"}`,
+            `⚡ 强度　　${rt.effort || this.config().get<string>("effort", "") || "默认"}`,
+            `🔐 权限　　${this.config().get<string>("qqBotPermissionMode", "acceptEdits")}`,
+            `💬 会话　　${this.qqSessionId ? this.qqSessionId.slice(0, 8) : "尚未创建"}`,
+            `${busy ? "🔵" : "🟢"} 状态　　${busy ? "正在回复中" : "空闲"}`,
+            `📥 排队　　${this.qqQueue.length} 条`,
+          ].join("\n"),
+        );
+        return true;
+      }
+
+      case "/usage":
+        this.fetchUsage(true);
+        // 等一小会儿拿最新值（拿不到就报缓存/提示稍后）。
+        for (let i = 0; i < 24 && !this.lastUsage; i++) await new Promise((r) => setTimeout(r, 500));
+        await reply(this.qqUsageText());
+        return true;
+
+      case "/stop":
+        if (this.qqProc?.isBusy) {
+          await this.qqProc.interrupt();
+          const dropped = this.qqQueue.length;
+          this.qqQueue.length = 0;
+          // 被中断的那轮不会再有 result 事件 → finishQQTurn 永远不会被调用。
+          // 必须在这里手动收尾，否则 qqRunning 卡死、机器人从此不再响应任何消息。
+          if (this.qqTurn) {
+            this.qqBot?.forget(this.qqTurn.target.msgId);
+            this.qqTurn = undefined;
+          }
+          this.qqRunning = false;
+          await reply(dropped ? `⏹ 已中断当前回复\n并清空了 ${dropped} 条排队消息` : "⏹ 已中断当前回复");
+        } else {
+          await reply("💤 当前没有正在跑的回复");
+        }
+        return true;
+
+      case "/model": {
+        if (!arg) {
+          await reply(`🧠 当前模型：${rt.model || this.config().get<string>("model", "") || "默认"}\n${ChatViewProvider.QQ_HR}\n可选：${ChatViewProvider.QQ_MODELS.join(" / ")}\n用法：/model opus`);
+          return true;
+        }
+        const v = /^(默认|default)$/i.test(arg) ? "" : arg.toLowerCase();
+        if (v && !ChatViewProvider.QQ_MODELS.includes(v)) {
+          await reply(`❌ 未知模型「${arg}」\n可选：${ChatViewProvider.QQ_MODELS.join(" / ")}`);
+          return true;
+        }
+        await this.context.globalState.update(ChatViewProvider.QQ_RUNTIME_KEY, { ...rt, model: v });
+        // 进程活着就热切（控制通道），不用重启、不丢上下文。
+        try {
+          if (this.qqProc && !this.qqProc.isExited) await this.qqProc.setModel(v);
+        } catch {
+          this.qqProc?.dispose();
+          this.qqProc = undefined; // 热切失败就让下轮重建
+        }
+        await reply(`✅ 已切换模型：${v || "默认"}`);
+        return true;
+      }
+
+      case "/effort": {
+        if (!arg) {
+          await reply(`⚡ 当前强度：${rt.effort || this.config().get<string>("effort", "") || "默认"}\n${ChatViewProvider.QQ_HR}\n可选：low / medium / high / xhigh / max / 默认\n用法：/effort high`);
+          return true;
+        }
+        const v = /^(默认|default)$/i.test(arg) ? "" : arg.toLowerCase();
+        if (v && !ChatViewProvider.QQ_EFFORTS.includes(v)) {
+          await reply(`❌ 未知强度「${arg}」\n可选：low / medium / high / xhigh / max / 默认`);
+          return true;
+        }
+        await this.context.globalState.update(ChatViewProvider.QQ_RUNTIME_KEY, { ...rt, effort: v });
+        // effort 是启动参数，只能重建进程（会话仍会 --resume 回来，不丢历史）。
+        this.qqProc?.dispose();
+        this.qqProc = undefined;
+        await reply(`✅ 已切换思考强度：${v || "默认"}\n（下一条消息生效）`);
+        return true;
+      }
+
+      case "/compact": {
+        const proc = await this.ensureQQProcess();
+        if (!proc) {
+          await reply("❌ 启动 Claude 失败，无法压缩");
+          return true;
+        }
+        proc.compact();
+        await reply("🗜 正在压缩上下文，稍后可继续对话");
+        return true;
+      }
+
+      case "/clear": {
+        this.qqProc?.dispose();
+        this.qqProc = undefined;
+        this.qqSessionId = undefined;
+        await this.context.globalState.update(ChatViewProvider.QQ_SESSION_KEY, undefined);
+        this.output.appendLine(`[${new Date().toISOString()}] [qq] /clear 已重置机器人会话`);
+        if (arg) {
+          // 清空后把剩余内容当普通消息走正常轮次（用全新上下文回答）。
+          msg.text = arg;
+          await reply("🧹 已清空上下文，正在用全新上下文回答…");
+          return false;
+        }
+        await reply("🧹 已清空上下文\n之后的对话不会带上之前的历史");
+        return true;
+      }
+    }
+    return false; // 未知 / 命令：交给 Claude（它的 skills 不能被吞掉）
+  }
+
+  /** 机器人专用进程。权限模式取配置；工具请求自动放行——远程没有弹窗可确认，
+   *  不放行就会永久卡住（所以白名单是这套东西唯一的安全边界）。 */
+  private async ensureQQProcess(): Promise<ClaudeProcess | undefined> {
+    if (this.qqProc && !this.qqProc.isExited) return this.qqProc;
+    const stored = this.context.globalState.get<string>(ChatViewProvider.QQ_SESSION_KEY);
+    const resume = stored && this.store.findFile(stored) ? stored : undefined;
+    const sid = resume ?? randomUUID();
+    this.qqSessionId = sid;
+    const proc = new ClaudeProcess(
+      {
+        claudePath: this.config().get<string>("claudePath", "claude"),
+        cwd: this.cwd(),
+        // 机器人专属覆盖优先（/model、/effort 命令设的），没有才回落到全局设置。
+        model: this.qqRuntime().model ?? this.config().get<string>("model", "") ?? undefined,
+        effort: this.qqRuntime().effort ?? this.config().get<string>("effort", "") ?? undefined,
+        permissionMode: this.config().get<string>("qqBotPermissionMode", "acceptEdits"),
+        resumeSessionId: resume,
+        sessionId: resume ? undefined : sid,
+        addDirs: this.workspaceDirs(),
+        appendSystemPrompt: this.config().get<string>("appendSystemPrompt", "") || undefined,
+      },
+      {
+        emit: (e) => this.onQQEmit(e),
+        onPermission: (req) => proc.respondPermission(req.requestId, { behavior: "allow" }),
+        onSessionId: (id) => {
+          this.qqSessionId = id;
+          void this.context.globalState.update(ChatViewProvider.QQ_SESSION_KEY, id);
+          this.refreshSessions();
+        },
+        onClose: () => {
+          if (this.qqProc === proc) this.qqProc = undefined;
+          // 进程中途死掉不会发 result → 本轮永远收不了尾，qqRunning 会卡死导致
+          // 机器人此后不再响应任何消息。这里兜底告知用户并放行队列。
+          const t = this.qqTurn;
+          if (t && !t.done) {
+            t.done = true;
+            this.output.appendLine(`[qq] 进程退出，本轮未完成：${t.target.msgId}`);
+            void (async () => {
+              const partial = t.text.trim();
+              await this.qqBot?.reply(
+                t.target,
+                partial ? `⚠️ 回复中断（进程退出），已生成部分内容：\n${splitForQQ(partial)[0]}` : "⚠️ Claude 进程意外退出，请重新发送",
+              );
+              this.finishQQTurn();
+            })();
+          }
+        },
+      },
+    );
+    this.qqProc = proc;
+    try {
+      await proc.start();
+      this.output.appendLine(`[qq] Claude 进程就绪 session=${sid.slice(0, 8)}`);
+      return proc;
+    } catch (err) {
+      this.output.appendLine(`[qq] Claude 启动失败：${String(err)}`);
+      proc.dispose();
+      this.qqProc = undefined;
+      return undefined;
+    }
+  }
+
+  /** 收集这一轮的助手文本，轮次结束时整段回给 QQ。
+   *  进程事件可能在宿主关闭途中到达——整个处理体自兜底，绝不外抛。 */
+  private onQQEmit(e: ToWebview): void {
+    try {
+      this.onQQEmitInner(e);
+    } catch {
+      /* isolated */
+    }
+  }
+
+  private onQQEmitInner(e: ToWebview): void {
+    const t = this.qqTurn;
+    if (!t) return;
+    if (e.kind === "text_delta") t.text += e.text;
+    else if (e.kind === "error") this.output.appendLine(`[qq] ${e.message}`);
+    else if (e.kind === "result") {
+      if (t.done) return;
+      t.done = true;
+      const parts = splitForQQ(t.text || "（本轮没有文本输出）");
+      void (async () => {
+        for (const p of parts) await this.qqBot?.reply(t.target, p);
+        this.output.appendLine(`[qq] 已回复 ${parts.length} 段，共 ${t.text.length} 字`);
+        this.finishQQTurn();
+      })();
+    }
   }
 
   /** Is this ctx still attached to a live, displayable panel? */
@@ -2290,6 +2984,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   dispose(): void {
     if (this.keepWarmTimer) clearInterval(this.keepWarmTimer);
     this.keepWarmTimer = undefined;
+    this.stopQQBot(); // 关窗口就断开机器人，不留孤儿进程/连接
+    this.qqPanel?.dispose();
+    this.qqPanel = undefined;
     // Flush debounced snapshot writes first — a hard window close within 500ms
     // of the last file edit would otherwise lose that file's baseline.
     for (const ctx of this.sessions) ctx.checkpoints.flush();
@@ -2476,6 +3173,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
+    // 侧边栏脚本一旦抛错整个面板就会"点了没反应"且无迹可循——错误上报给 host 记日志。
+    window.addEventListener("error", (e) => {
+      try { vscode.postMessage({ type: "webviewError", message: (e.message || "?") + " @sidebar:" + e.lineno }); } catch {}
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      try { vscode.postMessage({ type: "webviewError", message: "unhandledrejection@sidebar: " + String(e.reason).slice(0, 300) }); } catch {}
+    });
     const TRASH = ${JSON.stringify(TRASH)};
     const PENCIL = ${JSON.stringify(PENCIL)};
     const EYE = ${JSON.stringify(EYE)}, EYE_OFF = ${JSON.stringify(EYE_OFF)};

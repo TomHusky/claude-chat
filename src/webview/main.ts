@@ -14,6 +14,19 @@ declare function acquireVsCodeApi(): {
 const vscode = acquireVsCodeApi();
 const send = (m: FromWebview) => vscode.postMessage(m);
 
+// Webview 内的 JS 错误平时完全不可见（不进扩展宿主日志）——上报给 host 记进
+// "Claude Chat" 输出通道，"界面没反应"这类问题才有迹可循。
+window.addEventListener("error", (e) => {
+  try {
+    vscode.postMessage({ type: "webviewError", message: `${e.message} @${(e as ErrorEvent).filename?.split("/").pop()}:${(e as ErrorEvent).lineno}` });
+  } catch { /* 上报本身绝不能再抛 */ }
+});
+window.addEventListener("unhandledrejection", (e) => {
+  try {
+    vscode.postMessage({ type: "webviewError", message: `unhandledrejection: ${String((e as PromiseRejectionEvent).reason).slice(0, 300)}` });
+  } catch { /* ignore */ }
+});
+
 // ---------------------------------------------------------------------------
 // Markdown (fast = per-line while streaming; full = finalized w/ highlighting)
 // ---------------------------------------------------------------------------
@@ -1846,9 +1859,130 @@ function clearComposer() {
   refreshComposerHint();
 }
 
+// ---- 斜杠命令 -------------------------------------------------------------
+// 只拦截下面这几条本地命令；其余以 / 开头的一律原样发给 CLI（它自己的 skills /
+// slash command 才不会被我们吃掉）。
+const COMMANDS: { name: string; args?: string; desc: string }[] = [
+  { name: "/help", desc: "显示所有可用命令" },
+  { name: "/clear", args: "[消息]", desc: "清空上下文：丢掉本轮之前的历史，用全新上下文回复（可直接带上要问的话）" },
+  { name: "/compact", desc: "压缩上下文：把历史总结成摘要，保留要点但大幅缩小" },
+  { name: "/model", args: "[名称]", desc: "切换模型，如 /model opus；不带参数则列出可选" },
+  { name: "/effort", args: "[档位]", desc: "切换思考强度，如 /effort high；不带参数则列出可选" },
+  { name: "/usage", desc: "查看 5 小时 / 每周用量" },
+];
+
+function cmdHelp(): string {
+  const rows = COMMANDS.map((c) => `  ${c.name}${c.args ? " " + c.args : ""}  —  ${c.desc}`);
+  return "可用命令：\n" + rows.join("\n") + "\n\n（其它以 / 开头的内容会原样交给 Claude Code CLI 处理）";
+}
+
+function cmdUsage(): string {
+  const d = lastUsageData;
+  const line = (label: string, pct?: number, reset?: string) =>
+    typeof pct === "number" ? `  ${label}：${pct}%${reset ? " · " + reset : ""}` : `  ${label}：暂无数据`;
+  return [
+    "订阅用量：",
+    line("5 小时限额", d.sessionPct, cnResetSession(d.sessionReset)),
+    line("每周 · 全部模型", d.weekPct, cnResetWeek(d.weekReset)),
+    ...(typeof d.weekModelPct === "number" ? [line(`每周 · 仅 ${d.weekModelName || "特定模型"}`, d.weekModelPct)] : []),
+  ].join("\n");
+}
+
+/** 处理本地斜杠命令。返回 true = 已消费，不再当普通消息发送。 */
+function handleSlashCommand(payload: QueueItem): boolean {
+  const t = payload.text.trim();
+  if (!t.startsWith("/")) return false;
+  const sp = t.search(/\s/);
+  const cmd = (sp === -1 ? t : t.slice(0, sp)).toLowerCase();
+  const arg = sp === -1 ? "" : t.slice(sp + 1).trim();
+  const known = COMMANDS.some((c) => c.name === cmd);
+  if (!known) return false; // 交给 CLI（它的 skills 等命令不能被我们吞掉）
+
+  clearComposer();
+  switch (cmd) {
+    case "/help":
+      appendNotice(cmdHelp(), "info");
+      return true;
+    case "/usage":
+      appendNotice(cmdUsage(), "info");
+      send({ type: "refreshUsage" }); // 顺手刷新，下次看就是新的
+      return true;
+    case "/compact":
+      if (isBusy) { appendNotice("正在回复中，请等本轮结束再压缩。", "error"); return true; }
+      send({ type: "compact" });
+      return true;
+    case "/model": {
+      if (!arg) {
+        appendNotice("可选模型：\n" + MODELS.map((m) => `  ${m.id || "(默认)"}  —  ${m.label}`).join("\n"), "info");
+        return true;
+      }
+      const key = arg.toLowerCase();
+      const hit = MODELS.find((m) => m.id.toLowerCase() === key || m.short.toLowerCase() === key);
+      if (!hit) {
+        appendNotice(`未知模型「${arg}」。可选：${MODELS.map((m) => m.id || "默认").join(" / ")}`, "error");
+        return true;
+      }
+      currentModel = hit.id;
+      send({ type: "setModel", model: currentModel });
+      syncPickers();
+      appendNotice(`已切换模型：${hit.label}`, "info");
+      return true;
+    }
+    case "/effort": {
+      if (!arg) {
+        appendNotice("可选思考强度：\n" + EFFORTS.map((e) => `  ${e.id}  —  ${e.label}：${e.desc}`).join("\n"), "info");
+        return true;
+      }
+      const key = arg.toLowerCase();
+      const hit = EFFORTS.find((e) => e.id.toLowerCase() === key || e.label.toLowerCase() === key);
+      if (!hit) {
+        appendNotice(`未知强度「${arg}」。可选：${EFFORTS.map((e) => e.id).join(" / ")}`, "error");
+        return true;
+      }
+      currentEffort = hit.id;
+      send({ type: "setEffort", effort: currentEffort });
+      syncPickers();
+      appendNotice(`已切换思考强度：${hit.label}（下一轮生效）`, "info");
+      return true;
+    }
+    case "/clear": {
+      if (isBusy) { appendNotice("正在回复中，请先停止本轮再清空上下文。", "error"); return true; }
+      // 清空这个 tab 的时间线；host 会同时解绑会话、下次发送开全新上下文。
+      messagesEl.innerHTML = "";
+      assistantEl = null;
+      liveBlock = null;
+      toolCards.clear();
+      userMsgCount = 0;
+      taskQueue.length = 0;
+      renderQueue();
+      appendNotice(arg ? "已清空上下文，用全新上下文回答这条消息。" : "已清空上下文，之后的对话不会带上之前的历史。", "info");
+      if (arg) appendUser(arg, payload.labels, payload.imageUris, payload.sls);
+      send({
+        type: "newContext",
+        text: arg || undefined,
+        context: arg ? payload.context : undefined,
+        images: arg ? payload.images : undefined,
+        files: arg ? payload.files : undefined,
+        sls: arg ? payload.sls : undefined,
+      });
+      if (arg) {
+        // 与 performSend 保持一致的忙碌态，否则界面不显示停止按钮/思考动画。
+        turnTokens = 0; turnEst = 0; turnThinkTokens = 0; msgTokenBase = 0; lastMsgTokens = 0;
+        isBusy = true;
+        setGlow("running");
+        refreshComposerHint();
+        showWorking();
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 function doSend() {
   const payload = readComposer();
   if (!payload) return;
+  if (handleSlashCommand(payload)) return;
   // Quota spent — bail BEFORE clearComposer() so the user doesn't lose what
   // they typed. The banner already explains why nothing happened.
   if (rateLimited) {

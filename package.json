@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.204",
+  "version": "0.1.213",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -97,6 +97,11 @@
         "command": "claude-chat.slsConfig",
         "title": "Claude: SLS 日志配置",
         "icon": "$(database)"
+      },
+      {
+        "command": "claude-chat.qqConfig",
+        "title": "Claude: QQ 机器人配置",
+        "icon": "$(broadcast)"
       }
     ],
     "menus": {
@@ -120,6 +125,11 @@
           "command": "claude-chat.slsConfig",
           "when": "view == claude-chat.chatView",
           "group": "navigation@2"
+        },
+        {
+          "command": "claude-chat.qqConfig",
+          "when": "view == claude-chat.chatView",
+          "group": "navigation@4"
         }
       ],
       "editor/title": [
@@ -214,6 +224,18 @@
           "type": "boolean",
           "default": true,
           "description": "打开/切换到已有会话时立即后台启动并 --resume 进程，让读取上下文的耗时和你读历史、打字的时间重叠，而不是全压在按下发送那一刻（官方交互式就是打开即 resume）。几乎不额外花 token，只是把本来要花的启动开销提前。"
+        },
+        "claudeChat.qqBotPermissionMode": {
+          "type": "string",
+          "enum": [
+            "default",
+            "acceptEdits",
+            "plan",
+            "auto",
+            "bypassPermissions"
+          ],
+          "default": "acceptEdits",
+          "description": "QQ 机器人专用会话的权限模式。注意：远程消息无法逐条弹窗确认，所以机器人会话里的工具请求一律自动放行——白名单是唯一的安全边界。想只让它读代码不改文件，可设为 plan。"
         },
         "claudeChat.appendSystemPrompt": {
           "type": "string",

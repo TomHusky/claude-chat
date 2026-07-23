@@ -35,6 +35,17 @@ export const ICONS: Record<string, string> = {
  *  projects 是「环境名 -> SLS Project」的映射，可自由增删环境（默认种子 dev/pro）；
  *  logs 把每个业务项目映射到 info/error 两个 logstore（各环境共用同一份映射，环境只切
  *  Project）。 */
+/** QQ 开放平台机器人配置。AppSecret 不走这里持久化（存 VS Code SecretStorage），
+ *  但表单读写时会经过它；回填到界面时 secret 用占位符表示"已保存"。 */
+export interface QQConfig {
+  appId: string;
+  appSecret: string;
+  /** 白名单 user openid（换行/逗号分隔的原始文本，由宿主解析）。 */
+  allowed: string;
+  sandbox: boolean;
+  enabled: boolean;
+}
+
 export interface SlsConfig {
   endpoint: string;
   accessKeyId: string;
@@ -104,6 +115,11 @@ export type ToWebview =
   | { kind: "sls_open"; config: SlsConfig; enginePresent: boolean }
   /** slsLoad 的应答，仅回填表单不弹开抽屉。 */
   | { kind: "sls_config"; config: SlsConfig; enginePresent: boolean }
+  | { kind: "qq_config"; config: QQConfig; hasSecret: boolean }
+  | { kind: "qq_state"; state: "connecting" | "online" | "offline"; detail?: string }
+  | { kind: "qq_result"; ok: boolean; message: string }
+  /** 配对模式下捕获到的发信人 openid —— 界面提供"填入白名单"一键操作。 */
+  | { kind: "qq_pairing"; openId: string }
   /** 测试连接/保存的结果反馈。stores 为拉取到的 logstore 列表（成功时）。 */
   | { kind: "sls_result"; action: "test" | "save"; ok: boolean; message: string; stores?: string[] }
   /** 把一段文本预填进聊天输入框（供“让 Claude 生成映射”一键塞入 prompt）。 */
@@ -192,6 +208,9 @@ export type FromWebview =
   | { type: "editMessage"; checkpointId: string; text: string; images?: { mediaType: string; data: string }[] }
   | { type: "interrupt" }
   | { type: "compact" }
+  /** /clear：丢弃当前会话上下文，在同一个 tab 里开一段全新的会话。
+   *  带 text 时清空后立刻把这条消息发进新上下文。 */
+  | { type: "newContext"; text?: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[]; sls?: boolean }
   | { type: "permission"; requestId: string; behavior: "allow" | "deny"; suggestionId?: string }
   | { type: "answerQuestion"; requestId: string; answers: Record<string, string | string[]> }
   | { type: "newSession" }
@@ -222,6 +241,11 @@ export type FromWebview =
   | { type: "saveImage"; dataUri: string }
   // ---- SLS 日志配置面板 ----
   | { type: "slsLoad" }
+  /** webview 内部 JS 错误上报——host 记入输出通道（webview 控制台平时看不到）。 */
+  | { type: "webviewError"; message: string }
+  | { type: "qqLoad" }
+  | { type: "qqSave"; config: QQConfig }
+  | { type: "qqToggle"; enabled: boolean }
   | { type: "slsSave"; config: SlsConfig }
   | { type: "slsTest"; config: SlsConfig }
   /** 让 Claude 扫描工作区 Spring Boot 配置生成日志映射（预填 prompt 到聊天）。 */

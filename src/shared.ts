@@ -247,6 +247,8 @@ export type FromWebview =
   /** webview 内部 JS 错误上报——host 记入输出通道（webview 控制台平时看不到）。 */
   | { type: "webviewError"; message: string }
   | { type: "pong"; id: number }
+  /** 用户关掉了"用量即将用尽"警告横幅——本重置周期内不再提示（exhausted 不受影响）。 */
+  | { type: "dismissRateLimit"; limitLabel: string; resetsAt?: number }
   | { type: "qqLoad" }
   | { type: "qqSave"; config: QQConfig }
   | { type: "qqToggle"; enabled: boolean }

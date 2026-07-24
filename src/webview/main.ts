@@ -2790,6 +2790,17 @@ function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
     el("span", "rl-ico", exhausted ? "⛔" : "⚠"),
     el("b", "rl-title", exhausted ? `${m.limitLabel}已用尽` : `${m.limitLabel}即将用尽`),
   );
+  if (!exhausted) {
+    // 警告级可关闭：本重置周期内不再提示（宿主记住 resetsAt，周期一过自然恢复）。
+    // 耗尽级是阻断性的，必须一直显示，不给关闭按钮。
+    const x = el("button", "rl-close", "×");
+    x.title = "本周期内不再提示";
+    x.onclick = () => {
+      box.remove();
+      send({ type: "dismissRateLimit", limitLabel: m.limitLabel, resetsAt: m.resetsAt });
+    };
+    head.appendChild(x);
+  }
   const cd = resetCountdown(m.resetsAt);
   const when = m.resetsAt ? new Date(m.resetsAt * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
   const body = el(

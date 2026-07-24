@@ -757,6 +757,10 @@ body.vscode-high-contrast .askq-card .tool-name { color: #a78bfa; } /* 5.6:1 on 
 .rate-limit-banner .rl-head { display: flex; align-items: center; gap: 7px; }
 .rate-limit-banner .rl-ico { font-size: 14px; line-height: 1; }
 .rate-limit-banner .rl-title { font-weight: 600; }
+.rate-limit-banner .rl-close { margin-left: auto; width: 22px; height: 22px; padding: 0; line-height: 1;
+  font-size: 15px; cursor: pointer; background: none; border: none; border-radius: 4px;
+  color: var(--vscode-descriptionForeground); }
+.rate-limit-banner .rl-close:hover { color: var(--vscode-foreground); background: rgba(127, 127, 127, 0.18); }
 .rate-limit-banner .rl-body { margin-top: 4px; opacity: .85; }
 .rate-limit-banner.warning {
   border-color: rgba(234, 179, 8, .55);

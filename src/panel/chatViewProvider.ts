@@ -1037,6 +1037,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       switch (m.type) {
         case "pong":
           break; // 心跳，无需处理
+        case "dismissRateLimit": {
+          // 记到 resetsAt（秒→毫秒）；事件没带就兜底 6 小时，别永久闭嘴。
+          const until = m.resetsAt ? m.resetsAt * 1000 : Date.now() + 6 * 3600_000;
+          const map = { ...this.context.globalState.get<Record<string, number>>("claudeChat.rateLimitDismissed") };
+          map[m.limitLabel] = until;
+          await this.context.globalState.update("claudeChat.rateLimitDismissed", map);
+          this.output.appendLine(`[${new Date().toISOString()}] [ratelimit] 「${m.limitLabel}」警告已关闭至 ${new Date(until).toLocaleString()}`);
+          break;
+        }
         case "webviewError":
           this.output.appendLine(`[${new Date().toISOString()}] [webview] 聊天面板脚本错误: ${m.message}`);
           break;
@@ -2487,6 +2496,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (this.config().get<boolean>("snapshotFilesForRestore", true)) {
         const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
         if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
+      }
+    }
+    // 用量"警告"横幅被用户关过的话，本重置周期内不再弹（每个新进程都会重报一次，
+    // 不在这拦就永远关不干净）。exhausted 是阻断性的，永远放行。
+    if (e.kind === "rate_limit" && e.level === "warning") {
+      const until = this.context.globalState.get<Record<string, number>>("claudeChat.rateLimitDismissed")?.[e.limitLabel] ?? 0;
+      if (Date.now() < until) {
+        this.output.appendLine(`[${new Date().toISOString()}] [ratelimit] 「${e.limitLabel}」警告已被关闭，跳过（至 ${new Date(until).toLocaleString()}）`);
+        return;
       }
     }
     // 纯诊断事件：只进日志，绝不进界面（用户明确要求界面保持干净）。

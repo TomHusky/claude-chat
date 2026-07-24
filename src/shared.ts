@@ -83,6 +83,9 @@ export type ToWebview =
   | { kind: "thinking_tokens"; tokens: number }
   /** 纯诊断信息：只进输出通道日志，绝不显示到界面。 */
   | { kind: "diag"; message: string }
+  /** 看门狗心跳：webview 必须立即回 pong。通道半死（页面活着但消息不通）时
+   *  宿主据此发现并重建 webview——否则表现为"永远转圈/按钮全聋"。 */
+  | { kind: "ping"; id: number }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
@@ -243,6 +246,7 @@ export type FromWebview =
   | { type: "slsLoad" }
   /** webview 内部 JS 错误上报——host 记入输出通道（webview 控制台平时看不到）。 */
   | { type: "webviewError"; message: string }
+  | { type: "pong"; id: number }
   | { type: "qqLoad" }
   | { type: "qqSave"; config: QQConfig }
   | { type: "qqToggle"; enabled: boolean }

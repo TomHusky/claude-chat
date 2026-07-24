@@ -48,6 +48,11 @@ interface SessionCtx {
   lastUsedAt?: number;
   /** 本条消息写入 CLI 的时刻；首个流事件到达时用来算真实等待并记日志（然后清掉）。 */
   sendAt?: number;
+  /** 看门狗：连续未回应的 ping 数。webview↔host 通道会无声半死（页面活着但消息
+   *  不通，表现为永远转圈/按钮全聋），连续 3 次不回就重建 webview 自愈。 */
+  missedPings?: number;
+  /** 上次看门狗重建的时刻——5 分钟冷却，防止超大会话渲染慢被误判成失联后反复重建。 */
+  rebuildAt?: number;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -74,6 +79,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly prewarmDone = new Map<string, number>(); // sessionId -> ts of last completed warm
   private prewarmProc?: ClaudeProcess; // at most one warm-up runs at a time (they're token-expensive)
   private keepWarmTimer?: ReturnType<typeof setInterval>; // periodic re-warm for idle open tabs
+  private usageTimer?: ReturnType<typeof setInterval>; // 用量胶囊定时刷新（不然要点开菜单才更新）
+  private watchdogTimer?: ReturnType<typeof setInterval>; // webview 通道半死检测 + 自愈
+  private sidebarMissedPings = 0; // 侧边栏的看门狗计数（它不在 sessions 里）
   // -- QQ 开放平台机器人（远程操控，专用后台会话）--
   private qqBot?: QQBot;
   private qqProc?: ClaudeProcess; // 机器人专用的 Claude 进程（与聊天 tab 完全隔离）
@@ -133,6 +141,59 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 过期，下一条消息就变成"冷发送"（大会话实测五六十秒）。这里每 5 分钟对所有
     // 打开的 tab 补一次 maybePrewarm —— 它自带全部守卫（>1MB、50min 内焐过不重复、
     // 额度>80% 跳过、同时只跑一个），所以静息成本为零，只在快过期时才真正花钱。
+    // 用量随时间流逝（5h 窗口滚动）+ 其他设备的消耗——不主动刷新的话，胶囊上的
+    // 数字要等用户点开菜单才变。每 3 分钟拉一次（fetchUsage 自带 90s 节流）。
+    this.usageTimer = setInterval(() => this.fetchUsage(), 3 * 60_000);
+
+    // 看门狗：webview↔host 通道会无声半死（实锤案例：宿主 103s 完成的轮次，面板
+    // 转圈到 1000s+，确认更改按钮全聋，官方插件同时正常）。每 10s ping 一次已就绪
+    // 的聊天面板，连续 3 次（30s）不回 pong 就重建该面板的 webview——历史与忙碌
+    // 状态由 ready→loadCtxSession 恢复，用户看到的只是界面刷了一下而不是永久卡死。
+    this.watchdogTimer = setInterval(() => {
+      for (const ctx of this.sessions) {
+        if (!ctx.ready) continue; // 尚未加载完不算失联
+        ctx.missedPings = (ctx.missedPings ?? 0) + 1;
+        if ((ctx.missedPings ?? 0) > 3) {
+          ctx.missedPings = 0;
+          // 5 分钟冷却：超大会话首次渲染可能合法地阻塞主线程较久，别反复重建打转。
+          if (Date.now() - (ctx.rebuildAt ?? 0) < 5 * 60_000) {
+            this.output.appendLine(`[${new Date().toISOString()}] [watchdog] 面板仍未响应，但 5min 内已重建过，跳过`);
+            continue;
+          }
+          ctx.rebuildAt = Date.now();
+          this.output.appendLine(
+            `[${new Date().toISOString()}] [watchdog] 面板 ${ctx.sessionId?.slice(0, 8) ?? "新会话"} 通道无响应 30s，重建 webview`,
+          );
+          ctx.ready = false;
+          try {
+            ctx.panel.webview.html = this.html(ctx.panel.webview); // 强制整页重载，ready 后自动恢复
+          } catch (err) {
+            this.output.appendLine(`[watchdog] 重建失败: ${String(err)}`);
+          }
+          continue;
+        }
+        this.post(ctx, { kind: "ping", id: Date.now() });
+      }
+      // 侧边栏同款（昨天的"全灭"案例正是侧边栏通道死了）。只在可见时检测——
+      // 隐藏的侧边栏收不到 ping 属正常，不能误判重建。
+      if (this.view?.visible) {
+        this.sidebarMissedPings++;
+        if (this.sidebarMissedPings > 3) {
+          this.output.appendLine(`[${new Date().toISOString()}] [watchdog] 侧边栏通道无响应 30s，重建 webview`);
+          this.sidebarMissedPings = 0;
+          try {
+            this.view.webview.html = this.sidebarHtml(this.view.webview);
+          } catch (err) {
+            this.output.appendLine(`[watchdog] 侧边栏重建失败: ${String(err)}`);
+          }
+        } else {
+          this.view.webview.postMessage({ kind: "ping", id: Date.now() } satisfies ToWebview);
+        }
+      } else {
+        this.sidebarMissedPings = 0;
+      }
+    }, 10_000);
+
     this.keepWarmTimer = setInterval(() => {
       // 有会话正在回复时避让：预热是全量上下文的大请求，跟真实对话抢并发可能
       // 触发 API 限流重试，反而拖慢用户正在等的那条。下个 tick 再补不迟。
@@ -918,8 +979,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Messages from the left sidebar (session manager only). */
   private async onSidebarMessage(m: FromWebview): Promise<void> {
+    this.sidebarMissedPings = 0; // 任何消息都证明通道活着
     try {
       switch (m.type) {
+        case "pong":
+          break; // 心跳，无需处理（上面已归零计数）
         case "ready":
         case "listSessions":
           this.refreshSessions();
@@ -968,8 +1032,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Messages from a chat panel — every message is scoped to that panel's ctx. */
   private async onPanelMessage(ctx: SessionCtx, m: FromWebview): Promise<void> {
+    ctx.missedPings = 0; // 任何消息都证明通道活着
     try {
       switch (m.type) {
+        case "pong":
+          break; // 心跳，无需处理
         case "webviewError":
           this.output.appendLine(`[${new Date().toISOString()}] [webview] 聊天面板脚本错误: ${m.message}`);
           break;
@@ -1909,6 +1976,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   window.addEventListener("message", (ev) => {
     const m = ev.data;
     if (!m) return;
+    if (m.kind === "ping") { vscode.postMessage({ type: "pong", id: m.id }); return; }
     if (m.kind === "qq_config") fill(m.config, m.hasSecret);
     else if (m.kind === "qq_state") setDot(m.state, m.detail);
     else if (m.kind === "qq_result") status(m.message, m.ok ? "ok" : "err");
@@ -2635,6 +2703,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.broadcastRunning();
     this.refreshSessions();
+    this.sweepResurrected(ids);
+  }
+
+  /** 删除后的"防复活"复查：垂死的 CLI（本窗口 3s 兜底没等到的、其他 VS Code 窗口
+   *  常驻着同一会话的、官方插件的）可能在 unlink 之后 flush 缓冲，把 jsonl 又写回
+   *  来——列表里就"删不掉"。删完在 4s/12s 各复查一次，复活就再删。 */
+  private sweepResurrected(ids: string[]): void {
+    for (const delay of [4_000, 12_000]) {
+      setTimeout(() => {
+        let revived = 0;
+        for (const id of ids) {
+          if (this.store.findFile(id)) {
+            this.store.delete(id);
+            revived++;
+            this.output.appendLine(`[${new Date().toISOString()}] [delete] 会话 ${id.slice(0, 8)} 被残留进程复活，已再次删除`);
+          }
+        }
+        if (revived) this.refreshSessions();
+      }, delay);
+    }
   }
 
   /** Set (or clear, when blank) a user-defined title. Persisted as a
@@ -2984,6 +3072,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   dispose(): void {
     if (this.keepWarmTimer) clearInterval(this.keepWarmTimer);
     this.keepWarmTimer = undefined;
+    if (this.usageTimer) clearInterval(this.usageTimer);
+    this.usageTimer = undefined;
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.watchdogTimer = undefined;
     this.stopQQBot(); // 关窗口就断开机器人，不留孤儿进程/连接
     this.qqPanel?.dispose();
     this.qqPanel = undefined;
@@ -3251,10 +3343,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       input.addEventListener("blur", () => commit(true));
     }
     $("new").addEventListener("click", () => vscode.postMessage({ type: "newInEditor" }));
+    function exitMulti() {
+      multi = false;
+      document.body.classList.remove("multi");
+      $("multi").textContent = "多选";
+      sel.clear();
+      $("delsel").classList.add("hidden");
+      render();
+    }
     $("multi").addEventListener("click", () => {
-      multi = !multi; document.body.classList.toggle("multi", multi);
-      $("multi").textContent = multi ? "取消" : "多选";
-      if (!multi) { sel.clear(); $("delsel").classList.add("hidden"); }
+      if (multi) { exitMulti(); return; }
+      multi = true; document.body.classList.add("multi");
+      $("multi").textContent = "取消";
       render();
     });
     $("delsel").addEventListener("click", () => confirmDel([...sel]));
@@ -3262,10 +3362,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     window.addEventListener("message", (ev) => {
       const m = ev.data;
+      if (m && m.kind === "ping") { vscode.postMessage({ type: "pong", id: m.id }); return; }
       if (m && m.kind === "sessions") {
         sessions = m.list || []; activeId = m.activeId || null;
         if (m.runningIds !== undefined) runningIds = new Set(m.runningIds || []);
+        const hadSel = sel.size > 0;
         for (const id of [...sel]) if (!sessions.find((s) => s.id === id)) sel.delete(id);
+        // 批量删除完成的信号：之前选中的会话全部从列表消失 → 自动退出多选。
+        // （宿主弹窗点了取消时 sel 原样保留，不会误退。）
+        if (multi && hadSel && sel.size === 0) { exitMulti(); return; }
         $("delsel").classList.toggle("hidden", sel.size === 0);
         render();
       } else if (m && m.kind === "running") {

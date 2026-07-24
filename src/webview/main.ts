@@ -645,6 +645,9 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     return;
   }
   switch (m.kind) {
+    case "ping":
+      send({ type: "pong", id: m.id }); // 看门狗心跳——必须无条件立即回
+      return;
     case "session":
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
       // The CLI reports the mode its process actually runs in — trust it over

@@ -1,8 +1,57 @@
 import * as vscode from "vscode";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { ChatViewProvider } from "./panel/chatViewProvider";
 
+/** 固定日志目录：~/.claude-chat/logs/claude-chat-YYYY-MM-DD.log（按天分文件）。
+ *  VS Code 输出通道的落盘路径深埋且每次会话都变，用户/同事根本找不到——
+ *  所有日志双写到这里，收日志只需要拿这个目录。 */
+const LOG_DIR = path.join(os.homedir(), ".claude-chat", "logs");
+
+function logFilePath(): string {
+  const d = new Date();
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return path.join(LOG_DIR, `claude-chat-${day}.log`);
+}
+
+/** 包一层 OutputChannel：appendLine 同时落盘到固定目录。写盘失败静默（日志不能反噬功能）。 */
+function teeOutput(channel: vscode.OutputChannel): vscode.OutputChannel {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    // 只保留最近 7 天，防止无限膨胀。
+    for (const f of fs.readdirSync(LOG_DIR)) {
+      try {
+        const full = path.join(LOG_DIR, f);
+        if (Date.now() - fs.statSync(full).mtimeMs > 7 * 24 * 3600_000) fs.unlinkSync(full);
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+  const writeLine = (line: string) => {
+    try {
+      const ts = new Date();
+      const hh = `${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}:${String(ts.getSeconds()).padStart(2, "0")}`;
+      fs.appendFileSync(logFilePath(), `[${hh}] ${line}\n`, "utf8");
+    } catch { /* 日志写盘失败不打扰任何功能 */ }
+  };
+  return {
+    name: channel.name,
+    append: (v) => channel.append(v),
+    appendLine: (v) => {
+      channel.appendLine(v);
+      writeLine(v);
+    },
+    replace: (v) => channel.replace(v),
+    clear: () => channel.clear(),
+    show: ((...args: unknown[]) => (channel.show as (...a: unknown[]) => void)(...args)) as vscode.OutputChannel["show"],
+    hide: () => channel.hide(),
+    dispose: () => channel.dispose(),
+  };
+}
+
 export function activate(context: vscode.ExtensionContext): void {
-  const output = vscode.window.createOutputChannel("Claude Chat");
+  const output = teeOutput(vscode.window.createOutputChannel("Claude Chat"));
+  output.appendLine(`[boot] ClaudeCopilot v${(context.extension.packageJSON as { version?: string }).version ?? "?"} 日志目录 ${LOG_DIR}`);
   const provider = new ChatViewProvider(context, output);
 
   context.subscriptions.push(
@@ -27,6 +76,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
     vscode.commands.registerCommand("claude-chat.slsConfig", () => provider.showSlsConfig()),
     vscode.commands.registerCommand("claude-chat.qqConfig", () => provider.showQQConfig()),
+    vscode.commands.registerCommand("claude-chat.openLogs", () => {
+      try {
+        fs.mkdirSync(LOG_DIR, { recursive: true });
+      } catch { /* ignore */ }
+      void vscode.env.openExternal(vscode.Uri.file(LOG_DIR));
+    }),
     vscode.commands.registerCommand("claude-chat.openInEditor", () => provider.openInEditor()),
     // The icon on FILE editors' title bar: always start a FRESH conversation
     // (openInEditor would resurrect the last session).

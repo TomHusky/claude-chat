@@ -1542,6 +1542,26 @@ function symbolName(s: string): string | null {
 
 /** Make file references inside rendered assistant markdown clickable. */
 function linkifyRefs(container: HTMLElement) {
+  // 0) AI 常输出 markdown 文件链接（[router:651](src/router/index.js#L651)）。
+  //    <a> 渲染出来点击本来就无人处理 = 永远的死链接。统一转成文件引用并走
+  //    存在性校验：真实存在 → 可点击打开；不存在 → 退化成纯文本（宁可没有
+  //    链接，也不给点不动的链接）。http/命令类真外链保持原样交给 VS Code。
+  container.querySelectorAll("a").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    if (/^(https?|mailto|command|vscode):/i.test(href)) return;
+    const span = document.createElement("span");
+    span.textContent = a.textContent || href;
+    const m = /^([^#?]+?)(?:#L?(\d+)(?:[-–]L?(\d+))?)?$/.exec(href);
+    if (m && m[1] && m[1] !== "#") {
+      span.className = "code-ref";
+      span.dataset.action = "open";
+      span.dataset.path = decodeURIComponent(m[1]);
+      if (m[2]) span.dataset.line = m[2];
+      if (m[3]) span.dataset.endline = m[3];
+      span.title = "打开 " + decodeURIComponent(m[1]) + (m[2] ? `:${m[2]}` : "");
+    }
+    a.replaceWith(span);
+  });
   // 1) Inline code spans: a file path -> open file; a symbol -> go to definition.
   container.querySelectorAll("code").forEach((code) => {
     if (code.closest("pre") || code.children.length) return;

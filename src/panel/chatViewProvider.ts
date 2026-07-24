@@ -1188,7 +1188,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await this.openSymbol(ctx, m.name);
           break;
         case "validateRefs": {
-          const invalid = m.refs.filter((r) => !this.fileRefExists(r.path)).map((r) => r.id);
+          // 逐个解析（含全工作区文件名搜索）——裸文件名 `bridge.js:282` 也算有效链接。
+          const invalid: string[] = [];
+          for (const r of m.refs) {
+            if (!(await this.fileRefResolves(r.path))) invalid.push(r.id);
+          }
           if (invalid.length) this.post(ctx, { kind: "refs_validated", invalid });
           break;
         }
@@ -2879,24 +2883,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // -- Helpers -------------------------------------------------------------
 
   /** Does a file ref (path, optionally with `:line`) point at a real file? */
-  private fileRefExists(ref: string): boolean {
-    const p = ref.replace(/:\d+(?:-\d+)?$/, "").trim();
-    if (!p) return false;
-    const candidates = path.isAbsolute(p)
+  /** 把 AI 提到的（往往不完整的）路径解析成真实文件：先按给定路径直接拼，拼不到
+   *  就全工作区按文件名搜（回复里常见 `bridge.js:282` 这种裸文件名——以前直接拼
+   *  接找不到，点击就"没反应"）。多个候选且无法判定时弹选择器（interactive）。 */
+  private async resolveWorkspaceFile(p: string, interactive: boolean): Promise<string | undefined> {
+    const direct = path.isAbsolute(p)
       ? [p]
       : [path.join(this.cwd(), p), ...this.workspaceDirs().map((d) => path.join(d, p))];
-    return candidates.some((c) => {
+    for (const c of direct) {
       try {
-        return fs.statSync(c).isFile();
+        if (fs.statSync(c).isFile()) return c;
       } catch {
-        return false;
+        /* try next */
       }
+    }
+    const base = p.split(/[\\/]/).pop() || "";
+    if (!base) return undefined;
+    let uris: vscode.Uri[];
+    try {
+      uris = await vscode.workspace.findFiles(
+        `**/${base}`,
+        "{**/node_modules/**,**/.git/**,**/dist/**,**/build/**,**/target/**,**/out/**}",
+        12,
+      );
+    } catch {
+      return undefined;
+    }
+    if (!uris.length) return undefined;
+    // 带目录的引用优先后缀完全匹配（src/a/bridge.js 优于 test/bridge.js）；再取路径最浅的。
+    const norm = "/" + p.replace(/\\/g, "/");
+    const ranked = uris.map((u) => u.fsPath).sort((a, b) => {
+      const sa = a.replace(/\\/g, "/").endsWith(norm) ? 0 : 1;
+      const sb = b.replace(/\\/g, "/").endsWith(norm) ? 0 : 1;
+      return sa - sb || a.length - b.length;
     });
+    if (ranked.length === 1 || ranked[0].replace(/\\/g, "/").endsWith(norm) || !interactive) return ranked[0];
+    const pick = await vscode.window.showQuickPick(
+      ranked.map((f) => ({ label: vscode.workspace.asRelativePath(f), f })),
+      { placeHolder: `找到多个「${base}」，选择要打开的文件` },
+    );
+    return pick?.f;
+  }
+
+  private async fileRefResolves(ref: string): Promise<boolean> {
+    const p = ref.replace(/:\d+(?:-\d+)?$/, "").trim();
+    if (!p) return false;
+    return !!(await this.resolveWorkspaceFile(p, false));
   }
 
   private async openFile(ctx: SessionCtx, p: string, line?: number, endLine?: number): Promise<void> {
     try {
-      const abs = path.isAbsolute(p) ? p : path.join(this.cwd(), p);
+      const abs = await this.resolveWorkspaceFile(p, true);
+      if (!abs) {
+        vscode.window.showWarningMessage(`工作区里找不到文件：${p}`);
+        return;
+      }
+      if (abs !== p) this.output.appendLine(`[openFile] ${p} → ${abs}`);
       const doc = await vscode.workspace.openTextDocument(abs);
       const editor = await vscode.window.showTextDocument(doc, { viewColumn: this.codeColumn(ctx), preview: false });
       if (line && line > 0) {

@@ -2460,8 +2460,8 @@ const MODES = [
 ];
 const MODELS = [
   { id: "", label: "默认模型", short: "默认", desc: "使用 CLI 默认模型" },
-  { id: "opus", label: "Claude Opus 4.8", short: "Opus", desc: "最强 · 复杂任务" },
-  { id: "sonnet", label: "Claude Sonnet 4.6", short: "Sonnet", desc: "均衡 · 日常编码" },
+  { id: "opus", label: "Claude Opus 5", short: "Opus", desc: "最强 · 复杂任务" },
+  { id: "sonnet", label: "Claude Sonnet 5", short: "Sonnet", desc: "均衡 · 日常编码" },
   { id: "haiku", label: "Claude Haiku 4.5", short: "Haiku", desc: "最快 · 轻量任务" },
   { id: "fable", label: "Fable 5", short: "Fable", desc: "" },
 ];

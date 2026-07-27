@@ -311,15 +311,77 @@ export class SessionStore {
     return undefined;
   }
 
+  /** 官方 CLI 在 ~/.claude 下按 sessionId 建的附属目录。只删 transcript 的话它们
+   *  会永远堆着（实测一台机器攒了 61 个孤儿），且官方侧仍认得这个会话——所以
+   *  "删了还在"。删会话时一并清理。 */
+  private static readonly SIDECAR_DIRS = ["file-history", "session-env", "tasks", "sessions"];
+
   delete(sessionId: string): boolean {
     const f = this.findFile(sessionId);
-    if (!f) return false;
-    try {
-      fs.unlinkSync(f);
-      return true;
-    } catch {
-      return false;
+    let ok = false;
+    if (f) {
+      try {
+        fs.unlinkSync(f);
+        ok = true;
+      } catch {
+        /* 文件可能被占用；附属目录仍继续清理 */
+      }
     }
+    this.deleteSidecars(sessionId);
+    return ok;
+  }
+
+  /** 清理某会话在 ~/.claude 下的附属数据（目录或同名 .json）。best-effort。 */
+  deleteSidecars(sessionId: string): void {
+    for (const dir of SessionStore.SIDECAR_DIRS) {
+      for (const name of [sessionId, `${sessionId}.json`, `${sessionId}.jsonl`]) {
+        const p = path.join(this.configDir(), dir, name);
+        try {
+          if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  /** 扫掉所有"transcript 已不存在"的附属目录——历史遗留的孤儿。返回清理数量。 */
+  sweepOrphanSidecars(): number {
+    const live = new Set<string>();
+    for (const dir of this.projectDirs()) {
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          if (f.endsWith(".jsonl")) live.add(f.slice(0, -6));
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    // 一个 transcript 都读不到时果断放弃：可能是路径判断出错，别误删用户数据。
+    if (!live.size) return 0;
+    let removed = 0;
+    for (const dir of SessionStore.SIDECAR_DIRS) {
+      const base = path.join(this.configDir(), dir);
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(base);
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const id = e.replace(/\.(json|jsonl)$/, "");
+        // 只认 uuid 形态，避免误伤官方将来放进去的其它文件。
+        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) continue;
+        if (live.has(id)) continue;
+        try {
+          fs.rmSync(path.join(base, e), { recursive: true, force: true });
+          removed++;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return removed;
   }
 
   /** Parse only the last `bytes` of a transcript (first partial line dropped).

@@ -145,6 +145,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 数字要等用户点开菜单才变。每 3 分钟拉一次（fetchUsage 自带 90s 节流）。
     this.usageTimer = setInterval(() => this.fetchUsage(), 3 * 60_000);
 
+    // 启动清一次历史遗留的孤儿附属目录（旧版本删会话时没清 file-history /
+    // session-env / tasks，实测能攒到几十个）。延后执行，不拖慢激活。
+    setTimeout(() => {
+      try {
+        const n = this.store.sweepOrphanSidecars();
+        if (n) this.output.appendLine(`[${new Date().toISOString()}] [cleanup] 清理了 ${n} 个已删会话的残留数据`);
+      } catch (err) {
+        this.output.appendLine(`[cleanup] 清理残留失败: ${String(err)}`);
+      }
+    }, 8000);
+
     // 看门狗：webview↔host 通道会无声半死（实锤案例：宿主 103s 完成的轮次，面板
     // 转圈到 1000s+，确认更改按钮全聋，官方插件同时正常）。每 10s ping 一次已就绪
     // 的聊天面板，连续 3 次（30s）不回 pong 就重建该面板的 webview——历史与忙碌
@@ -2740,6 +2751,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             this.store.delete(id);
             revived++;
             this.output.appendLine(`[${new Date().toISOString()}] [delete] 会话 ${id.slice(0, 8)} 被残留进程复活，已再次删除`);
+          } else {
+            this.store.deleteSidecars(id); // 垂死进程可能又写回了 file-history 等附属数据
           }
         }
         if (revived) this.refreshSessions();

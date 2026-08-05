@@ -566,9 +566,10 @@ function buildUsageMenu() {
   let html = `<div class="pick-head usage-head">套餐用量</div>`;
   html += usageRow("5 小时限额", d.sessionPct, cnResetSession(d.sessionReset));
   html += usageRow("每周 · 全部模型", d.weekPct, cnResetWeek(d.weekReset));
-  // 按模型的周限额行：CLI 输出了才显示（模型名原样带出，Sonnet/Fable 都通用）。
+  // 按模型的周限额行：CLI 输出了才显示（模型名 Sonnet/Fable 都通用）。
+  // 模型名来自解析 CLI 的 stdout——外部字符串进 innerHTML 必须转义。
   if (typeof d.weekModelPct === "number") {
-    html += usageRow(`仅 ${d.weekModelName || "特定模型"}`, d.weekModelPct, "");
+    html += usageRow(`仅 ${escapeHtml(d.weekModelName || "特定模型")}`, d.weekModelPct, "");
   }
   usageMenu.innerHTML = html;
 }
@@ -647,6 +648,13 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   switch (m.kind) {
     case "ping":
       send({ type: "pong", id: m.id }); // 看门狗心跳——必须无条件立即回
+      return;
+    case "draft":
+      // 看门狗重建后回填草稿；用户已经打了新内容就绝不覆盖。
+      if (!inputEl.value && m.text) {
+        inputEl.value = m.text;
+        autoResize();
+      }
       return;
     case "session":
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
@@ -1138,7 +1146,12 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
     multiSelect?: boolean;
     options?: Array<{ label: string; description?: string }>;
   }>;
-  if (!questions.length) return;
+  if (!questions.length) {
+    // 畸形输入（没有任何问题）：不渲染 UI 也不应答的话，这个请求就成了
+    // 无法作答的黑洞，本轮永久卡在 waiting。空答案放行让 CLI 继续。
+    send({ type: "answerQuestion", requestId: m.requestId, answers: {} });
+    return;
+  }
 
   const sel = questions.map(() => new Set<string>()); // chosen built-in labels per question
   const custom = questions.map(() => ""); // custom answer text per question
@@ -1888,6 +1901,7 @@ function readComposer(): QueueItem | null {
 
 function clearComposer() {
   inputEl.value = "";
+  send({ type: "draft", text: "" }); // 已发送/清空——宿主侧草稿同步作废
   autoResize();
   clearContextChips();
   pendingImages.length = 0;
@@ -2143,6 +2157,14 @@ stopBtn.onclick = () => {
 };
 /** True from Stop-click until the next turn starts: render nothing new. */
 let stoppingView = false;
+// 草稿实时同步到宿主（节流 500ms）：webview 通道看门狗重建是整页重载，
+// 不存宿主侧的话用户打了一半的长消息会瞬间消失。
+let draftTimer = 0;
+inputEl.addEventListener("input", () => {
+  clearTimeout(draftTimer);
+  draftTimer = window.setTimeout(() => send({ type: "draft", text: inputEl.value }), 500);
+});
+
 inputEl.addEventListener("keydown", (e) => {
   // Ignore Enter while an IME composition is active (e.g. confirming a pinyin
   // candidate) — `isComposing`/keyCode 229 means it's not a real "send".
@@ -2354,15 +2376,27 @@ window.addEventListener(
     if (!dt) return;
     // ① VS Code 资源管理器（含其他窗口）拖入：uri-list 里直接有 file:// 路径。
     let added = 0;
-    const raw =
-      dt.getData("application/vnd.code.uri-list") || dt.getData("text/uri-list") || dt.getData("text/plain") || "";
+    const uriRaw = dt.getData("application/vnd.code.uri-list") || dt.getData("text/uri-list") || "";
+    const plain = dt.getData("text/plain") || "";
+    // text/plain 只有整段内容"就是一列路径"时才当文件——拖一段日志/代码文本
+    // 进来（里面恰好有 /etc/hosts 这样的行）不能被吞成附件。
+    const plainLines = plain.split(/[\r\n]+/).map((s) => s.trim()).filter(Boolean);
+    const plainIsPathList =
+      plainLines.length > 0 && plainLines.length <= 5 && plainLines.every((s) => /^(file:\/\/|\/)\S+$/.test(s));
+    const raw = uriRaw || (plainIsPathList ? plain : "");
     for (const line of raw.split(/[\r\n]+/)) {
       const s = line.trim();
       if (!s || s.startsWith("#")) continue;
       try {
         const u = new URL(s);
         if (u.protocol === "file:") {
-          addFile(decodeURIComponent(u.pathname));
+          let p = u.pathname;
+          try {
+            p = decodeURIComponent(u.pathname);
+          } catch {
+            /* keep raw */
+          }
+          addFile(p);
           added++;
         }
       } catch {
@@ -2373,6 +2407,16 @@ window.addEventListener(
       }
     }
     if (added) return;
+    // 普通文本拖进来（选中的代码/日志）：插到输入框光标处，而不是静默吞掉。
+    if (plain && !(dt.files && dt.files.length)) {
+      const start = inputEl.selectionStart ?? inputEl.value.length;
+      const end = inputEl.selectionEnd ?? start;
+      inputEl.value = inputEl.value.slice(0, start) + plain + inputEl.value.slice(end);
+      inputEl.selectionStart = inputEl.selectionEnd = start + plain.length;
+      inputEl.focus();
+      inputEl.dispatchEvent(new Event("input"));
+      return;
+    }
     // ② OS（Finder 等）拖入：没有 uri-list。老 Electron 的 File.path 能直接拿到
     // 绝对路径；新版拿不到就走 ③。
     const plainFiles = dt.files ? Array.from(dt.files) : [];

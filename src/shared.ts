@@ -86,6 +86,8 @@ export type ToWebview =
   /** 看门狗心跳：webview 必须立即回 pong。通道半死（页面活着但消息不通）时
    *  宿主据此发现并重建 webview——否则表现为"永远转圈/按钮全聋"。 */
   | { kind: "ping"; id: number }
+  /** 重建 webview 后回填输入框草稿（宿主侧持有，整页重载不丢）。 */
+  | { kind: "draft"; text: string }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
@@ -247,6 +249,8 @@ export type FromWebview =
   /** webview 内部 JS 错误上报——host 记入输出通道（webview 控制台平时看不到）。 */
   | { type: "webviewError"; message: string }
   | { type: "pong"; id: number }
+  /** 输入框草稿同步（节流上报），看门狗重建 webview 时由宿主回填。 */
+  | { type: "draft"; text: string }
   /** 用户关掉了"用量即将用尽"警告横幅——本重置周期内不再提示（exhausted 不受影响）。 */
   | { type: "dismissRateLimit"; limitLabel: string; resetsAt?: number }
   /** 校验符号引用是否真实存在（LSP 工作区索引）。无效的通过 refs_validated 剥掉链接。 */

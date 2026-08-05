@@ -126,6 +126,16 @@ export class ClaudeProcess {
           `无法启动 claude CLI (${this.opts.claudePath}): ${err.message}。` +
           ` 请检查 设置 claudeChat.claudePath，或确认 \`claude\` 在 PATH 中。`,
       });
+      // spawn 本身失败（如 claudePath 配错的 ENOENT，pid 为空）不会再有 'close'
+      // 事件——不在这收尾的话 initialize 控制请求要干等满 30s 超时，期间
+      // spinner 一直转，最后还多弹一条"control_request timed out"。
+      if (this.proc?.pid === undefined && !this.exited) {
+        this.exited = true;
+        for (const [, pending] of this.pendingControl) pending.reject(new Error(`无法启动 claude CLI: ${err.message}`));
+        this.pendingControl.clear();
+        this.setBusy(false);
+        if (!this.disposed) this.hooks.onClose(null);
+      }
     });
 
     // Without a listener, an async EPIPE on stdin (CLI died mid-write) is an

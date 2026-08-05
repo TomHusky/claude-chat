@@ -19,8 +19,10 @@ function logFilePath(): string {
 function teeOutput(channel: vscode.OutputChannel): vscode.OutputChannel {
   try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
-    // 只保留最近 7 天，防止无限膨胀。
+    // 只保留最近 7 天，防止无限膨胀。只清自己命名规则的文件——用户往这个
+    // 目录放的其它东西（导出的旧日志、笔记）不能被静默删掉。
     for (const f of fs.readdirSync(LOG_DIR)) {
+      if (!/^claude-chat-\d{4}-\d{2}-\d{2}\.log$/.test(f)) continue;
       try {
         const full = path.join(LOG_DIR, f);
         if (Date.now() - fs.statSync(full).mtimeMs > 7 * 24 * 3600_000) fs.unlinkSync(full);

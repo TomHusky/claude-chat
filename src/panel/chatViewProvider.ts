@@ -57,6 +57,13 @@ interface SessionCtx {
   missedPings?: number;
   /** 上次看门狗重建的时刻——5 分钟冷却，防止超大会话渲染慢被误判成失联后反复重建。 */
   rebuildAt?: number;
+  /** 进程最近一次吐出任何事件的时刻（不随轮次收尾清零，与 lastEventAt 不同）。
+   *  LRU 淘汰用它兜底：interrupt 会乐观置 busy=false，但 CLI 可能还在继续输出——
+   *  刚有动静的进程不能当"空闲"杀掉。 */
+  lastEmitAt?: number;
+  /** 输入框草稿（webview 每次变化都同步过来）。通道看门狗重建 webview 是整页
+   *  重载，不存宿主侧的话用户打了一半的长消息会瞬间消失。 */
+  draft?: string;
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
@@ -73,6 +80,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private updateAvailable?: string; // remote version when an update was detected (drives the red dot)
   private installedPending?: string; // version installed this session, awaiting a window reload to take effect
   private lastUsageAt = 0; // throttle for subscription-usage queries
+  private usageFails = 0; // 连续解析失败次数（API-key 账号会一直失败，不能无限重试）
   private usageInFlight = false;
   private lastUsage?: ToWebview; // most recent usage result, replayed to new tabs
   private layoutFixing = false; // guards re-entrancy while sliding a file group left
@@ -386,6 +394,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
+    // 移动侧边栏位置（如移到辅助侧栏）会 dispose 旧 view 再 resolve 新的——
+    // 死引用不清掉的话，进程事件路径上的 postMessage 会抛异常。
+    view.onDidDispose(() => {
+      if (this.view === view) this.view = undefined;
+    });
     view.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
@@ -458,10 +471,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       activeId: this.activeCtx?.sessionId,
       runningIds: this.runningIds(),
     };
-    this.view?.webview.postMessage(e);
+    try {
+      this.view?.webview.postMessage(e);
+    } catch {
+      /* view disposed（移动侧边栏位置会短暂出现死引用） */
+    }
     for (const ctx of this.sessions) {
-      ctx.panel.webview.postMessage(e);
-      this.setPanelTitle(ctx, list);
+      try {
+        ctx.panel.webview.postMessage(e);
+        this.setPanelTitle(ctx, list);
+      } catch {
+        /* panel disposed */
+      }
     }
   }
 
@@ -601,7 +622,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let overflow = this.detached.size - ChatViewProvider.MAX_BACKGROUND;
     if (overflow <= 0) return;
     const idle = [...this.detached.values()]
-      .filter((c) => c.proc && !c.proc.isBusy && c.sessionId)
+      // 60s 内还在吐事件的进程不算空闲：interrupt 乐观置了 busy=false，但 CLI
+      // 可能没理会、仍在写 transcript——这时候杀掉会截断落盘内容。
+      .filter((c) => c.proc && !c.proc.isBusy && c.sessionId && Date.now() - (c.lastEmitAt ?? 0) > 60_000)
       .sort((a, b) => (a.lastUsedAt ?? 0) - (b.lastUsedAt ?? 0));
     for (const c of idle) {
       if (overflow <= 0) break;
@@ -1083,6 +1106,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       switch (m.type) {
         case "pong":
           break; // 心跳，无需处理
+        case "draft":
+          ctx.draft = m.text; // 宿主侧留底，webview 被看门狗重建时回填
+          break;
         case "dismissRateLimit": {
           // 记到 resetsAt（秒→毫秒）；事件没带就兜底 6 小时，别永久闭嘴。
           const until = m.resetsAt ? m.resetsAt * 1000 : Date.now() + 6 * 3600_000;
@@ -1164,6 +1190,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "newSession":
           await this.openSession(undefined);
+          break;
+        // 面板内会话抽屉的四种操作此前没有 handler（点了没反应的哑弹）——
+        // 与侧边栏同款路由。
+        case "switchSession":
+          await this.openSession(m.sessionId);
+          break;
+        case "deleteSession":
+          await this.deleteSessions([m.sessionId]);
+          break;
+        case "deleteSessions":
+          await this.deleteSessions(m.sessionIds);
+          break;
+        case "renameSession":
+          this.renameSession(m.sessionId, m.title);
           break;
         case "listSessions":
           this.refreshSessions();
@@ -1269,6 +1309,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** On a chat panel's webview load, render its session (or last/blank). */
   private loadCtxSession(ctx: SessionCtx): void {
+    if (ctx.draft) this.post(ctx, { kind: "draft", text: ctx.draft }); // 重建后回填草稿
     if (ctx.sessionId) {
       this.loadSessionInto(ctx, ctx.sessionId);
       return;
@@ -2445,12 +2486,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return true;
       }
 
-      case "/usage":
+      case "/usage": {
+        // 等"这一次强制刷新"的结果（对象引用变化 = 新数据落地）——原来的
+        // 条件是 !lastUsage，缓存几乎总是存在，等于永远立即返回 3 分钟前的旧值。
+        const prev = this.lastUsage;
         this.fetchUsage(true);
-        // 等一小会儿拿最新值（拿不到就报缓存/提示稍后）。
-        for (let i = 0; i < 24 && !this.lastUsage; i++) await new Promise((r) => setTimeout(r, 500));
+        for (let i = 0; i < 24 && this.lastUsage === prev; i++) await new Promise((r) => setTimeout(r, 500));
         await reply(this.qqUsageText());
         return true;
+      }
 
       case "/stop":
         if (this.qqProc?.isBusy) {
@@ -2676,6 +2720,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     ctx.proc = undefined;
     ctx.starting = undefined;
+    // 后台（关着 tab）的会话：进程已经没了，留在池里就是个僵尸条目——占
+    // MAX_BACKGROUND 容量却永远不在可淘汰列表里，变相把保活池越挤越小。
+    if (!this.alive(ctx) && ctx.sessionId && this.detached.get(ctx.sessionId) === ctx) {
+      ctx.checkpoints.flush();
+      this.detached.delete(ctx.sessionId);
+    }
     this.post(ctx, {
       kind: "error",
       message: `Claude 已 ${Math.round(idle / 60_000)} 分钟没有任何响应，判定为卡死并已重置连接。请重新发送这条消息（上下文不会丢失）。`,
@@ -2726,6 +2776,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 轮次看门狗心跳：CLI 只要还有任何动静（思考、工具、状态）就算活着。
     // 放在最前面，任何 early-return 都不会漏掉刷新。
     if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
+    ctx.lastEmitAt = Date.now(); // 无条件版（LRU 淘汰的"最近有动静"兜底）
     if (e.kind === "tool_input" && FILE_TOOLS.has(e.name)) {
       if (this.config().get<boolean>("snapshotFilesForRestore", true)) {
         const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
@@ -2799,9 +2850,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Tell every webview which sessions are currently streaming, so the list can
    *  show live "active" dots — even after a chat tab is closed or switched. */
   private broadcastRunning(): void {
+    // 这条会从进程事件（busy/close）进入，没有外层 try/catch 保护——侧边栏
+    // 被移动位置/收起时 view 是已 dispose 的死引用，postMessage 直接抛
+    // "Webview is disposed"，异常会中断当轮事件处理。逐个吞掉。
     const e: ToWebview = { kind: "running", sessionIds: this.runningIds() };
-    this.view?.webview.postMessage(e);
-    for (const ctx of this.sessions) ctx.panel.webview.postMessage(e);
+    try {
+      this.view?.webview.postMessage(e);
+    } catch {
+      /* view disposed */
+    }
+    for (const ctx of this.sessions) {
+      try {
+        ctx.panel.webview.postMessage(e);
+      } catch {
+        /* panel disposed */
+      }
+    }
   }
 
   /**
@@ -2841,13 +2905,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       const parsed = parseUsage(resultText);
       if (parsed) {
+        this.usageFails = 0;
         // Remember it so newly-opened tabs can show it immediately, and push it
         // to every open chat tab (not just the focused one).
         this.lastUsage = { kind: "usage", ...parsed, sessionResetAt };
         for (const ctx of this.sessions) this.post(ctx, this.lastUsage);
       } else {
         // Transient failure — don't let the throttle block retries for 90s.
-        this.lastUsageAt = 0;
+        // 但 API-key 账号的 /usage 永远解析不出百分比：连续失败几次后就恢复
+        // 正常节流，否则每个 ready/result/定时器都会真实 spawn 一个 CLI 进程。
+        this.usageFails++;
+        if (this.usageFails <= 3) this.lastUsageAt = 0;
       }
     };
 

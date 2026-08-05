@@ -607,7 +607,9 @@ function truncate(s: string, n: number): string {
 function stringify(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content.map((c) => (typeof c === "string" ? c : (c as any).text ?? "")).join("\n");
+    // 非 text 块与实时侧 stringifyToolResult 对齐（JSON 序列化），否则同一个
+    // 工具卡片实时显示有内容、重启后回放变空行。
+    return content.map((c) => (typeof c === "string" ? c : (c as any).text ?? JSON.stringify(c))).join("\n");
   }
   return content == null ? "" : JSON.stringify(content);
 }

@@ -1625,6 +1625,18 @@ function linkifyRefs(container: HTMLElement) {
     });
     send({ type: "validateRefs", refs });
   }
+  // 4) 符号引用同样要校验——`@RateLimit` 这类项目里根本不存在的注解以前也会被
+  //    加上链接，点了没反应。LSP 索引里查不到的就剥掉链接（宁缺毋滥）。
+  const symRefs = container.querySelectorAll<HTMLElement>('.code-ref[data-action="symbol"]:not([data-ref-id])');
+  if (symRefs.length) {
+    const syms: { id: string; name: string }[] = [];
+    symRefs.forEach((e) => {
+      const id = "ref" + refSeq++;
+      e.dataset.refId = id;
+      syms.push({ id, name: e.dataset.symbol || "" });
+    });
+    send({ type: "validateSymbols", syms });
+  }
 }
 
 let refSeq = 0;

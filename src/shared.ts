@@ -249,6 +249,8 @@ export type FromWebview =
   | { type: "pong"; id: number }
   /** 用户关掉了"用量即将用尽"警告横幅——本重置周期内不再提示（exhausted 不受影响）。 */
   | { type: "dismissRateLimit"; limitLabel: string; resetsAt?: number }
+  /** 校验符号引用是否真实存在（LSP 工作区索引）。无效的通过 refs_validated 剥掉链接。 */
+  | { type: "validateSymbols"; syms: { id: string; name: string }[] }
   | { type: "qqLoad" }
   | { type: "qqSave"; config: QQConfig }
   | { type: "qqToggle"; enabled: boolean }

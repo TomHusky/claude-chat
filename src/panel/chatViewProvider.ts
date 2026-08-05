@@ -1207,6 +1207,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "openSymbol":
           await this.openSymbol(ctx, m.name);
           break;
+        case "validateSymbols": {
+          const invalid = await this.validateSymbols(m.syms);
+          if (invalid.length) this.post(ctx, { kind: "refs_validated", invalid });
+          break;
+        }
         case "validateRefs": {
           // 逐个解析（含全工作区文件名搜索）——裸文件名 `bridge.js:282` 也算有效链接。
           const invalid: string[] = [];
@@ -2990,6 +2995,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       { placeHolder: `找到多个「${base}」，选择要打开的文件` },
     );
     return pick?.f;
+  }
+
+  /** 符号名 -> 是否能在工作区解析到。LSP 查询有成本，且历史重渲染会反复问同一批。 */
+  private readonly symbolCache = new Map<string, boolean>();
+
+  /** 校验一批符号引用，返回无效项的 id。策略：LSP 工作区符号索引（快、准）。
+   *  保护：整批一个都查不到时不下结论——可能是语言服务还没热身（窗口刚开时索引
+   *  是空的），此时全部保留，宁可留几个可疑链接也不错杀真符号。 */
+  private async validateSymbols(syms: { id: string; name: string }[]): Promise<string[]> {
+    const results = new Map<string, boolean>();
+    let anyHit = false;
+    for (const { name } of syms) {
+      if (!name || results.has(name)) continue;
+      const cached = this.symbolCache.get(name);
+      if (cached !== undefined) {
+        results.set(name, cached);
+        if (cached) anyHit = true;
+        continue;
+      }
+      let ok = false;
+      try {
+        const found =
+          (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+            "vscode.executeWorkspaceSymbolProvider",
+            name,
+          )) ?? [];
+        ok = found.some((s) => s.name === name || s.name.startsWith(name + "("));
+      } catch {
+        ok = true; // 查询本身失败（无语言服务等）——不下结论，保留链接
+      }
+      results.set(name, ok);
+      if (ok) anyHit = true;
+      if (this.symbolCache.size > 500) this.symbolCache.clear(); // 简单防膨胀
+      this.symbolCache.set(name, ok);
+    }
+    // 一个都没命中：大概率是 LSP 冷启动（索引为空），全部保留、且不要缓存这批
+    // 否定结论（等索引热了下次重新验）。
+    if (!anyHit) {
+      for (const { name } of syms) if (results.get(name) === false) this.symbolCache.delete(name);
+      return [];
+    }
+    return syms.filter(({ name }) => results.get(name) === false).map(({ id }) => id);
   }
 
   private async fileRefResolves(ref: string): Promise<boolean> {

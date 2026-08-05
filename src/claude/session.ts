@@ -433,24 +433,32 @@ export class SessionStore {
     return out;
   }
 
+  /** CLI 注入的合成消息开头标签——这些挂在 user 角色下但不是用户敲的。 */
+  private static readonly INJECTED_TAG_RE =
+    /^<(command-name|command-message|command-args|local-command-stdout|local-command-caveat|task-notification|system-reminder)>/;
+
   /** True for genuine user-typed text (not tool results or synthetic injects). */
   private isRealUserText(o: any): boolean {
     // Skip CLI-generated meta turns: /compact summaries, slash-command echoes,
     // and local-command stdout/caveat wrappers — these aren't real user input.
     if (o?.isMeta === true || o?.isCompactSummary === true) return false;
+    // 权威标记（新版 CLI 写入）：origin.kind==="human" 才是真人消息；
+    // "task-notification" 等一律是系统注入（曾被当成用户气泡渲染过——实锤 bug）。
+    const originKind = o?.origin?.kind;
+    if (typeof originKind === "string" && originKind !== "human") return false;
     const c = o.message?.content;
     if (typeof c === "string") {
       const t = c.trim();
       if (!t) return false;
-      if (/^<(command-name|command-message|command-args|local-command-stdout|local-command-caveat)>/.test(t)) {
-        return false;
-      }
+      if (SessionStore.INJECTED_TAG_RE.test(t)) return false;
       return true;
     }
     if (Array.isArray(c)) {
-      const hasText = c.some((b) => b?.type === "text" && b.text?.trim());
+      const texts = c.filter((b) => b?.type === "text" && b.text?.trim());
       const hasToolResult = c.some((b) => b?.type === "tool_result");
-      return hasText && !hasToolResult;
+      if (!texts.length || hasToolResult) return false;
+      // 老条目没有 origin——数组形态的正文同样要按开头标签兜底过滤。
+      return !SessionStore.INJECTED_TAG_RE.test(String(texts[0].text).trim());
     }
     return false;
   }

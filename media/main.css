@@ -1280,11 +1280,11 @@ body.vscode-high-contrast .askq-card .tool-name { color: #a78bfa; } /* 5.6:1 on 
   font-size: 9px; line-height: 1; color: var(--vscode-descriptionForeground);
 }
 .todo-item.done .todo-box::before { content: "✔"; }
-.todo-item.done .todo-text { text-decoration: line-through; color: var(--vscode-descriptionForeground); }
+.todo-item.done .todo-text { text-decoration: line-through; opacity: .75; }
 .todo-item.doing .todo-box {
   border-color: var(--vscode-charts-blue, var(--vscode-textLink-foreground));
   color: var(--vscode-charts-blue, var(--vscode-textLink-foreground)); opacity: 1;
 }
 .todo-item.doing .todo-box::before { content: "•"; font-size: 12px; }
 .todo-item.doing .todo-text { color: var(--vscode-foreground); font-weight: 600; }
-.todo-item .todo-text { color: var(--vscode-foreground); word-break: break-word; }
+.todo-item .todo-text { color: var(--vscode-descriptionForeground); word-break: break-word; }

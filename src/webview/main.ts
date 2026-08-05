@@ -874,9 +874,11 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
   card.dataset.toolName = name;
   const head = el("div", "tool-head");
   const icon = compact ? "" : toolIcon(name);
+  // 与官方 Claude Code 一致：TodoWrite 卡片标题显示为 "Update Todos"。
+  const displayName = name === "TodoWrite" ? "Update Todos" : name;
   head.innerHTML =
     `${icon ? `<span class="tool-icon">${icon}</span>` : ""}` +
-    `<span class="tool-name">${escapeHtml(name)}</span><span class="tool-why"></span><span class="tool-sub"></span>` +
+    `<span class="tool-name">${escapeHtml(displayName)}</span><span class="tool-why"></span><span class="tool-sub"></span>` +
     `<div class="tool-actions"></div>`;
   const bodyWrap = el("div", "tool-body");
   card.append(head, bodyWrap);
@@ -910,11 +912,14 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
   // keep any existing result/permission below
   bodyWrap.prepend(inputEl2);
   // Non-file tools have a code block — put copy (+ run for Bash) in the card header.
+  // 任务清单不是代码，复制按钮没有意义。
   const actions = card.querySelector(".tool-actions") as HTMLElement | null;
   if (actions) {
     actions.innerHTML =
-      (name === "Bash" ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play} 执行</button>` : "") +
-      `<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button>`;
+      name === "TodoWrite"
+        ? ""
+        : (name === "Bash" ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play} 执行</button>` : "") +
+          `<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button>`;
   }
 }
 
@@ -1000,7 +1005,9 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   // While the model moves on to the next step, show the thinking pill again.
   if (isBusy) showWorking();
   // File tools (Read/Edit/Write/…) don't show their result body — only errors.
-  if (FILE_VIEW_TOOLS.has(card.dataset.toolName || "") && !isError) {
+  // TodoWrite 的结果只是 "Todos have been modified" 一类的确认语，也不用展示。
+  const tn = card.dataset.toolName || "";
+  if ((FILE_VIEW_TOOLS.has(tn) || tn === "TodoWrite") && !isError) {
     maybeScroll();
     return;
   }
@@ -1048,6 +1055,20 @@ function renderToolInput(name: string, input: Record<string, unknown>): { subtit
   }
   const filechip = fp ? `<a class="file-chip" data-action="open" data-path="${escapeHtml(fp)}">${escapeHtml(rel)}</a>` : "";
   switch (name) {
+    case "TodoWrite": {
+      // 渲染成勾选清单（对齐官方样式）：完成 = 勾选+删除线，进行中 = 高亮，待办 = 空框。
+      const todos = Array.isArray(input.todos) ? (input.todos as Array<{ content?: string; status?: string; activeForm?: string }>) : [];
+      if (!todos.length) return { subtitle: "", html: "" };
+      const rows = todos
+        .map((t) => {
+          const st = t?.status === "completed" ? " done" : t?.status === "in_progress" ? " doing" : "";
+          const text = String((t?.status === "in_progress" && t?.activeForm) || t?.content || "");
+          return `<div class="todo-item${st}"><span class="todo-box"></span><span class="todo-text">${escapeHtml(text)}</span></div>`;
+        })
+        .join("");
+      const done = todos.filter((t) => t?.status === "completed").length;
+      return { subtitle: `${done}/${todos.length}`, html: `<div class="todo-list">${rows}</div>` };
+    }
     case "Bash": {
       const cmd = String(input.command ?? "");
       const desc = input.description ? `<div class="muted">${escapeHtml(String(input.description))}</div>` : "";

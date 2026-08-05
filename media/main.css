@@ -1268,3 +1268,23 @@ body.vscode-high-contrast .askq-card .tool-name { color: #a78bfa; } /* 5.6:1 on 
 .empty { padding: 20px; text-align: center; color: var(--vscode-descriptionForeground); font-size: 12px; }
 
 .hidden { display: none !important; }
+
+/* -- TodoWrite 任务清单卡片（对齐官方 Update Todos 样式）-- */
+.todo-list { display: flex; flex-direction: column; gap: 4px; padding: 4px 2px; }
+.todo-item { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; line-height: 1.5; }
+.todo-box {
+  flex: none; width: 13px; height: 13px; margin-top: 2px;
+  border: 1px solid var(--vscode-descriptionForeground);
+  border-radius: 3px; opacity: .75;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 9px; line-height: 1; color: var(--vscode-descriptionForeground);
+}
+.todo-item.done .todo-box::before { content: "✔"; }
+.todo-item.done .todo-text { text-decoration: line-through; color: var(--vscode-descriptionForeground); }
+.todo-item.doing .todo-box {
+  border-color: var(--vscode-charts-blue, var(--vscode-textLink-foreground));
+  color: var(--vscode-charts-blue, var(--vscode-textLink-foreground)); opacity: 1;
+}
+.todo-item.doing .todo-box::before { content: "•"; font-size: 12px; }
+.todo-item.doing .todo-text { color: var(--vscode-foreground); font-weight: 600; }
+.todo-item .todo-text { color: var(--vscode-foreground); word-break: break-word; }

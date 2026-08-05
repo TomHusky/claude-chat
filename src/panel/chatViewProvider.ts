@@ -3311,33 +3311,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Jump to a code symbol's definition (class / method / enum …) by name.
    *  Tries the language-server symbol index first (same as "Go to Symbol in
    *  Workspace" / Copilot), then jumps directly via file-name & text search. */
+  /** 正在定位中的符号（LSP 热身重试最长 ~4s，期间重复点击直接忽略，防止开一串编辑器）。 */
+  private openingSymbol?: string;
+
   private async openSymbol(ctx: SessionCtx, name: string): Promise<void> {
-    // 1) Language-server workspace-symbol index (best — needs the lang extension).
+    if (this.openingSymbol === name) return;
+    this.openingSymbol = name;
     try {
-      const syms =
-        (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-          "vscode.executeWorkspaceSymbolProvider",
-          name,
-        )) ?? [];
-      const exact = syms.filter((s) => s.name === name);
-      const candidates = exact.length ? exact : syms;
-      const order: Record<number, number> = {
-        [vscode.SymbolKind.Class]: 0,
-        [vscode.SymbolKind.Interface]: 0,
-        [vscode.SymbolKind.Enum]: 0,
-        [vscode.SymbolKind.Struct]: 0,
-        [vscode.SymbolKind.Constructor]: 1,
-        [vscode.SymbolKind.Method]: 1,
-        [vscode.SymbolKind.Function]: 1,
-      };
-      candidates.sort((a, b) => (order[a.kind] ?? 5) - (order[b.kind] ?? 5));
-      const pick = candidates[0];
-      if (pick) {
-        await this.openFile(ctx, pick.location.uri.fsPath, pick.location.range.start.line + 1);
-        return;
-      }
-    } catch {
-      /* no symbol provider — fall through */
+      await this.openSymbolInner(ctx, name);
+    } finally {
+      this.openingSymbol = undefined;
+    }
+  }
+
+  private async openSymbolInner(ctx: SessionCtx, name: string): Promise<void> {
+    // 1) Language-server workspace-symbol index (best — needs the lang extension).
+    //    冷启动重试：窗口刚开时 LSP 索引是空的，立即降级会把用户丢进全局搜索
+    //    面板（"第一次点是搜索、多点几次才能定位"的根因）——等它热身，最多 ~4s。
+    const lspHit = await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: `定位 ${name}…` },
+      async () => {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (attempt) await new Promise((r) => setTimeout(r, 500 + attempt * 500));
+          let syms: vscode.SymbolInformation[];
+          try {
+            syms =
+              (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+                "vscode.executeWorkspaceSymbolProvider",
+                name,
+              )) ?? [];
+          } catch {
+            return undefined; // 没有语言服务——重试无意义，走后面的降级链路
+          }
+          const exact = syms.filter((s) => s.name === name || s.name.startsWith(name + "("));
+          const candidates = exact.length ? exact : syms;
+          const order: Record<number, number> = {
+            [vscode.SymbolKind.Class]: 0,
+            [vscode.SymbolKind.Interface]: 0,
+            [vscode.SymbolKind.Enum]: 0,
+            [vscode.SymbolKind.Struct]: 0,
+            [vscode.SymbolKind.Constructor]: 1,
+            [vscode.SymbolKind.Method]: 1,
+            [vscode.SymbolKind.Function]: 1,
+          };
+          candidates.sort((a, b) => (order[a.kind] ?? 5) - (order[b.kind] ?? 5));
+          if (candidates[0]) return candidates[0];
+        }
+        return undefined;
+      },
+    );
+    if (lspHit) {
+      await this.openFile(ctx, lspHit.location.uri.fsPath, lspHit.location.range.start.line + 1);
+      return;
     }
     // 2) A type whose file is named after it (Java/Kotlin/C#/TS/Go/… convention).
     try {

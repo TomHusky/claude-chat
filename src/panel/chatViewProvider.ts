@@ -48,6 +48,10 @@ interface SessionCtx {
   lastUsedAt?: number;
   /** 本条消息写入 CLI 的时刻；首个流事件到达时用来算真实等待并记日志（然后清掉）。 */
   sendAt?: number;
+  /** 轮次看门狗：本轮最后一次收到任何 CLI 事件的时刻；有值 = 轮次进行中。
+   *  CLI 有已知的静默 hang 缺陷（stream-json 多轮、result 后不退出等），一旦发生
+   *  我们永远等不到 result、界面永远转圈。超过静默上限就判定卡死并自愈。 */
+  lastEventAt?: number;
   /** 看门狗：连续未回应的 ping 数。webview↔host 通道会无声半死（页面活着但消息
    *  不通，表现为永远转圈/按钮全聋），连续 3 次不回就重建 webview 自愈。 */
   missedPings?: number;
@@ -161,6 +165,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 的聊天面板，连续 3 次（30s）不回 pong 就重建该面板的 webview——历史与忙碌
     // 状态由 ready→loadCtxSession 恢复，用户看到的只是界面刷了一下而不是永久卡死。
     this.watchdogTimer = setInterval(() => {
+      // ① 轮次看门狗：CLI 静默太久 = 卡死（已知缺陷，见 anthropics/claude-code
+      //    #3187 / #25629）。前台后台都查——后台跑着的轮次卡住同样要收尾。
+      for (const ctx of [...this.sessions, ...this.detached.values()]) this.checkTurnStall(ctx);
+      // ② webview 通道看门狗（下方）
       for (const ctx of this.sessions) {
         if (!ctx.ready) continue; // 尚未加载完不算失联
         ctx.missedPings = (ctx.missedPings ?? 0) + 1;
@@ -1098,6 +1106,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "interrupt":
           ctx.pendingPerm = undefined;
+          ctx.lastEventAt = undefined; // 用户主动停止，本轮不再受看门狗管辖
           ctx.stopSeq = ctx.sendSeq ?? 0; // cancel every send already in flight (incl. mid-spawn)
           this.post(ctx, { kind: "busy", busy: false }); // instant UI feedback regardless of CLI latency
           void ctx.proc?.interrupt(); // fire-and-forget — don't block the message loop on the round-trip
@@ -1290,6 +1299,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctx.coldStart = false;
     ctx.pendingPerm = undefined;
     ctx.sendAt = undefined;
+    ctx.lastEventAt = undefined; // 旧轮次随进程一起作废，别让看门狗事后再开火
     // 新上下文配新的检查点账本——旧会话的还原点不该落到新对话头上。
     ctx.checkpoints.flush();
     ctx.checkpoints = new CheckpointManager(this.storageDir());
@@ -1362,6 +1372,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
     ctx.sendAt = Date.now(); // 埋点：首个流事件到达时计算真实等待时长
+    ctx.lastEventAt = ctx.sendAt; // 轮次看门狗开始计时（任何事件都会刷新它）
     this.output.appendLine(
       `[${new Date().toISOString()}] [send] session=${ctx.sessionId?.slice(0, 8)} 正文${text.length}字 附加${attached?.length ?? 0}字 图片${images?.length ?? 0}`,
     );
@@ -1523,6 +1534,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ctx.proc.dispose();
       ctx.proc = undefined;
       ctx.starting = undefined;
+      ctx.lastEventAt = undefined; // 进程被主动换掉，旧轮次不再受看门狗管辖
     }
   }
 
@@ -2500,6 +2512,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** 一轮对话允许的最大"完全静默"时长。CLI 只要还在思考/调工具就会持续吐事件，
+   *  真正 0 事件这么久只可能是卡死了。实测正常轮次最长 11 分钟但期间事件不断，
+   *  首字延迟最大 9.6 秒——12 分钟静默给了极宽的余量，不会误伤长任务。 */
+  private turnStallMs(): number {
+    const min = 60_000;
+    const v = this.config().get<number>("turnStallTimeoutSec", 720) * 1000;
+    return Number.isFinite(v) && v >= min ? v : 720_000;
+  }
+
+  /** 轮次卡死检测 + 自愈：清掉转圈、告知用户、丢弃卡住的进程（下次发送会
+   *  自动 --resume 重建，上下文不丢）。 */
+  private checkTurnStall(ctx: SessionCtx): void {
+    const last = ctx.lastEventAt;
+    if (last === undefined) return; // 没有进行中的轮次
+    const idle = Date.now() - last;
+    if (idle < this.turnStallMs()) return;
+    ctx.lastEventAt = undefined;
+    ctx.sendAt = undefined;
+    this.output.appendLine(
+      `[${new Date().toISOString()}] [stall] session=${ctx.sessionId?.slice(0, 8)} CLI 静默 ${Math.round(idle / 1000)}s，判定卡死，丢弃进程`,
+    );
+    // 卡住的进程不能再用（同一条 stdin 已经不响应了），丢掉让下轮重建。
+    try {
+      ctx.proc?.dispose();
+    } catch {
+      /* ignore */
+    }
+    ctx.proc = undefined;
+    ctx.starting = undefined;
+    this.post(ctx, {
+      kind: "error",
+      message: `Claude 已 ${Math.round(idle / 60_000)} 分钟没有任何响应，判定为卡死并已重置连接。请重新发送这条消息（上下文不会丢失）。`,
+    });
+    this.post(ctx, { kind: "busy", busy: false });
+    this.broadcastRunning();
+  }
+
   /** Is this ctx still attached to a live, displayable panel? */
   private alive(ctx: SessionCtx): boolean {
     return this.sessions.has(ctx);
@@ -2507,6 +2556,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Snapshot file edits for restore points as soon as Claude proposes them. */
   private handleEmit(ctx: SessionCtx, e: ToWebview): void {
+    // 轮次看门狗心跳：CLI 只要还有任何动静（思考、工具、状态）就算活着。
+    // 放在最前面，任何 early-return 都不会漏掉刷新。
+    if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
     if (e.kind === "tool_input" && FILE_TOOLS.has(e.name)) {
       if (this.config().get<boolean>("snapshotFilesForRestore", true)) {
         const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
@@ -2557,6 +2609,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // After a turn, a new session's title becomes available — sync list + tab title.
     if (e.kind === "result") {
       ctx.sendAt = undefined; // 秒错的轮次没有流事件——别把时间戳漏进下一轮的测量
+      ctx.lastEventAt = undefined; // 轮次正常收尾，停掉看门狗
       this.output.appendLine(
         `[${new Date().toISOString()}] [turn] session=${ctx.sessionId?.slice(0, 8)} 完成 ${e.durationMs}ms 轮次${e.numTurns}${e.isError ? " (出错)" : ""}`,
       );
@@ -2690,6 +2743,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.output.appendLine(`[claude] process closed (code ${code})`);
     if (ctx.proc !== proc) return; // stale process, already replaced
     ctx.proc = undefined; // next send respawns with --resume to keep context
+    ctx.lastEventAt = undefined; // 进程都没了，本轮不可能再有事件——停掉看门狗
     // A detached (background) session's process exited: drop it.
     if (!this.alive(ctx) && ctx.sessionId) {
       this.detached.delete(ctx.sessionId);

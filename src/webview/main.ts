@@ -1879,6 +1879,9 @@ function clearComposer() {
   // It re-arms only when the active file changes (onActiveFile) or the user
   // re-adds the file manually (addFile).
   onActiveFile(autoPath);
+  // SLS 开关和图片/文件一样是「本条消息的附加项」，发完就复位——否则它会一直
+  // 开着，后面每条消息都被悄悄塞进日志工具说明（用户以为只带了那一条）。
+  setSlsOn(false);
   refreshComposerHint();
 }
 

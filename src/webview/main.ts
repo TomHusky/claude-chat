@@ -1553,12 +1553,20 @@ function linkifyRefs(container: HTMLElement) {
     span.textContent = a.textContent || href;
     const m = /^([^#?]+?)(?:#L?(\d+)(?:[-–]L?(\d+))?)?$/.exec(href);
     if (m && m[1] && m[1] !== "#") {
+      // 非法百分号序列（如 caf%E9.md）会让 decodeURIComponent 抛 URIError——
+      // 这里一炸，整段历史/流式渲染就断了，会话永久打不开。原样保留即可。
+      let decoded = m[1];
+      try {
+        decoded = decodeURIComponent(m[1]);
+      } catch {
+        /* keep raw */
+      }
       span.className = "code-ref";
       span.dataset.action = "open";
-      span.dataset.path = decodeURIComponent(m[1]);
+      span.dataset.path = decoded;
       if (m[2]) span.dataset.line = m[2];
       if (m[3]) span.dataset.endline = m[3];
-      span.title = "打开 " + decodeURIComponent(m[1]) + (m[2] ? `:${m[2]}` : "");
+      span.title = "打开 " + decoded + (m[2] ? `:${m[2]}` : "");
     }
     a.replaceWith(span);
   });
@@ -2073,6 +2081,9 @@ function flushQueue() {
   // tasks are queued means "skip this reply, get on with my queue", so the queue
   // must keep draining. (An empty queue makes this a no-op anyway, which is what
   // a plain "I want it to stop" Stop looks like.)
+  // 用量耗尽时按兵不动：不拦的话队列会绕过 doSend 的锁逐条穿墙，每条都变成
+  // 失败轮次白白丢掉。额度恢复（clearRateLimit）后会重新放行。
+  if (rateLimited) return;
   if (isBusy || !taskQueue.length) return;
   const next = taskQueue.shift()!;
   renderQueue();
@@ -2737,7 +2748,7 @@ function buildReplyActions(aEl: HTMLElement): HTMLElement {
 /** Re-run the user message that produced this reply: rewind to before it
  *  (truncate transcript + revert files) and resend the same text. */
 function regenerate(aEl: HTMLElement) {
-  if (isBusy) return;
+  if (isBusy || rateLimited) return;
   const userMsg = precedingUserMsg(aEl);
   if (!userMsg) return;
   const raw = userMsg.dataset.rawText || "";
@@ -2876,6 +2887,8 @@ function clearRateLimit() {
   messagesEl.querySelector(".rate-limit-banner.exhausted")?.remove();
   setGlow("idle");
   refreshComposerHint();
+  // 解锁后把被拦下的队列续上（锁定期间 flushQueue 是按兵不动的）。
+  if (taskQueue.length) setTimeout(flushQueue, 150);
 }
 
 function addContextChip(label: string, text: string) {

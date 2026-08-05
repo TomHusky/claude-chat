@@ -98,6 +98,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly qqQueue: QQIncoming[] = [];
   /** 轮次忙标记。命令处理期间 qqTurn 为空，只靠它防止并发跑第二条。 */
   private qqRunning = false;
+  /** QQ 轮次的卡死看门狗心跳（对齐聊天侧 ctx.lastEventAt——CLI 静默卡死时
+   *  机器人不能永久装死，尤其人不在电脑前时没有任何手动恢复手段）。 */
+  private qqLastEventAt?: number;
+  /** /compact 进行中标记：压缩结束会发一个正常 result，不吃掉的话它会把
+   *  压缩期间新发的那轮"偷走"（用户收到空回复，真正的回答被丢弃）。 */
+  private qqCompacting = false;
   /** 正在跑的预热（warmKey + 完成 promise）。发送撞上同会话的预热时等它完成再发：
    *  两个请求并发冷啃同一段大上下文会互相拖慢（实测比先焐后发慢好几倍）。 */
   private prewarmInflight?: { key: string; promise: Promise<void> };
@@ -149,6 +155,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 数字要等用户点开菜单才变。每 3 分钟拉一次（fetchUsage 自带 90s 节流）。
     this.usageTimer = setInterval(() => this.fetchUsage(), 3 * 60_000);
 
+    // QQ 机器人自动续连放在这（扩展激活）而不是侧边栏 resolve——重载窗口后
+    // 侧边栏不展开的话 resolveWebviewView 根本不执行，开着的机器人会一直离线。
+    setTimeout(() => {
+      try {
+        if (this.qqStored().enabled && !this.qqBot) {
+          void this.startQQBot().catch((e) => this.output.appendLine(`[qq] 自动启动失败: ${String(e)}`));
+        }
+      } catch (e) {
+        this.output.appendLine(`[qq] 初始化异常(已隔离): ${String(e)}`);
+      }
+    }, 1500);
+
     // 启动清一次历史遗留的孤儿附属目录（旧版本删会话时没清 file-history /
     // session-env / tasks，实测能攒到几十个）。延后执行，不拖慢激活。
     setTimeout(() => {
@@ -168,6 +186,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // ① 轮次看门狗：CLI 静默太久 = 卡死（已知缺陷，见 anthropics/claude-code
       //    #3187 / #25629）。前台后台都查——后台跑着的轮次卡住同样要收尾。
       for (const ctx of [...this.sessions, ...this.detached.values()]) this.checkTurnStall(ctx);
+      this.checkQQStall(); // QQ 机器人进程同样会被 CLI 静默卡死拖死，且人不在电脑前无法手动救
       // ② webview 通道看门狗（下方）
       for (const ctx of this.sessions) {
         if (!ctx.ready) continue; // 尚未加载完不算失联
@@ -958,7 +977,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   async stop(): Promise<void> {
-    await this.activeCtx?.proc?.interrupt();
+    const ctx = this.activeCtx;
+    if (!ctx) return;
+    // 与面板内 interrupt 分支保持一致：被中断的轮次不会再有 result 事件，
+    // 不清 lastEventAt 的话 12 分钟后看门狗会对早已停止的会话"补一枪"。
+    ctx.pendingPerm = undefined;
+    ctx.lastEventAt = undefined;
+    ctx.stopSeq = ctx.sendSeq ?? 0;
+    this.post(ctx, { kind: "busy", busy: false });
+    await ctx.proc?.interrupt();
   }
 
   focusInput(): void {
@@ -1117,16 +1144,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "compact": {
           // Resume/spawn the process so it holds the full transcript, then /compact it.
           const proc = await this.ensureProcess(ctx);
-          if (proc) proc.compact();
-          else this.post(ctx, { kind: "busy", busy: false });
+          if (proc) {
+            proc.compact();
+            // 压缩也纳入轮次看门狗：CLI 在 compacting 中静默卡死同样会永久转圈。
+            ctx.lastEventAt = Date.now();
+          } else this.post(ctx, { kind: "busy", busy: false });
           break;
         }
         case "permission":
           ctx.pendingPerm = undefined;
+          // 挂起期间不计时（checkTurnStall 跳过），答复后从现在重新起算。
+          if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
           this.handlePermission(ctx, m.requestId, m.behavior, m.suggestionId);
           break;
         case "answerQuestion":
           ctx.pendingPerm = undefined;
+          if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
           ctx.proc?.answerQuestion(m.requestId, m.answers);
           break;
         case "newSession":
@@ -1742,8 +1775,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // 恢复的大会话且缓存冷：第一轮会等很久，标记好在发送时给出诚实提示。
       ctx.coldStart = isResume && this.cacheCold(sessionId);
     } catch (err) {
-      this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
       proc.dispose(); // reap the half-started child
+      // Stale 守卫（对照 onProcessClose）：握手期这个进程可能已被换掉
+      // （/clear、setEffort 等 dispose 老进程后立刻挂了新进程）——那时
+      // ctx.proc 指向的是新进程，这里再清引用/报错会打断正常工作的后继者。
+      if (ctx.proc !== proc) return undefined;
+      this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
       ctx.proc = undefined;
       // A brand-new tab minted this sessionId but the CLI never created the
       // session. Keeping it would make every retry `--resume <ghost>` and fail
@@ -2102,10 +2139,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     else this.stopQQBot();
   }
 
+  /** start/stop 的代际号：stopQQBot 与每次 startQQBot 都 +1。
+   *  startQQBot 中间有 await（读 SecretStorage）——期间被关掉或被新的 start
+   *  顶掉的话，旧调用恢复后不能再创建 bot（否则实例引用丢失、永远没人 stop）。 */
+  private qqStartSeq = 0;
+
   private async startQQBot(): Promise<void> {
     this.stopQQBot(); // 重连前先拆掉旧连接
+    const seq = ++this.qqStartSeq;
     const cfg = this.qqStored();
     const secret = (await this.context.secrets.get(ChatViewProvider.QQ_SECRET_KEY)) ?? "";
+    if (seq !== this.qqStartSeq) return; // await 期间被 stop / 新 start 作废
     const allowed = cfg.allowed.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
     if (!cfg.appId || !secret) {
       this.setQQState("offline", "缺少 AppID / AppSecret");
@@ -2138,6 +2182,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private stopQQBot(): void {
+    this.qqStartSeq++; // 作废还悬在 startQQBot await 里的并发调用
     this.qqBot?.stop();
     this.qqBot = undefined;
     this.qqProc?.dispose();
@@ -2145,13 +2190,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.qqTurn = undefined;
     this.qqRunning = false; // 不重置的话重启后队列永远不再被消费
     this.qqQueue.length = 0;
+    this.qqLastEventAt = undefined;
+    this.qqCompacting = false;
     this.setQQState("offline");
   }
 
   /** 排队处理——机器人一次只跑一轮，避免多条消息串到同一个进程里互相打断。 */
   private onQQMessage(msg: QQIncoming): void {
+    // /stop 必须绕过队列：排队的话要等本轮跑完才被处理，"中断"就没有意义了
+    // （这正是它此前形同虚设的原因）。
+    if (this.qqRunning && msg.text.trim().toLowerCase() === "/stop") {
+      void this.qqInterrupt(msg);
+      return;
+    }
     this.qqQueue.push(msg);
     if (!this.qqRunning) void this.runQQTurn();
+  }
+
+  /** 立即中断当前轮次并清空队列（/stop 的插队通道）。 */
+  private async qqInterrupt(msg: QQIncoming): Promise<void> {
+    try {
+      const t = this.qqTurn;
+      const dropped = this.qqQueue.length;
+      this.qqQueue.length = 0;
+      if (t) t.done = true; // 迟到的 result / onClose 兜底都不要再回复
+      this.qqTurn = undefined;
+      this.qqRunning = false;
+      this.qqLastEventAt = undefined;
+      if (t) this.qqBot?.forget(t.target.msgId);
+      try {
+        if (this.qqProc?.isBusy) await this.qqProc.interrupt();
+      } catch {
+        this.qqProc?.dispose(); // 连中断都不响应的进程直接丢弃，下轮重建
+        this.qqProc = undefined;
+      }
+      await this.qqBot?.reply(
+        msg,
+        t || dropped
+          ? dropped
+            ? `⏹ 已中断当前回复\n并清空了 ${dropped} 条排队消息`
+            : "⏹ 已中断当前回复"
+          : "💤 当前没有正在跑的回复",
+      );
+      if (this.qqQueue.length) void this.runQQTurn();
+    } catch (err) {
+      this.output.appendLine(`[qq] /stop 处理失败: ${String(err)}`);
+    }
   }
 
   private async runQQTurn(): Promise<void> {
@@ -2176,6 +2260,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     this.qqTurn = { target: msg, text: "", done: false };
     const proc = await this.ensureQQProcess();
+    // 建进程的 1-3 秒里机器人可能被关掉（stopQQBot 已清 qqTurn/queue）——
+    // 不能再以"已关闭"的状态把消息发出去在本机自动执行。
+    if (!this.qqBot) {
+      proc?.dispose();
+      this.qqProc = undefined;
+      this.qqTurn = undefined;
+      this.qqRunning = false;
+      return;
+    }
     if (!proc) {
       await this.qqBot?.reply(msg, "❌ 启动 Claude 失败\n请在 VS Code 输出面板查看 Claude Chat 日志");
       this.finishQQTurn();
@@ -2185,13 +2278,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.qqProc = undefined; // 进程已死，下条消息会重建
       await this.qqBot?.reply(msg, "❌ Claude 进程已退出，请重试");
       this.finishQQTurn();
+      return;
     }
+    this.qqLastEventAt = Date.now(); // QQ 轮次也纳入卡死看门狗
   }
 
   private finishQQTurn(): void {
     const t = this.qqTurn;
     this.qqTurn = undefined;
     this.qqRunning = false;
+    this.qqLastEventAt = undefined;
     if (t) this.qqBot?.forget(t.target.msgId);
     if (this.qqQueue.length) void this.runQQTurn();
   }
@@ -2207,7 +2303,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private static readonly QQ_MODELS = ["默认", "opus", "sonnet", "haiku", "fable"];
-  private static readonly QQ_EFFORTS = ["低", "low", "medium", "high", "xhigh", "max"];
+  private static readonly QQ_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+  /** 中文档位别名 → CLI 合法值。字面量"低"直接传 --effort 会让进程再也起不来。 */
+  private static readonly QQ_EFFORT_ALIASES: Record<string, string> = {
+    低: "low",
+    中: "medium",
+    高: "high",
+    极高: "xhigh",
+    最大: "max",
+    最高: "max",
+  };
+
+  /** 校验/翻译 effort 值；非法（含历史持久化进去的脏值）一律回落到 undefined。 */
+  private static saneEffort(v?: string): string | undefined {
+    if (!v) return undefined;
+    const mapped = ChatViewProvider.QQ_EFFORT_ALIASES[v] ?? v.toLowerCase();
+    return ChatViewProvider.QQ_EFFORTS.includes(mapped) ? mapped : undefined;
+  }
 
   /** QQ 是纯文本消息（不渲染 Markdown），排版只能靠分隔线 / emoji / 方块进度条。 */
   private static readonly QQ_HR = "━━━━━━━━━━━━━";
@@ -2385,7 +2497,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await reply(`⚡ 当前强度：${rt.effort || this.config().get<string>("effort", "") || "默认"}\n${ChatViewProvider.QQ_HR}\n可选：low / medium / high / xhigh / max / 默认\n用法：/effort high`);
           return true;
         }
-        const v = /^(默认|default)$/i.test(arg) ? "" : arg.toLowerCase();
+        let v = /^(默认|default)$/i.test(arg) ? "" : arg.toLowerCase();
+        if (v) v = ChatViewProvider.QQ_EFFORT_ALIASES[arg.trim()] ?? v;
         if (v && !ChatViewProvider.QQ_EFFORTS.includes(v)) {
           await reply(`❌ 未知强度「${arg}」\n可选：low / medium / high / xhigh / max / 默认`);
           return true;
@@ -2404,6 +2517,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           await reply("❌ 启动 Claude 失败，无法压缩");
           return true;
         }
+        this.qqCompacting = true;
+        this.qqLastEventAt = Date.now(); // 压缩也受卡死看门狗保护
         proc.compact();
         await reply("🗜 正在压缩上下文，稍后可继续对话");
         return true;
@@ -2441,8 +2556,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         claudePath: this.config().get<string>("claudePath", "claude"),
         cwd: this.cwd(),
         // 机器人专属覆盖优先（/model、/effort 命令设的），没有才回落到全局设置。
+        // effort 过 saneEffort：历史版本可能把"低"这类非法值持久化进了 globalState，
+        // 原样下发 --effort 会让机器人进程永远起不来。
         model: this.qqRuntime().model ?? this.config().get<string>("model", "") ?? undefined,
-        effort: this.qqRuntime().effort ?? this.config().get<string>("effort", "") ?? undefined,
+        effort:
+          this.qqRuntime().effort !== undefined
+            ? ChatViewProvider.saneEffort(this.qqRuntime().effort) // ""（/effort 默认）→ undefined = CLI 默认
+            : ChatViewProvider.saneEffort(this.config().get<string>("effort", "")),
         permissionMode: this.config().get<string>("qqBotPermissionMode", "acceptEdits"),
         resumeSessionId: resume,
         sessionId: resume ? undefined : sid,
@@ -2501,6 +2621,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private onQQEmitInner(e: ToWebview): void {
+    if (this.qqLastEventAt !== undefined) this.qqLastEventAt = Date.now();
+    // 压缩收尾的 result 只代表压缩完成，不是任何用户轮次的结束。
+    if (e.kind === "result" && this.qqCompacting) {
+      this.qqCompacting = false;
+      this.output.appendLine(`[qq] 压缩完成`);
+      return;
+    }
     const t = this.qqTurn;
     if (!t) return;
     if (e.kind === "text_delta") t.text += e.text;
@@ -2531,6 +2658,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private checkTurnStall(ctx: SessionCtx): void {
     const last = ctx.lastEventAt;
     if (last === undefined) return; // 没有进行中的轮次
+    // 权限确认/提问弹窗挂起时 CLI 静默是正常的——在等用户，不是卡死。
+    // 用户想离开多久都行；答复后（permission/answerQuestion 分支）重新计时。
+    if (ctx.pendingPerm) return;
     const idle = Date.now() - last;
     if (idle < this.turnStallMs()) return;
     ctx.lastEventAt = undefined;
@@ -2552,6 +2682,38 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     this.post(ctx, { kind: "busy", busy: false });
     this.broadcastRunning();
+  }
+
+  /** QQ 侧的轮次卡死检测（对齐 checkTurnStall）：重置进程、通知发信人重发。 */
+  private checkQQStall(): void {
+    const last = this.qqLastEventAt;
+    if (last === undefined) return;
+    const idle = Date.now() - last;
+    if (idle < this.turnStallMs()) return;
+    this.qqLastEventAt = undefined;
+    this.qqCompacting = false;
+    this.output.appendLine(
+      `[${new Date().toISOString()}] [qq][stall] CLI 静默 ${Math.round(idle / 1000)}s，判定卡死，重置机器人进程`,
+    );
+    const t = this.qqTurn;
+    if (t) t.done = true; // 先标记，dispose 触发的 onClose 兜底才不会重复回复
+    try {
+      this.qqProc?.dispose();
+    } catch {
+      /* ignore */
+    }
+    this.qqProc = undefined;
+    if (t) {
+      void (async () => {
+        await this.qqBot?.reply(
+          t.target,
+          `⚠️ Claude 已 ${Math.round(idle / 60_000)} 分钟没有任何响应，判定卡死并已重置\n请重新发送这条消息（上下文不会丢失）`,
+        );
+        this.finishQQTurn();
+      })();
+    } else {
+      this.finishQQTurn();
+    }
   }
 
   /** Is this ctx still attached to a live, displayable panel? */
@@ -2786,6 +2948,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (det) {
         if (det.proc) waits.push(det.proc.disposeAndWait());
         this.detached.delete(id);
+      }
+      // QQ 机器人的专用会话也在列表里——不停掉 qqProc 的话，下一条 QQ 消息
+      // 会用还活着的进程把 transcript 重新写回磁盘，会话"删不掉"。
+      if (id === this.qqSessionId || id === this.context.globalState.get<string>(ChatViewProvider.QQ_SESSION_KEY)) {
+        if (this.qqProc) waits.push(this.qqProc.disposeAndWait());
+        this.qqProc = undefined;
+        this.qqTurn = undefined;
+        this.qqRunning = false;
+        this.qqLastEventAt = undefined;
+        this.qqSessionId = undefined;
+        void this.context.globalState.update(ChatViewProvider.QQ_SESSION_KEY, undefined);
       }
       if (waits.length) await Promise.all(waits);
       this.store.delete(id);

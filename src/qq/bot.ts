@@ -95,6 +95,13 @@ export class QQBot {
   private lastSeq: number | null = null;
   private stopped = false;
   private retry = 0;
+  /** 连接代际号：stop()/新 start() 都会 +1。connect 的每个 await 之后都校验它——
+   *  否则"开→关"落在建连的 HTTP 窗口内时，socket 会在 stop 之后照常建立、
+   *  鉴权、心跳续命，界面显示已停止但机器人实际在线（僵尸连接）。 */
+  private gen = 0;
+  /** 最近收到任何帧的时间。半死 TCP（合盖过夜/切网）不触发 onclose，
+   *  靠它判定连接已僵死并主动重连。 */
+  private lastFrameAt = 0;
   /** 每个 msg_id 的被动回复序号（官方要求同一 msg_id 的多次回复 msg_seq 递增）。 */
   private readonly msgSeq = new Map<string, number>();
 
@@ -128,11 +135,12 @@ export class QQBot {
 
   async start(): Promise<void> {
     this.stopped = false;
-    await this.connect();
+    await this.connect(++this.gen);
   }
 
   stop(): void {
     this.stopped = true;
+    this.gen++; // 让还悬在 await 里的 connect 作废
     this.clearTimers();
     try {
       this.ws?.close();
@@ -164,12 +172,19 @@ export class QQBot {
     return this.token;
   }
 
-  private async connect(): Promise<void> {
-    if (this.stopped) return;
+  /** 本代连接是否已被 stop/新 start 作废。 */
+  private staleGen(gen: number): boolean {
+    return this.stopped || gen !== this.gen;
+  }
+
+  private async connect(gen: number): Promise<void> {
+    if (this.staleGen(gen)) return;
     this.safeState("connecting");
     try {
       const token = await this.ensureToken();
+      if (this.staleGen(gen)) return;
       const gw = await httpJson(`${this.apiBase}/gateway`, { headers: { Authorization: `QQBot ${token}` } });
+      if (this.staleGen(gen)) return;
       const url = gw?.url;
       if (!url) throw new Error(`gateway 无 url：${JSON.stringify(gw).slice(0, 200)}`);
 
@@ -177,30 +192,42 @@ export class QQBot {
       if (!WS) throw new Error("当前 VS Code 运行时不支持 WebSocket（需要 Node 22+ 的宿主）");
       const ws = new WS(url);
       this.ws = ws;
+      this.lastFrameAt = Date.now();
 
       ws.onopen = () => this.safeLog("[qq] websocket 已连接，等待 Hello");
-      ws.onmessage = (ev: any) => this.onFrame(String(ev.data));
+      // 旧 socket 的帧一律不理（op7 重连后旧连接短时间内仍会吐事件，
+      // 处理了就是同一条消息双份跑 Claude）。
+      ws.onmessage = (ev: any) => {
+        if (this.ws === ws) this.onFrame(String(ev.data));
+      };
       ws.onerror = () => this.safeLog("[qq] websocket 错误");
       ws.onclose = (ev: any) => {
         this.safeLog(`[qq] websocket 关闭 code=${ev?.code}`);
-        if (this.ws === ws) this.scheduleReconnect();
+        if (this.ws === ws) this.scheduleReconnect(gen);
       };
     } catch (err) {
       this.safeLog(`[qq] 连接失败：${String((err as Error)?.message ?? err)}`);
       this.safeState("offline", String((err as Error)?.message ?? err));
-      this.scheduleReconnect();
+      this.scheduleReconnect(gen);
     }
   }
 
-  private scheduleReconnect(): void {
-    if (this.stopped) return;
+  private scheduleReconnect(gen: number): void {
+    if (this.staleGen(gen)) return;
     this.clearTimers();
+    // 旧 socket 必须显式关掉：op7/op9 触发重连时它还开着，onmessage 也还挂着。
+    const old = this.ws;
     this.ws = undefined;
+    try {
+      old?.close();
+    } catch {
+      /* ignore */
+    }
     this.safeState("connecting");
     // 指数退避，封顶 60s——避免鉴权失败时疯狂重试打爆接口。
     const delay = Math.min(60_000, 2000 * Math.pow(2, Math.min(this.retry++, 5)));
     this.safeLog(`[qq] ${Math.round(delay / 1000)}s 后重连`);
-    this.reconnectTimer = setTimeout(() => void this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => void this.connect(gen), delay);
   }
 
   private send(obj: unknown): void {
@@ -212,6 +239,7 @@ export class QQBot {
   }
 
   private onFrame(raw: string): void {
+    this.lastFrameAt = Date.now();
     let p: any;
     try {
       p = JSON.parse(raw);
@@ -227,7 +255,18 @@ export class QQBot {
           op: 2,
           d: { token: `QQBot ${this.token}`, intents: INTENT_GROUP_AND_C2C, shard: [0, 1] },
         });
-        this.heartbeatTimer = setInterval(() => this.send({ op: 1, d: this.lastSeq }), interval);
+        const gen = this.gen;
+        this.heartbeatTimer = setInterval(() => {
+          // 僵死检测：半死 TCP 不触发 onclose、send 也不报错（写进内核缓冲），
+          // 服务端至少每个心跳周期会回 ACK（op 11）——两个周期没有任何入站帧
+          // 就说明连接已死，主动换连接（否则面板永远绿灯但消息全丢）。
+          if (Date.now() - this.lastFrameAt > interval * 2 + 10_000) {
+            this.safeLog("[qq] 心跳无响应，判定连接僵死，重连");
+            this.scheduleReconnect(gen);
+            return;
+          }
+          this.send({ op: 1, d: this.lastSeq });
+        }, interval);
         return;
       }
       case 0:
@@ -241,11 +280,11 @@ export class QQBot {
         return;
       case 7: // 服务端要求重连
         this.safeLog("[qq] 服务端要求重连");
-        this.scheduleReconnect();
+        this.scheduleReconnect(this.gen);
         return;
       case 9: // 鉴权/参数非法——重试也没用，交由退避慢慢重来并记日志
         this.safeLog("[qq] 鉴权失败（op 9），请检查 AppID / AppSecret / 是否选错沙箱环境");
-        this.scheduleReconnect();
+        this.scheduleReconnect(this.gen);
         return;
       default:
         return;
@@ -302,6 +341,11 @@ export class QQBot {
       return;
     }
     this.msgSeq.set(target.msgId, seq);
+    // 配对/拒绝回复没人调 forget，长期在线会无限攒条目——按插入序淘汰旧的。
+    if (this.msgSeq.size > 500) {
+      const oldest = this.msgSeq.keys().next().value;
+      if (oldest !== undefined) this.msgSeq.delete(oldest);
+    }
     const path =
       target.scene === "group" && target.groupOpenId
         ? `/v2/groups/${target.groupOpenId}/messages`

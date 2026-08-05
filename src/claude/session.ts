@@ -326,6 +326,14 @@ export class SessionStore {
       } catch {
         /* 文件可能被占用；附属目录仍继续清理 */
       }
+      // 新版 CLI 在 transcript 旁边还有同名目录（subagents/ 子agent对话、
+      // tool-results/ 等）——里面是对话内容，比 sidecar 更该跟着删。
+      try {
+        const sib = path.join(path.dirname(f), sessionId);
+        if (fs.existsSync(sib)) fs.rmSync(sib, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
     }
     this.deleteSidecars(sessionId);
     return ok;
@@ -345,10 +353,22 @@ export class SessionStore {
     }
   }
 
-  /** 扫掉所有"transcript 已不存在"的附属目录——历史遗留的孤儿。返回清理数量。 */
+  /** 扫掉所有"transcript 已不存在"的附属目录——历史遗留的孤儿。返回清理数量。
+   *  sidecar 目录是全局的（不分项目），所以存活集必须收集**所有**项目的
+   *  transcript——只看当前工作区会把其他项目的活会话当孤儿误删（实锤 bug）。 */
   sweepOrphanSidecars(): number {
     const live = new Set<string>();
-    for (const dir of this.projectDirs()) {
+    const projectsRoot = path.join(this.configDir(), "projects");
+    let projDirs: string[];
+    try {
+      projDirs = fs
+        .readdirSync(projectsRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => path.join(projectsRoot, d.name));
+    } catch {
+      return 0; // projects 都读不到：环境异常，别动任何数据
+    }
+    for (const dir of projDirs) {
       try {
         for (const f of fs.readdirSync(dir)) {
           if (f.endsWith(".jsonl")) live.add(f.slice(0, -6));
@@ -359,6 +379,7 @@ export class SessionStore {
     }
     // 一个 transcript 都读不到时果断放弃：可能是路径判断出错，别误删用户数据。
     if (!live.size) return 0;
+    const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
     let removed = 0;
     for (const dir of SessionStore.SIDECAR_DIRS) {
       const base = path.join(this.configDir(), dir);
@@ -371,10 +392,29 @@ export class SessionStore {
       for (const e of entries) {
         const id = e.replace(/\.(json|jsonl)$/, "");
         // 只认 uuid 形态，避免误伤官方将来放进去的其它文件。
-        if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) continue;
+        if (!isUuid(id)) continue;
         if (live.has(id)) continue;
         try {
           fs.rmSync(path.join(base, e), { recursive: true, force: true });
+          removed++;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    // projects/<enc>/<sid>/ 形态的同名目录（subagents/tool-results）：
+    // 同目录下没有对应 .jsonl 的就是删会话时的历史残留。
+    for (const dir of projDirs) {
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        if (!e.isDirectory() || !isUuid(e.name) || live.has(e.name)) continue;
+        try {
+          fs.rmSync(path.join(dir, e.name), { recursive: true, force: true });
           removed++;
         } catch {
           /* ignore */
@@ -437,6 +477,14 @@ export class SessionStore {
   private static readonly INJECTED_TAG_RE =
     /^<(command-name|command-message|command-args|local-command-stdout|local-command-caveat|task-notification|system-reminder)>/;
 
+  /** 按 Stop 后 CLI 写入的中断标记（user 角色、无 origin、无 isMeta）——
+   *  实时流从不显示它，历史回放也不该显示。 */
+  private static readonly INTERRUPT_MARK_RE = /^\[Request interrupted by user( for tool use)?\]$/;
+
+  private static isInjectedText(t: string): boolean {
+    return SessionStore.INJECTED_TAG_RE.test(t) || SessionStore.INTERRUPT_MARK_RE.test(t);
+  }
+
   /** True for genuine user-typed text (not tool results or synthetic injects). */
   private isRealUserText(o: any): boolean {
     // Skip CLI-generated meta turns: /compact summaries, slash-command echoes,
@@ -450,7 +498,7 @@ export class SessionStore {
     if (typeof c === "string") {
       const t = c.trim();
       if (!t) return false;
-      if (SessionStore.INJECTED_TAG_RE.test(t)) return false;
+      if (SessionStore.isInjectedText(t)) return false;
       return true;
     }
     if (Array.isArray(c)) {
@@ -458,7 +506,7 @@ export class SessionStore {
       const hasToolResult = c.some((b) => b?.type === "tool_result");
       if (!texts.length || hasToolResult) return false;
       // 老条目没有 origin——数组形态的正文同样要按开头标签兜底过滤。
-      return !SessionStore.INJECTED_TAG_RE.test(String(texts[0].text).trim());
+      return !SessionStore.isInjectedText(String(texts[0].text).trim());
     }
     return false;
   }

@@ -123,13 +123,13 @@ export class SdkClaudeProcess {
 
     // spawn + initialize 握手（失败会抛异常，由 spawnProcess 的 catch 兜住）。
     const warm = await startup({ options, initializeTimeoutMs: 30_000 });
-    if (this.disposed) {
-      // 握手期间被 dispose（比如用户 /clear 换进程）：直接丢弃，别泄漏子进程。
-      warm.close();
-      this.exited = true;
-      throw new Error("已在启动期间被丢弃");
-    }
+    // 无论是否已被 dispose，都挂上消息流：只有这样才有一个"能等到子进程真死"
+    // 的 closedPromise。warm.close() 是 void，等不到任何东西——删会话/还原点
+    // 回退正需要等它，否则垂死的 CLI 会把缓冲行刷回刚被截断的 transcript。
+    // （handleMessage 入口有 disposed 守卫，这条路径不会碰 UI。）
     this.q = warm.query(this.input);
+    this.startMessageLoop();
+    if (this.disposed) throw new Error("已在启动期间被丢弃");
     this.initialized = true;
     // 握手期间攒下的模式/模型切换现在补上（失败不致命，保持 spawn 时的值）。
     if (this.pendingMode !== undefined) {
@@ -154,7 +154,10 @@ export class SdkClaudeProcess {
       }
     }
 
-    // 消息循环常驻后台。
+  }
+
+  /** 消息循环常驻后台。 */
+  private startMessageLoop(): void {
     this.closedPromise = (async () => {
       let code: number | null = 0;
       try {
@@ -372,6 +375,9 @@ export class SdkClaudeProcess {
       this.pendingMode = mode;
       return;
     }
+    // init 事件可能还堵在消息循环的缓冲里没被取出，那时它报的仍是 spawn 时的
+    // 旧模式——记一份覆盖值，别让界面上的选择器被打回去。
+    this.modeOverride = mode;
     await this.q.setPermissionMode(mode as Parameters<Query["setPermissionMode"]>[0]);
   }
 
@@ -400,15 +406,19 @@ export class SdkClaudeProcess {
   }
 
   disposeAndWait(): Promise<void> {
+    // 总预算 5s（两段共享，不是各算各的）：这条路径在 UI 上是同步等待的
+    // （删除会话、还原点回退都 await 它），不能让用户对着冻住的界面干等十几秒。
+    // 实测正常退出约 0.5s，这个上限只在 CLI 赖着不走时才付出。
+    const deadline = Date.now() + 5000;
+    const left = () => Math.max(0, deadline - Date.now());
     const done = (async () => {
       // 先等 start() 落定：握手期就被丢弃时 closedPromise 还不存在，
       // 直接返回等于没等，调用方会去动一个正在被写的 transcript。
-      if (this.startPromise) await Promise.race([this.startPromise, delay(3000)]);
-      if (this.exited || !this.closedPromise) return;
-      // SDK 的拆卸阶梯是 abort → 2s 宽限 → SIGTERM → 5s → SIGKILL，最坏 ~7s；
-      // 3s 就返回的话调用方会在子进程还活着时去删/截断 transcript。正常退出
-      // 远快于此，这个上限只在真的赖着不走时才付出。
-      await Promise.race([this.closedPromise.catch(() => undefined), delay(8000)]);
+      if (this.startPromise) await Promise.race([this.startPromise, delay(left())]);
+      // 注意不要因为 exited 就提前返回：start 失败时 exited 也是 true，但
+      // 只要有 closedPromise 就说明子进程存在过，必须等它收尾。
+      if (!this.closedPromise) return;
+      await Promise.race([this.closedPromise.catch(() => undefined), delay(left())]);
     })();
     this.dispose();
     return done;
@@ -417,6 +427,11 @@ export class SdkClaudeProcess {
   // -- 事件翻译（process.ts handleEvent 的移植版，逐段对齐）------------------
 
   private handleMessage(m: Record<string, unknown>): void {
+    // 已被主动丢弃的进程一律闭嘴。dispose() 之后消息循环还会把缓冲里的消息
+    // 排完（实测能再吐十几个 text_delta/thinking_delta），而此时 ctx 上多半
+    // 已经挂了新进程——这些迟到事件会串进新轮次的气泡、打乱 token 计数。
+    // （stream-json 版靠 rl.close() 立刻断流，天然没有这个窗口。）
+    if (this.disposed) return;
     // 子 agent 内部事件不渲染（Task 的 tool_result 会汇总）。
     if ((m as any).parent_tool_use_id && (m.type === "stream_event" || m.type === "assistant" || m.type === "user")) return;
     switch (m.type) {
@@ -599,8 +614,13 @@ export class SdkClaudeProcess {
   }
 }
 
+/** race 用的超时。定时器加 unref：race 被另一边赢下后它还挂着，批量
+ *  disposeAndWait 会留下一堆，unref 让它们不阻塞宿主退出。 */
 function delay(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise((r) => {
+    const t = setTimeout(r, ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+  });
 }
 
 /** 简单的可推送异步队列（SDK streaming input 的 prompt 载体）。 */

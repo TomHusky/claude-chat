@@ -66,6 +66,47 @@ interface SessionCtx {
   draft?: string;
 }
 
+/** 预热时间戳台账，落盘在 ~/.claude-chat/prewarm.json，所有窗口共用。
+ *  预热一次的代价是一份完整上下文的 input token，绝不能因为"换了个窗口/刚
+ *  reload 过"就重来一遍。文件很小、读写频次低，直接同步 IO；任何失败都退化成
+ *  "当作没预热过"（顶多多热一次，不会反过来把功能搞坏）。 */
+class PrewarmLedger {
+  private static readonly TTL = 24 * 3600_000; // 超过一天的记录没有意义，顺手清掉
+  constructor(private readonly field: "s" | "d") {}
+
+  private file(): string {
+    return path.join(os.homedir(), ".claude-chat", "prewarm.json");
+  }
+
+  private read(): Record<string, { s?: number; d?: number }> {
+    try {
+      return JSON.parse(fs.readFileSync(this.file(), "utf8")) || {};
+    } catch {
+      return {};
+    }
+  }
+
+  get(key: string): number | undefined {
+    return this.read()[key]?.[this.field];
+  }
+
+  set(key: string, ts: number): void {
+    try {
+      const all = this.read();
+      const entry = all[key] ?? {};
+      entry[this.field] = ts;
+      all[key] = entry;
+      for (const [k, v] of Object.entries(all)) {
+        if (Math.max(v.s ?? 0, v.d ?? 0) < Date.now() - PrewarmLedger.TTL) delete all[k];
+      }
+      fs.mkdirSync(path.dirname(this.file()), { recursive: true });
+      fs.writeFileSync(this.file(), JSON.stringify(all), "utf8");
+    } catch {
+      /* 记不下来最多多预热一次，不能反过来影响功能 */
+    }
+  }
+}
+
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "claude-chat.chatView";
 
@@ -87,10 +128,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private readonly origChanged = new vscode.EventEmitter<vscode.Uri>();
   private terminal?: vscode.Terminal;
   // -- Prompt-cache prewarmer (big sessions) --
-  private readonly prewarmStarted = new Map<string, number>(); // sessionId -> ts (dedupe in-flight)
-  private readonly prewarmDone = new Map<string, number>(); // sessionId -> ts of last completed warm
+  // 预热记录必须跨窗口/跨 reload 持久化：放内存里的话，窗口每 reload 一次就重新
+  // 预热一次，两个窗口还各预热各的——实测一个 16.7MB 的会话 75 分钟内被预热了
+  // 4 次，每次都是一份完整上下文的 input token。这是"莫名其妙很费 token"的真凶。
+  private readonly prewarmStarted = new PrewarmLedger("s"); // warmKey -> ts (dedupe in-flight)
+  private readonly prewarmDone = new PrewarmLedger("d"); // warmKey -> ts of last completed warm
   private prewarmProc?: ClaudeProcess; // at most one warm-up runs at a time (they're token-expensive)
-  private keepWarmTimer?: ReturnType<typeof setInterval>; // periodic re-warm for idle open tabs
   private usageTimer?: ReturnType<typeof setInterval>; // 用量胶囊定时刷新（不然要点开菜单才更新）
   private watchdogTimer?: ReturnType<typeof setInterval>; // webview 通道半死检测 + 自愈
   private sidebarMissedPings = 0; // 侧边栏的看门狗计数（它不在 sessions 里）
@@ -115,6 +158,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 正在跑的预热（warmKey + 完成 promise）。发送撞上同会话的预热时等它完成再发：
    *  两个请求并发冷啃同一段大上下文会互相拖慢（实测比先焐后发慢好几倍）。 */
   private prewarmInflight?: { key: string; promise: Promise<void> };
+  /** 已弹过"建议压缩"提示的会话（每窗口每会话只提示一次，不做唐僧）。 */
+  private readonly compactPrompted = new Set<string>();
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -240,14 +285,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }, 10_000);
 
-    this.keepWarmTimer = setInterval(() => {
-      // 有会话正在回复时避让：预热是全量上下文的大请求，跟真实对话抢并发可能
-      // 触发 API 限流重试，反而拖慢用户正在等的那条。下个 tick 再补不迟。
-      for (const ctx of this.sessions) if (ctx.proc?.isBusy) return;
-      for (const ctx of this.detached.values()) if (ctx.proc?.isBusy) return;
-      if (this.activeCtx) this.maybePrewarm(this.activeCtx); // 活跃 tab 优先
-      for (const ctx of this.sessions) if (ctx !== this.activeCtx) this.maybePrewarm(ctx);
-    }, 5 * 60_000);
+    // （原来这里有个每 5 分钟的"定时保温"：对所有开着的 tab 每 50 分钟重焐一遍
+    // prompt cache。经调研已删除——官方与全部同类项目都没有这种机制，挂着一个
+    // 大会话的 tab 等于每小时白烧一份完整上下文的 input token，是费 token 的
+    // 头号元凶。现在只保留"打开会话时预热一次"；缓存过期后靠发送前的诚实提示
+    // 和一键 /compact（官方 Resume-from-summary 的同款思路）。）
   }
 
   /** Chat tabs whose panel was closed while their reply was still streaming.
@@ -1877,6 +1919,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     void this.ensureProcess(ctx);
   }
 
+  /** 从提示按钮触发的压缩：复用面板 compact 的完整链路（含看门狗保护）。 */
+  private async compactSession(ctx: SessionCtx): Promise<void> {
+    const proc = await this.ensureProcess(ctx);
+    if (!proc) return;
+    this.post(ctx, { kind: "busy", busy: true });
+    proc.compact();
+    ctx.lastEventAt = Date.now();
+  }
+
   /** Best-effort：失败静默（顶多损失一次预热），绝不打扰正常使用。 */
   private maybePrewarm(ctx: SessionCtx): void {
     if (!this.config().get<boolean>("prewarmCache", true)) return;
@@ -1901,6 +1952,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const pct = (this.lastUsage as { sessionPct?: number } | undefined)?.sessionPct;
     if (pct !== undefined && pct >= 80) {
       this.output.appendLine(`[prewarm] skipped: 5h usage at ${pct}%`);
+      return;
+    }
+    // 超大会话的预热是笔亏本买卖：实测 16.7MB 的会话预热完 1 分钟后发送，首字
+    // 延迟仍有 13.4 秒（没焐上），但 token 照花。这种会话该 /compact，不该硬焐。
+    const capMB = this.config().get<number>("prewarmMaxSizeMB", 12);
+    const sizeMB = this.transcriptSize(sid) / 1_000_000;
+    if (capMB > 0 && sizeMB > capMB) {
+      this.output.appendLine(
+        `[prewarm] ${sid.slice(0, 8)} skipped: 会话 ${sizeMB.toFixed(1)}MB 超过预热上限 ${capMB}MB（预热成本高且收效甚微，建议 /compact 压缩上下文）`,
+      );
+      // 官方 Resume-from-summary 的同款思路：不硬焐，提示用户一键压缩。
+      if (!this.compactPrompted.has(sid)) {
+        this.compactPrompted.add(sid);
+        void vscode.window
+          .showWarningMessage(
+            `会话已达 ${sizeMB.toFixed(1)}MB，每条回复都要重读全部历史（首条会慢几十秒）。建议压缩上下文：保留要点、大幅提速。`,
+            "立即压缩",
+          )
+          .then((pick) => {
+            if (pick === "立即压缩") void this.compactSession(ctx);
+          });
+      }
       return;
     }
     const key = this.warmKey(sid);
@@ -2159,6 +2232,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } catch { /* 面板可能正在销毁 */ }
   }
 
+  // -- QQ 机器人单实例锁（跨 VS Code 窗口）---------------------------------
+  // 每个窗口都是独立的扩展宿主，各自会去连机器人：同一条 QQ 消息被两个窗口
+  // 各跑一遍 Claude、回两次。用一个带心跳的锁文件选主，只有持锁窗口连机器人。
+  private static readonly QQ_LOCK_TTL = 90_000;
+  private readonly qqLockOwner = `${process.pid}-${Date.now()}`;
+  private qqLockTimer?: ReturnType<typeof setInterval>;
+  private qqHoldsLock = false;
+
+  private qqLockFile(): string {
+    return path.join(os.homedir(), ".claude-chat", "qq-bot.lock");
+  }
+
+  /** 抢锁：没人占、锁过期、或本来就是自己的，都算抢到。 */
+  private acquireQQLock(): boolean {
+    const file = this.qqLockFile();
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      let cur: { owner?: string; at?: number } | undefined;
+      try {
+        cur = JSON.parse(fs.readFileSync(file, "utf8"));
+      } catch {
+        cur = undefined; // 没有锁文件或内容损坏
+      }
+      const fresh = cur?.at && Date.now() - cur.at < ChatViewProvider.QQ_LOCK_TTL;
+      if (fresh && cur?.owner !== this.qqLockOwner) return false; // 别的窗口正持有
+      fs.writeFileSync(file, JSON.stringify({ owner: this.qqLockOwner, at: Date.now() }), "utf8");
+      this.qqHoldsLock = true;
+      return true;
+    } catch {
+      return true; // 锁机制本身出问题时不阻断功能（单窗口是常态）
+    }
+  }
+
+  private renewQQLock(): void {
+    if (!this.qqHoldsLock) return;
+    try {
+      fs.writeFileSync(this.qqLockFile(), JSON.stringify({ owner: this.qqLockOwner, at: Date.now() }), "utf8");
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private releaseQQLock(): void {
+    if (!this.qqHoldsLock) return;
+    this.qqHoldsLock = false;
+    try {
+      const cur = JSON.parse(fs.readFileSync(this.qqLockFile(), "utf8"));
+      if (cur?.owner === this.qqLockOwner) fs.unlinkSync(this.qqLockFile());
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 心跳 + 接管：持锁时续期；没抢到锁时定期重试，持锁窗口一关就自动顶上。 */
+  private ensureQQLockTimer(): void {
+    if (this.qqLockTimer) return;
+    this.qqLockTimer = setInterval(() => {
+      try {
+        if (this.qqBot) {
+          this.renewQQLock();
+          return;
+        }
+        if (!this.qqStored().enabled) return;
+        if (this.acquireQQLock()) {
+          this.output.appendLine(`[${new Date().toISOString()}] [qq] 接管机器人（原持有窗口已退出）`);
+          void this.startQQBot();
+        }
+      } catch {
+        /* 心跳绝不能把宿主拖下水 */
+      }
+    }, 30_000);
+  }
+
   private async saveQQConfig(cfg: QQConfig): Promise<void> {
     await this.context.globalState.update(ChatViewProvider.QQ_STATE_KEY, {
       appId: cfg.appId.trim(),
@@ -2197,6 +2343,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.qqPanel?.webview.postMessage({ kind: "qq_result", ok: false, message: "请先填写 AppID 和 AppSecret 并保存" } satisfies ToWebview);
       return;
     }
+    // 跨窗口单实例：抢不到锁说明另一个 VS Code 窗口已经在跑机器人了，本窗口
+    // 不再连接（否则同一条消息会被两个窗口各跑一遍、回两次）。
+    this.ensureQQLockTimer();
+    if (!this.acquireQQLock()) {
+      this.output.appendLine(`[${new Date().toISOString()}] [qq] 另一个窗口已在运行机器人，本窗口跳过连接`);
+      this.setQQState("offline", "另一个 VS Code 窗口已在运行机器人");
+      return;
+    }
     // 白名单为空不再拒绝启动——openid 只能从消息事件里拿到，必须先能连上、
     // 让用户发一条消息完成"配对"。此时机器人只回 openid，不执行任何指令。
     if (!allowed.length) {
@@ -2224,6 +2378,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   private stopQQBot(): void {
     this.qqStartSeq++; // 作废还悬在 startQQBot await 里的并发调用
+    this.releaseQQLock(); // 让位给其它窗口
     this.qqBot?.stop();
     this.qqBot = undefined;
     this.qqProc?.dispose();
@@ -3241,6 +3396,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** 符号名 -> 是否能在工作区解析到。LSP 查询有成本，且历史重渲染会反复问同一批。 */
   private readonly symbolCache = new Map<string, boolean>();
 
+  /** 工作区符号索引可用性：undefined=未知，true=用得上，false=这个工作区根本没有
+   *  （比如 Java 项目没装语言服务扩展——查询永远返回空）。
+   *  实测教训：不区分"冷启动"和"压根没有"的话，每次点击都要为一个永远不会
+   *  热起来的索引白等 2 秒多重试，这就是"点了很久才反应"的根因。 */
+  private lspSymbolUsable?: boolean;
+  /** LSP 查不到、但我们自己（文件名/文本搜索）找到了的次数——连续两次就判定索引不可用。 */
+  private lspMisses = 0;
+  private readonly bootAt = Date.now();
+
   /** 校验一批符号引用，返回无效项的 id。策略：LSP 工作区符号索引（快、准）。
    *  保护：整批一个都查不到时不下结论——可能是语言服务还没热身（窗口刚开时索引
    *  是空的），此时全部保留，宁可留几个可疑链接也不错杀真符号。 */
@@ -3262,6 +3426,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             "vscode.executeWorkspaceSymbolProvider",
             name,
           )) ?? [];
+        if (found.length) {
+          this.lspSymbolUsable = true; // 索引有反应 = 确实可用
+          this.lspMisses = 0;
+        }
         ok = found.some((s) => s.name === name || s.name.startsWith(name + "("));
       } catch {
         ok = true; // 查询本身失败（无语言服务等）——不下结论，保留链接
@@ -3287,13 +3455,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async openFile(ctx: SessionCtx, p: string, line?: number, endLine?: number): Promise<void> {
+    const t0 = Date.now();
     try {
       const abs = await this.resolveWorkspaceFile(p, true);
       if (!abs) {
+        this.output.appendLine(`[openFile] ${p} 未找到 (${Date.now() - t0}ms)`);
         vscode.window.showWarningMessage(`工作区里找不到文件：${p}`);
         return;
       }
-      if (abs !== p) this.output.appendLine(`[openFile] ${p} → ${abs}`);
+      // 慢的时候要能查出来是"找文件"慢还是"开编辑器"慢。
+      const resolveMs = Date.now() - t0;
+      if (abs !== p || resolveMs > 300) this.output.appendLine(`[openFile] ${p} → ${abs} (解析 ${resolveMs}ms)`);
       const doc = await vscode.workspace.openTextDocument(abs);
       const editor = await vscode.window.showTextDocument(doc, { viewColumn: this.codeColumn(ctx), preview: false });
       if (line && line > 0) {
@@ -3325,53 +3497,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async openSymbolInner(ctx: SessionCtx, name: string): Promise<void> {
+    const t0 = Date.now();
+    const done = (via: string) =>
+      this.output.appendLine(
+        `[${new Date().toISOString()}] [symbol] ${name} 定位 ${Date.now() - t0}ms 途径=${via}` +
+          (lspMs ? ` (其中 lsp ${lspMs}ms)` : ""),
+      );
     // 1) Language-server workspace-symbol index (best — needs the lang extension).
-    //    冷启动重试：窗口刚开时 LSP 索引是空的，立即降级会把用户丢进全局搜索
-    //    面板（"第一次点是搜索、多点几次才能定位"的根因）——等它热身，最多 ~4s。
-    const lspHit = await vscode.window.withProgress(
+    //    冷启动值得等一下（窗口刚开时索引是空的，立即降级会把用户丢进搜索面板）；
+    //    但"这个工作区压根没有语言服务"时（如 Java 项目没装 redhat.java，查询永远
+    //    返回空）再等就是每次点击白卡两秒多——所以先判可用性，不可用就直接跳过。
+    let lspMs = 0;
+    const lspHit = this.lspSymbolUsable === false ? undefined : await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: `定位 ${name}…` },
       async () => {
-        for (let attempt = 0; attempt < 4; attempt++) {
-          if (attempt) await new Promise((r) => setTimeout(r, 500 + attempt * 500));
-          let syms: vscode.SymbolInformation[];
-          try {
-            syms =
-              (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
-                "vscode.executeWorkspaceSymbolProvider",
-                name,
-              )) ?? [];
-          } catch {
-            return undefined; // 没有语言服务——重试无意义，走后面的降级链路
+        const lt = Date.now();
+        // 只有"可用性未知 + 扩展刚起不久"才可能是冷启动，才值得重试等待。
+        const mayBeCold = this.lspSymbolUsable === undefined && Date.now() - this.bootAt < 60_000;
+        const tries = mayBeCold ? 3 : 1;
+        try {
+          for (let attempt = 0; attempt < tries; attempt++) {
+            if (attempt) await new Promise((r) => setTimeout(r, 400));
+            let syms: vscode.SymbolInformation[];
+            try {
+              syms =
+                (await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+                  "vscode.executeWorkspaceSymbolProvider",
+                  name,
+                )) ?? [];
+            } catch {
+              return undefined; // 没有语言服务——重试无意义，走后面的降级链路
+            }
+            if (syms.length) {
+              this.lspSymbolUsable = true;
+              this.lspMisses = 0;
+            } else if (this.lspSymbolUsable) {
+              return undefined; // 索引确认可用 → 空 = 真没有，别再等
+            }
+            const exact = syms.filter((s) => s.name === name || s.name.startsWith(name + "("));
+            const candidates = exact.length ? exact : syms;
+            const order: Record<number, number> = {
+              [vscode.SymbolKind.Class]: 0,
+              [vscode.SymbolKind.Interface]: 0,
+              [vscode.SymbolKind.Enum]: 0,
+              [vscode.SymbolKind.Struct]: 0,
+              [vscode.SymbolKind.Constructor]: 1,
+              [vscode.SymbolKind.Method]: 1,
+              [vscode.SymbolKind.Function]: 1,
+            };
+            candidates.sort((a, b) => (order[a.kind] ?? 5) - (order[b.kind] ?? 5));
+            if (candidates[0]) return candidates[0];
           }
-          const exact = syms.filter((s) => s.name === name || s.name.startsWith(name + "("));
-          const candidates = exact.length ? exact : syms;
-          const order: Record<number, number> = {
-            [vscode.SymbolKind.Class]: 0,
-            [vscode.SymbolKind.Interface]: 0,
-            [vscode.SymbolKind.Enum]: 0,
-            [vscode.SymbolKind.Struct]: 0,
-            [vscode.SymbolKind.Constructor]: 1,
-            [vscode.SymbolKind.Method]: 1,
-            [vscode.SymbolKind.Function]: 1,
-          };
-          candidates.sort((a, b) => (order[a.kind] ?? 5) - (order[b.kind] ?? 5));
-          if (candidates[0]) return candidates[0];
+          return undefined;
+        } finally {
+          lspMs = Date.now() - lt;
         }
-        return undefined;
       },
     );
     if (lspHit) {
+      done("lsp");
       await this.openFile(ctx, lspHit.location.uri.fsPath, lspHit.location.range.start.line + 1);
       return;
     }
     // 2) A type whose file is named after it (Java/Kotlin/C#/TS/Go/… convention).
+    //    只对"类型名"形态（首字母大写）才查——saveOrder 这类方法名不可能有同名
+    //    文件，白跑一次 findFiles 就是几百毫秒。
     try {
+      if (!/^[A-Z]/.test(name)) throw new Error("skip");
       const matches = await vscode.workspace.findFiles(
         `**/${name}.{java,kt,kts,scala,cs,ts,tsx,go,rs,php,swift,dart}`,
         "**/{node_modules,dist,build,out,target,.git}/**",
         3,
       );
       if (matches.length) {
+        this.noteLspMiss();
+        done("file");
         const doc = await vscode.workspace.openTextDocument(matches[0]);
         await this.openFile(ctx, matches[0].fsPath, this.findDefLine(doc.getText(), name));
         return;
@@ -3383,6 +3583,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const hit = await this.searchDefinition(name);
       if (hit) {
+        this.noteLspMiss();
+        done("search");
         await this.openFile(ctx, hit.uri.fsPath, hit.line);
         return;
       }
@@ -3390,6 +3592,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       /* ignore */
     }
     // 4) Last resort: open the Search panel pre-filled.
+    this.noteLspMiss(); // 到这一步说明 LSP 也没帮上忙，同样计入"索引不可用"的证据
+    done("找不到→搜索面板");
     try {
       await vscode.commands.executeCommand("workbench.action.findInFiles", {
         query: name,
@@ -3417,12 +3621,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   /** Scan workspace source files for a definition of `name` (bounded, early-exit). */
-  private async searchDefinition(name: string): Promise<{ uri: vscode.Uri; line: number } | undefined> {
-    const files = await vscode.workspace.findFiles(
+  /** LSP 没查到、但我们自己找到了 —— 连续两次就判定这个工作区没有可用的符号索引，
+   *  之后所有点击直接跳过 LSP（省掉每次两秒多的无用等待）。 */
+  private noteLspMiss(): void {
+    if (this.lspSymbolUsable === true) return; // 索引本来可用，只是这个符号它不认识
+    if (++this.lspMisses >= 2) {
+      if (this.lspSymbolUsable !== false) {
+        this.output.appendLine(
+          `[${new Date().toISOString()}] [symbol] 工作区无可用符号索引（未装语言服务？），后续点击跳过 LSP 直接走搜索`,
+        );
+      }
+      this.lspSymbolUsable = false;
+    }
+  }
+
+  /** 源码文件清单缓存：findFiles 在大仓库本身就要几百毫秒，每次点击都重扫太浪费。 */
+  private srcFilesCache?: { at: number; uris: vscode.Uri[] };
+
+  private async sourceFiles(): Promise<vscode.Uri[]> {
+    const c = this.srcFilesCache;
+    if (c && Date.now() - c.at < 60_000) return c.uris;
+    const uris = await vscode.workspace.findFiles(
       "**/*.{java,kt,kts,scala,ts,tsx,js,jsx,go,rs,cs,py,php,rb,swift,dart,c,cpp,h,hpp}",
       "**/{node_modules,dist,build,out,target,.git}/**",
       2500,
     );
+    this.srcFilesCache = { at: Date.now(), uris };
+    return uris;
+  }
+
+  private async searchDefinition(name: string): Promise<{ uri: vscode.Uri; line: number } | undefined> {
+    const files = await this.sourceFiles();
     const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const word = new RegExp(`\\b${esc}\\b`);
     const def = new RegExp(
@@ -3431,18 +3660,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         `|\\b${esc}\\s*[:=]\\s*(?:function\\b|\\()`,
     );
     let fallback: { uri: vscode.Uri; line: number } | undefined;
-    for (const uri of files) {
-      let content: string;
-      try {
-        content = await fs.promises.readFile(uri.fsPath, "utf8");
-      } catch {
-        continue;
-      }
-      if (!word.test(content)) continue;
-      const lines = content.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (def.test(lines[i])) return { uri, line: i + 1 };
-        if (!fallback && word.test(lines[i])) fallback = { uri, line: i + 1 };
+    // 分批并行读：串行 2500 次 readFile 是"点了要等两秒"的另一半原因。
+    // 批内按原顺序判定，保证结果和串行版一致（第一个定义处优先）。
+    const BATCH = 48;
+    for (let start = 0; start < files.length; start += BATCH) {
+      const batch = files.slice(start, start + BATCH);
+      const contents = await Promise.all(
+        batch.map((u) => fs.promises.readFile(u.fsPath, "utf8").catch(() => undefined)),
+      );
+      for (let b = 0; b < batch.length; b++) {
+        const content = contents[b];
+        if (content === undefined || !word.test(content)) continue;
+        const uri = batch[b];
+        const lines = content.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          if (def.test(lines[i])) return { uri, line: i + 1 };
+          if (!fallback && word.test(lines[i])) fallback = { uri, line: i + 1 };
+        }
       }
     }
     return fallback;
@@ -3510,13 +3744,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   dispose(): void {
-    if (this.keepWarmTimer) clearInterval(this.keepWarmTimer);
-    this.keepWarmTimer = undefined;
     if (this.usageTimer) clearInterval(this.usageTimer);
     this.usageTimer = undefined;
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
     this.watchdogTimer = undefined;
-    this.stopQQBot(); // 关窗口就断开机器人，不留孤儿进程/连接
+    if (this.qqLockTimer) clearInterval(this.qqLockTimer);
+    this.qqLockTimer = undefined;
+    this.stopQQBot(); // 关窗口就断开机器人并让出锁，另一个窗口会自动接管
     this.qqPanel?.dispose();
     this.qqPanel = undefined;
     // Flush debounced snapshot writes first — a hard window close within 500ms

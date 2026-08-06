@@ -727,6 +727,13 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       if (userStopped) setGlow("idle");
       else setGlow(m.isError ? "error" : "done");
       finalizeTurn();
+      // 压缩的收尾也是一个普通 result。只靠 compacted 复位的话，压缩失败、或
+      // 会话太小 CLI 直接跳过压缩（实测 SDK 引擎下就不发 compact_boundary）时，
+      // 仪表盘会永远转圈且再也点不动。
+      if (compacting) {
+        compacting = false;
+        ctxGauge.classList.remove("compacting");
+      }
       if (m.numTurns != null) {
         statusLine.textContent = `完成 · ${m.numTurns} 轮`;
       }

@@ -35,6 +35,11 @@ export class SdkClaudeProcess {
   private stderrTail = "";
   /** 消息循环结束的信号（disposeAndWait 用）。 */
   private closedPromise?: Promise<void>;
+  /** start() 整体完成（或失败）的信号。disposeAndWait 必须先等它——否则在
+   *  握手期（resume 大会话要好几秒）调用会立即返回，调用方接着去删/截断
+   *  transcript，而子进程才刚起来，随后把缓冲行刷回磁盘 → 会话"删不掉"、
+   *  还原被撤销。stream-json 版没这个洞（spawn 那一行就有 proc 可等）。 */
+  private startPromise?: Promise<void>;
   /** 等待用户应答的权限请求：requestId -> resolver + 原始 input/suggestions。 */
   private readonly pendingPermissions = new Map<
     string,
@@ -63,6 +68,27 @@ export class SdkClaudeProcess {
    *  官方为此提供 startup()/WarmQuery：先 spawn + 完成 initialize 握手再挂 prompt，
    *  语义与 stream-json 版的 start() 完全一致。 */
   async start(): Promise<void> {
+    const p = this.startInner();
+    // 记下来给 disposeAndWait 等；这里不 catch，异常照常抛给调用方。
+    this.startPromise = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    return p;
+  }
+
+  private async startInner(): Promise<void> {
+    try {
+      await this.startInnerUnsafe();
+    } catch (err) {
+      // 没起来的实例必须自称已退出，否则调用方拿它当活对象用（发消息、等退出）
+      // 会静默失败。stream-json 版在 spawn 失败时同样置 exited。
+      this.exited = true;
+      throw err;
+    }
+  }
+
+  private async startInnerUnsafe(): Promise<void> {
     const { startup } = await import("@anthropic-ai/claude-agent-sdk");
     const options: Options = {
       pathToClaudeCodeExecutable: this.resolveCli(),
@@ -77,9 +103,15 @@ export class SdkClaudeProcess {
       persistSession: this.opts.forkNoPersist ? false : undefined,
       maxTurns: this.opts.maxTurns,
       additionalDirectories: this.opts.addDirs,
-      systemPrompt: this.opts.appendSystemPrompt
-        ? { type: "preset", preset: "claude_code", append: this.opts.appendSystemPrompt }
-        : undefined,
+      // 必须显式指定 preset：省略 systemPrompt 时 SDK 会下发 `systemPrompt: [""]`，
+      // CLI 据此认为"调用方自定义了系统提示"，于是**根本不构建 Claude Code 的
+      // 默认系统提示**——模型会失去工具使用规范/身份/输出风格，且不报错。
+      // （已用假 CLI 抓包实证：省略时 initialize 报文里就是 systemPrompt:[""]。）
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
+      },
       abortController: this.abort,
       stderr: (d) => {
         this.stderrTail = (this.stderrTail + d).slice(-4096);
@@ -103,6 +135,9 @@ export class SdkClaudeProcess {
     if (this.pendingMode !== undefined) {
       const mode = this.pendingMode;
       this.pendingMode = undefined;
+      // init 事件是缓冲后才被消息循环取出的，那时 pendingMode 已清空——单独记
+      // 一份给 handleSystem 用，否则界面上的权限模式选择器会被打回 spawn 时的旧值。
+      this.modeOverride = mode;
       try {
         await this.q.setPermissionMode(mode as Parameters<Query["setPermissionMode"]>[0]);
       } catch {
@@ -134,22 +169,48 @@ export class SdkClaudeProcess {
         }
       } finally {
         this.exited = true;
-        // 尚未应答的权限请求随进程一起作废（与 stream-json 版 close 处理一致）。
-        for (const requestId of [...this.pendingPermissions.keys()]) {
-          this.pendingPermissions.delete(requestId);
+        // 挂起的 canUseTool Promise 必须 resolve，否则连同闭包永久悬挂。
+        const pending = [...this.pendingPermissions.entries()];
+        this.pendingPermissions.clear();
+        for (const [, p] of pending) {
+          try {
+            p.resolve({ behavior: "deny", message: "进程已退出。", interrupt: false });
+          } catch {
+            /* ignore */
+          }
+        }
+        // 主动 dispose 的进程不得再碰 UI：此时 ctx 上很可能已经挂了新进程
+        // （/clear、切 effort 都是"先 dispose 再立刻建新的"），旧进程迟到的
+        // busy:false / permission_resolved 会把新进程的转圈和权限弹窗掐掉。
+        // 与 stream-json 版的 `if (this.disposed) return;` 保持一致。
+        if (this.disposed) return;
+        for (const [requestId] of pending) {
           this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
         }
         this.setBusy(false);
-        if (!this.disposed) this.hooks.onClose(code);
+        this.hooks.onClose(code);
       }
     })();
   }
 
   /** SDK 不做 PATH 查找（实测裸 "claude" 会报 Native CLI binary not found）——
-   *  裸命令名要先解析成真实路径。 */
+   *  裸命令名要先解析成真实路径。结果按进程缓存，日常只付一次。 */
   private resolveCli(): string {
     const p = this.opts.claudePath || "claude";
-    if (p.includes("/")) return p; // 已是路径
+    if (p.includes("/") || p.includes("\\")) return p; // 已是路径
+    if (process.platform === "win32") {
+      if (SdkClaudeProcess.cliPathCache?.name === p) return SdkClaudeProcess.cliPathCache.path;
+      let resolved = p;
+      try {
+        const { execSync } = require("node:child_process") as typeof import("node:child_process");
+        const out = execSync(`where ${p}`, { encoding: "utf8", timeout: 3000 }).trim();
+        if (out) resolved = out.split(/\r?\n/)[0];
+      } catch {
+        /* 交给 SDK 自己去试 */
+      }
+      SdkClaudeProcess.cliPathCache = { name: p, path: resolved };
+      return resolved;
+    }
     if (SdkClaudeProcess.cliPathCache?.name === p) return SdkClaudeProcess.cliPathCache.path;
     let resolved = p;
     try {
@@ -176,7 +237,9 @@ export class SdkClaudeProcess {
   // -- 发送 ----------------------------------------------------------------
 
   sendUserMessage(text: string, context?: string, images?: { mediaType: string; data: string }[]): boolean {
-    if (this.exited || !this.initialized) return false;
+    // 必须判 disposed：dispose() 只关输入流、不置 exited（要等消息循环收尾），
+    // 这中间返回 true 的话消息会被 AsyncQueue 静默吞掉，用户的消息凭空消失。
+    if (this.disposed || this.exited || !this.initialized) return false;
     const body = context ? `${context}\n\n${text}` : text;
     this.setBusy(true);
     const content: Array<Record<string, unknown>> = [];
@@ -323,6 +386,8 @@ export class SdkClaudeProcess {
 
   private pendingMode?: string;
   private pendingModel?: string;
+  /** 握手期切过的权限模式——init 事件上报时用它盖掉 CLI 报的 spawn 时旧值。 */
+  private modeOverride?: string;
 
   dispose(): void {
     this.disposed = true;
@@ -335,11 +400,16 @@ export class SdkClaudeProcess {
   }
 
   disposeAndWait(): Promise<void> {
-    const done = new Promise<void>((resolve) => {
-      if (this.exited || !this.closedPromise) return resolve();
-      void this.closedPromise.then(resolve).catch(() => resolve());
-      setTimeout(resolve, 3000); // hard cap — 与 stream-json 版一致
-    });
+    const done = (async () => {
+      // 先等 start() 落定：握手期就被丢弃时 closedPromise 还不存在，
+      // 直接返回等于没等，调用方会去动一个正在被写的 transcript。
+      if (this.startPromise) await Promise.race([this.startPromise, delay(3000)]);
+      if (this.exited || !this.closedPromise) return;
+      // SDK 的拆卸阶梯是 abort → 2s 宽限 → SIGTERM → 5s → SIGKILL，最坏 ~7s；
+      // 3s 就返回的话调用方会在子进程还活着时去删/截断 transcript。正常退出
+      // 远快于此，这个上限只在真的赖着不走时才付出。
+      await Promise.race([this.closedPromise.catch(() => undefined), delay(8000)]);
+    })();
     this.dispose();
     return done;
   }
@@ -387,12 +457,16 @@ export class SdkClaudeProcess {
         tools: ev.tools ?? [],
         resumed,
         // 与 stream-json 版一致：握手期改过模式的话，init 报的还是 spawn 时的旧值。
-        permissionMode: this.pendingMode ?? ev.permissionMode,
+        permissionMode: this.modeOverride ?? ev.permissionMode,
       });
     } else if (ev.subtype === "status") {
       if (ev.status === "compacting") this.hooks.emit({ kind: "compacting" });
       else if (ev.compact_result) {
-        /* swallow; compact_boundary carries the numbers */
+        // 成功时数字由 compact_boundary 带；失败要说出来，否则用户只看到
+        // 转圈停了却不知道压缩没生效。
+        if (ev.compact_result === "failed") {
+          this.hooks.emit({ kind: "error", message: `压缩上下文失败：${ev.compact_error ?? "未知原因"}` });
+        }
       } else if (typeof ev.status === "string") this.hooks.emit({ kind: "status", label: ev.status });
     } else if (ev.subtype === "compact_boundary") {
       const md = ev.compact_metadata ?? {};
@@ -400,7 +474,14 @@ export class SdkClaudeProcess {
     } else if (ev.subtype === "api_retry") {
       this.hooks.emit({
         kind: "diag",
-        message: `api_retry: ${JSON.stringify({ attempt: ev.attempt ?? ev.retry_count, delay: ev.delay_ms ?? ev.retry_in, error: ev.error }).slice(0, 300)}`,
+        // 字段名以 sdk.d.ts 的 SDKAPIRetryMessage 为准（retry_delay_ms / error_status）。
+        message: `api_retry: ${JSON.stringify({
+          attempt: ev.attempt ?? ev.retry_count,
+          delayMs: ev.retry_delay_ms ?? ev.delay_ms,
+          maxRetries: ev.max_retries,
+          status: ev.error_status,
+          error: ev.error,
+        }).slice(0, 300)}`,
       });
     } else if (ev.subtype === "thinking_tokens") {
       // SDK 类型定义的字段是 estimated_tokens（老候选保留兜底）。
@@ -516,6 +597,10 @@ export class SdkClaudeProcess {
     this.busy = busy;
     this.hooks.emit({ kind: "busy", busy });
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 /** 简单的可推送异步队列（SDK streaming input 的 prompt 载体）。 */

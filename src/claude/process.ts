@@ -551,7 +551,10 @@ export class ClaudeProcess {
       if (status === "compacting") {
         this.hooks.emit({ kind: "compacting" });
       } else if ((ev as any).compact_result) {
-        /* swallow; compact_boundary carries the numbers */
+        // 成功时数字由 compact_boundary 带；失败必须说出来。
+        if ((ev as any).compact_result === "failed") {
+          this.hooks.emit({ kind: "error", message: `压缩上下文失败：${(ev as any).compact_error ?? "未知原因"}` });
+        }
       } else if (typeof status === "string") {
         this.hooks.emit({ kind: "status", label: status });
       }

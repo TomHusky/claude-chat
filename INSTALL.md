@@ -6,11 +6,13 @@
 ## 前置条件
 
 1. 已安装 **VS Code**（或 Cursor 等兼容编辑器）。
-2. 本机已安装并登录 **`claude` CLI**（Claude Code）。验证：
+2. 本机已安装并登录 **`claude` CLI**（Claude Code），建议 2.1.x 及以上。验证：
    ```bash
    claude --version
    ```
-   插件不需要 API Key，它直接复用你本机 `claude` 的登录态。
+   插件不需要 API Key，它直接复用你本机 `claude` 的登录态。插件通过官方
+   `@anthropic-ai/claude-agent-sdk` 驱动这个本地 CLI，鉴权与计费和你自己在
+   终端里敲 `claude` 完全一致。
 
 ## 一键安装（推荐）
 
@@ -49,6 +51,13 @@ code --install-extension claude-chat-*.vsix --force
 
 - 左侧活动栏点击 **ClaudeCopilot** 管理会话；聊天面板在编辑器区/侧边栏打开。
 - 首次使用确保 `claude` CLI 已登录（`claude` 命令能正常对话）。
+
+## 出问题时
+
+- 日志固定在 **`~/.claude-chat/logs/`**（按天分文件，保留 7 天）。命令面板运行
+  `Claude: 打开日志文件夹` 可直接打开；反馈问题时把当天的 `.log` 发出来即可。
+- 若怀疑是新的对接引擎导致，设置里把 **`claudeChat.engine`** 从 `sdk` 切回
+  `stream-json`，重开会话即恢复旧链路（两条链路功能等价）。
 
 ## 卸载
 

@@ -1,7 +1,7 @@
 # ClaudeCopilot — VS Code 插件
 
-一个对标 GitHub Copilot Chat 的侧边栏聊天插件，**底层直接驱动你本机的 `claude` CLI**（Claude Code）。
-你已有的 Claude 订阅 / 登录态会被直接复用 —— 插件不需要 API Key，所有请求都通过本地 `claude` 进程发出。
+一个对标 GitHub Copilot Chat 的聊天插件，**底层驱动你本机的 `claude` CLI**（Claude Code）。
+复用你已有的 Claude 订阅 / 登录态 —— 插件不需要 API Key，所有请求都由本地 `claude` 进程发出。
 
 ## ⚡ 安装
 
@@ -13,47 +13,59 @@ code --install-extension release/claude-chat.vsix --force
 
 然后 Reload Window 即可。完整步骤（含 `code` 命令未安装、图形界面安装、从源码构建等）见 **[INSTALL.md](INSTALL.md)**。
 
-> 前置条件：本机已安装并登录 `claude` CLI（`claude --version` 可用）。
+> 前置条件：本机已安装并登录 `claude` CLI（`claude --version` 可用）。已针对 claude-code **2.1.x** 验证。
 
 ## 功能
 
-- 🗨️ **侧边栏聊天面板**：多轮对话，流式回复，Markdown + 代码高亮渲染
-- 🧠 **思考过程**：可折叠展示 Claude 的 thinking
-- 🔧 **工具调用卡片**：Read / Write / Edit / Bash 等以卡片形式展示输入与结果，文件路径可点击跳转
-- ✅ **改动待确认区**：默认权限模式下，每个敏感操作（写文件、跑命令）会弹出 *允许 / 拒绝 / 本会话总是允许* 按钮 —— 对应 Copilot 的 “Keep / Undo” 审批体验
-- 🕘 **会话管理**：自动复用 Claude Code 的本地会话记录，可在历史会话间切换、删除
-- ⏱ **还原点 (Restore Points)**：每轮对话前自动建立还原点。一键还原会**同时**：① 把工作区文件回滚到该消息之前的状态；② **真正截断对话** —— 截断会话记录并以 `--resume` 续接，Claude 会真的“忘记”该消息之后的所有轮次（已用实验验证：还原后它只记得截断点之前的内容）
-- ⚙️ **权限模式切换**：default / acceptEdits / plan / bypassPermissions
-- ⛔ **随时中断**：停止按钮可中断当前回合
+### 聊天
 
-## 运行方式（开发模式）
+- 🗨️ **聊天面板**：多轮对话、流式回复、Markdown + 代码高亮；可在侧边栏与编辑器区之间切换
+- 🧠 **思考过程**：可折叠展示 thinking，并显示实时思考 token 数
+- 🔧 **工具调用卡片**：Read / Write / Edit / Bash 等以卡片展示输入与结果；`TodoWrite` 渲染为勾选清单
+- 🔗 **可点击引用**：AI 提到的文件路径、`file.ts:42` 行号、符号名都会变成可点击链接跳转到源码。**校验后才给链接** —— 工作区里不存在的一律降级为纯文本，不留死链接
+- ✅ **改动待确认区**：默认权限模式下每个敏感操作弹出 *允许 / 拒绝 / 本会话总是允许*
+- ⛔ **随时中断**：停止按钮即时生效
+- 📋 **任务队列**：回复进行中可继续排队消息，按顺序自动发送
+- 📊 **用量胶囊**：5 小时 / 每周额度实时显示，限额告警可按周期关闭
 
-> 需要本机已安装并登录 `claude` CLI（`claude --version` 可用）。本插件已针对 claude-code **2.1.x** 验证。
+### 会话
 
-```bash
-cd claude-chat
-npm install
-npm run build      # 一次性构建；开发时用 npm run watch 监听
-```
+- 🕘 **会话管理**：复用 Claude Code 的本地会话记录，可切换、重命名、单个或批量删除；删除会同步清理官方侧的附属数据（`file-history` / `session-env` / `tasks` / 子 agent 记录），不留"删了还在"的残留
+- ⏱ **还原点**：每轮对话前自动建点。一键还原会**同时**回滚工作区文件、**并真正截断对话**（截断 `.jsonl` + `--resume` 续接，Claude 会真的"忘记"之后的轮次）
+- ✏️ **消息编辑重发**：改写历史消息并从该点重新生成
+- 🗜 **上下文压缩**：`/compact` 一键压缩；超大会话打开时会主动提示压缩
 
-然后用 VS Code 打开 `claude-chat` 文件夹，按 **F5**（“运行扩展”）启动一个 *Extension Development Host* 窗口。
-在新窗口左侧活动栏点击 **Claude Chat** 图标即可开始聊天。
+### 性能与稳定性
 
-> 想在真实环境长期使用，可以打包成 `.vsix`：
-> ```bash
-> npx @vscode/vsce package --no-dependencies
-> code --install-extension claude-chat-0.1.0.vsix
-> ```
+- 🔥 **进程预启动**：打开会话即后台 `--resume` 拉起进程，把读取上下文的耗时与你读历史/打字的时间重叠
+- ♨️ **缓存预热**：大会话（>1MB）后台预热服务端 prompt cache。预热记录跨窗口共享、不重复烧 token；超过 `prewarmMaxSizeMB` 的会话不再预热而是建议压缩
+- 🧯 **保活池**：关闭 tab 的会话进程后台保留（LRU，上限 5 个），重新打开秒回；正在回复的进程永不被回收
+- 🐕 **双看门狗**：① 一轮对话完全静默超时（默认 12 分钟）判定 CLI 卡死，自动重置连接并提示重发，上下文不丢；② webview 通道假死检测（ping/pong），自动重建界面并保留输入框草稿
+- 📁 **固定日志目录**：`~/.claude-chat/logs/`（按天分文件、保留 7 天），命令面板 `Claude: 打开日志文件夹` 直达
 
-## 配置项（设置 → 搜索 “Claude Chat”）
+### 扩展能力
+
+- 🤖 **QQ 机器人**：接入 QQ 开放平台，手机上发消息即可远程操控 Claude 干活。白名单授权 + 配对模式；支持 `/help` `/status` `/usage` `/model` `/effort` `/compact` `/clear` `/stop` 命令。多窗口自动选主，全局只保持一个机器人连接
+- 📈 **SLS 日志查询**：接入阿里云 SLS，让 Claude 直接查生产日志辅助排查
+- ⌨️ **斜杠命令**：输入框支持 `/help` `/clear` `/compact` `/model` `/effort` `/usage`，未知的 `/` 命令原样透传给 CLI（不吞掉 skills）
+
+## 配置项（设置 → 搜索 "Claude Chat"）
 
 | 配置 | 说明 | 默认 |
 | --- | --- | --- |
+| `claudeChat.engine` | 对接引擎：`sdk`（官方 Agent SDK）/ `stream-json`（自维护协议层，回退用） | `sdk` |
 | `claudeChat.claudePath` | `claude` 可执行文件路径（不在 PATH 时填绝对路径） | `claude` |
 | `claudeChat.model` | 模型（`opus` / `sonnet` / `fable` 或完整 id），留空用 CLI 默认 | `""` |
 | `claudeChat.permissionMode` | 新会话的初始权限模式 | `default` |
-| `claudeChat.effort` | 推理强度 low/medium/high/xhigh/max | `""` |
+| `claudeChat.effort` | 推理强度 `low`/`medium`/`high`/`xhigh`/`max` | `""` |
+| `claudeChat.appendSystemPrompt` | 追加到系统提示的全局指令（如强制中文回复） | `""` |
 | `claudeChat.snapshotFilesForRestore` | 文件被修改前先快照，供还原点回滚 | `true` |
+| `claudeChat.prespawnOnOpen` | 打开会话即后台启动进程 | `true` |
+| `claudeChat.prewarmCache` | 大会话打开时预热 prompt cache（耗 token） | `true` |
+| `claudeChat.prewarmMaxSizeMB` | 超过此大小不再预热，改为建议压缩；`0` 表示不限制 | `12` |
+| `claudeChat.turnStallTimeoutSec` | 一轮对话允许的最大完全静默秒数，超时判定卡死并自愈 | `720` |
+| `claudeChat.qqBotPermissionMode` | QQ 机器人专用会话的权限模式 | `acceptEdits` |
+| `claudeChat.pythonPath` | SLS 查询引擎初始化用的 python3 路径 | `""` |
 
 ## 快捷键
 
@@ -63,47 +75,75 @@ npm run build      # 一次性构建；开发时用 npm run watch 监听
 
 ## 工作原理
 
-插件为每个会话拉起一个常驻的 `claude` 进程：
+### 对接引擎
+
+插件为每个会话维护**一个长驻的 `claude` 子进程**（这也是官方 Agent SDK 推荐的 streaming input 形态）。自 0.1.235 起默认走**官方 SDK**：
 
 ```
-claude -p --input-format stream-json --output-format stream-json \
-       --verbose --include-partial-messages \
-       --permission-mode <mode> --permission-prompt-tool stdio \
-       [--model …] [--session-id <uuid> | --resume <id>] [--add-dir …]
+claudeChat.engine = "sdk"          ← 默认。@anthropic-ai/claude-agent-sdk
+claudeChat.engine = "stream-json"  ← 回退开关。自维护的协议解析
 ```
 
-- 通过 stdin/stdout 的 **stream-json 双向协议** 收发消息，实现流式渲染与多轮对话（同一进程内连续多轮，无需重启）。
-- 启动时先发送 `initialize` 控制握手；`--permission-prompt-tool stdio` 让 CLI 把权限请求 (`can_use_tool`) 通过控制通道发回插件，插件据此渲染“待确认区”，用户点击后回 `control_response`（`allow` 时回显 `updatedInput`，`deny` 时附原因）。
-- 会话记录由 Claude Code 自身持久化在 `~/.claude/projects/<编码后的工作目录>/<session-id>.jsonl`；本插件读取这些文件来列出/还原历史会话。
-- **还原点的真实截断**：每轮对话发送前记录该会话 `.jsonl` 的行数；还原时先结束当前进程，把 `.jsonl` 截断回该行数，下一条消息再用 `--resume <id>` 续接 —— 由于 `.jsonl` 是顺序追加的，截断成前缀等价于把会话回退到那个时间点。还原后若该会话已无任何用户轮次，则自动变为一个全新对话。
+- **sdk**：用官方 `startup()` 预热子进程并完成 initialize 握手，再挂上 `AsyncIterable` 消息流；权限走 `canUseTool` 回调，中断/切模型/切权限模式走 `Query` 的原生方法。协议层由官方维护，CLI 升级不再担心协议漂移。
+- **stream-json**：自己 spawn `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` 并逐行解析。作为回退保留，SDK 稳定后将移除。
 
-## 已知限制 / 后续可做
+两个引擎产生完全相同的界面事件序列，可随时切换（对新启动的进程生效）。
 
-- **还原点的截断粒度按“整轮”对齐**：截断边界记录于每轮发送前。若上一轮的收尾元数据尚未落盘就立刻还原（极少见），可能少留一两行无关元数据，不影响对话记忆与文件回滚。
-- `acceptEdits` / `bypassPermissions` 模式下 CLI 会自动应用编辑、不再询问，因此不会弹出待确认区（但文件仍会在编辑前被快照，可还原）。
-- 暂未实现历史消息“原地编辑并重发”入口；不过其底层机制（截断 + `--resume`）已经具备，等同于“还原到这条消息之前再重新发送”。
+### 会话与还原点
+
+- 会话记录由 Claude Code 自身持久化在 `~/.claude/projects/<编码后的工作目录>/<session-id>.jsonl`，插件读取这些文件来列出、回放、还原历史会话。
+- **还原点的真实截断**：每轮发送前记录该 `.jsonl` 的行数；还原时先结束当前进程、把文件截断回该行数，下一条消息用 `--resume` 续接 —— `.jsonl` 是顺序追加的，截断成前缀等价于把会话回退到那个时间点。
+- 历史回放会过滤掉 CLI 注入的合成消息（`task-notification`、斜杠命令回显、`[Request interrupted by user]` 等），只渲染真人发的内容。
+
+## 已知限制
+
+- **需要本机 `claude` CLI 已登录**，插件不接受 API Key。
+- **还原点的截断粒度按整轮对齐**；若上一轮收尾元数据尚未落盘就立刻还原（极少见），可能少留一两行无关元数据，不影响记忆与文件回滚。
+- `acceptEdits` / `bypassPermissions` 模式下 CLI 自动应用编辑、不再询问，因此不弹待确认区（但文件仍会被快照，可还原）。
+- **QQ 机器人的工具请求一律自动放行**（远程无法逐条弹窗确认），白名单是唯一的安全边界；只想让它读代码可把 `qqBotPermissionMode` 设为 `plan`。
+- 超大会话（>10MB）受 CLI 自身限制，`--resume` 会很慢甚至卡住，请及时 `/compact`。
 - 行内补全（Ghost text）按需不做。
 
 ## 目录结构
 
 ```
 src/
-  extension.ts            激活入口，注册视图与命令
+  extension.ts            激活入口，注册视图与命令，日志双写
   shared.ts               扩展 <-> webview 的消息契约（无运行时依赖）
   claude/
+    engine.ts             引擎工厂：按 claudeChat.engine 选实现
+    sdkProcess.ts         SdkClaudeProcess：官方 Agent SDK 对接（默认）
+    process.ts            ClaudeProcess：自维护 stream-json 协议层（回退）
     protocol.ts           stream-json / 控制协议的类型定义
-    process.ts            ClaudeProcess：spawn、流解析、权限控制通道、中断
-    session.ts            SessionStore：读取 CLI 的 .jsonl 会话记录
+    session.ts            SessionStore：读写 CLI 的 .jsonl 会话记录
   checkpoints.ts          CheckpointManager：文件快照与还原点
   panel/
-    chatViewProvider.ts   WebviewViewProvider：进程/会话/还原点 与 webview 的桥接
+    chatViewProvider.ts   核心：进程池 / 会话 / 预热 / 看门狗 / QQ / SLS 桥接
+  qq/
+    bot.ts                QQ 开放平台机器人（WebSocket，零依赖）
   webview/
-    main.ts               前端：流式 Markdown、工具卡片、待确认区、抽屉、输入框
+    main.ts               前端：流式 Markdown、工具卡片、待确认区、引用链接校验
 media/
   main.css                使用 VS Code 主题变量的样式
   webview.js              （构建产物）前端打包，内联 markdown-it + highlight.js
-  icon.svg                活动栏图标
 ```
+
+## 开发
+
+```bash
+npm install
+npm run build      # 生产构建；开发时用 npm run watch
+npm run check-types
+```
+
+用 VS Code 打开本文件夹按 **F5** 启动 *Extension Development Host*。打包发布：
+
+```bash
+npx @vscode/vsce package --no-dependencies
+code --install-extension claude-chat-<版本>.vsix --force
+```
+
+> 打包产物同时更新 `release/claude-chat.vsix` 并随仓库提交，同事直接拉取安装。
 
 ## License
 

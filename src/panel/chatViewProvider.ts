@@ -100,8 +100,14 @@ class PrewarmLedger {
       for (const [k, v] of Object.entries(all)) {
         if (Math.max(v.s ?? 0, v.d ?? 0) < Date.now() - PrewarmLedger.TTL) delete all[k];
       }
-      fs.mkdirSync(path.dirname(this.file()), { recursive: true });
-      fs.writeFileSync(this.file(), JSON.stringify(all), "utf8");
+      const file = this.file();
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      // 原子写：writeFileSync 会先 truncate 再写，另一个窗口若恰好在这中间读，
+      // 会读到空文件→当成"全表为空"→把所有记录一次性抹掉，反而害得每个会话
+      // 都重烧一次预热。tmp + rename 让读者永远看到完整的旧版或新版。
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(all), "utf8");
+      fs.renameSync(tmp, file);
     } catch {
       /* 记不下来最多多预热一次，不能反过来影响功能 */
     }
@@ -201,10 +207,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }),
     );
 
-    // 保温：预热只在打开会话那一刻跑一次，tab 一直开着不动的话 ~1h 后服务端缓存
-    // 过期，下一条消息就变成"冷发送"（大会话实测五六十秒）。这里每 5 分钟对所有
-    // 打开的 tab 补一次 maybePrewarm —— 它自带全部守卫（>1MB、50min 内焐过不重复、
-    // 额度>80% 跳过、同时只跑一个），所以静息成本为零，只在快过期时才真正花钱。
     // 用量随时间流逝（5h 窗口滚动）+ 其他设备的消耗——不主动刷新的话，胶囊上的
     // 数字要等用户点开菜单才变。每 3 分钟拉一次（fetchUsage 自带 90s 节流）。
     this.usageTimer = setInterval(() => this.fetchUsage(), 3 * 60_000);
@@ -1864,7 +1866,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // （/clear、setEffort 等 dispose 老进程后立刻挂了新进程）——那时
       // ctx.proc 指向的是新进程，这里再清引用/报错会打断正常工作的后继者。
       if (ctx.proc !== proc) return undefined;
-      this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${String(err)}` });
+      // 找不到可执行文件是最常见的配置错误，直接给出修复指引（SDK 引擎的
+      // 原始报错只说 "executable not found at ..."，用户不知道该改哪里）。
+      const raw = String(err);
+      const hint = /not found|ENOENT|no such file/i.test(raw)
+        ? `\n请检查设置 claudeChat.claudePath，或确认 \`claude\` 在 PATH 中（终端里 \`claude --version\` 能跑通）。`
+        : "";
+      this.post(ctx, { kind: "error", message: `初始化 claude 失败: ${raw}${hint}` });
       ctx.proc = undefined;
       // A brand-new tab minted this sessionId but the CLI never created the
       // session. Keeping it would make every retry `--resume <ghost>` and fail
@@ -1897,6 +1905,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** "有效上下文体量"：最后一次 /compact 边界之后的字节数。
+   *  transcript 是只追加的，压缩不会让文件变小——直接用文件大小判断"太大了"，
+   *  用户压缩完之后仍然超限，于是预热被永久关掉、"建议压缩"反复弹。
+   *  按压缩边界之后的部分衡量才反映真实上下文。 */
+  private effectiveTranscriptSize(sid: string): number {
+    const f = this.store.findFile(sid);
+    if (!f) return 0;
+    try {
+      const size = fs.statSync(f).size;
+      if (size < ChatViewProvider.PREWARM_MIN_SIZE) return size; // 小文件不必扫
+      const buf = fs.readFileSync(f);
+      const idx = buf.lastIndexOf('"subtype":"compact_boundary"');
+      if (idx < 0) return size;
+      return size - idx;
+    } catch {
+      return this.transcriptSize(sid);
+    }
+  }
+
   /** 缓存按 (会话, 模型) 记录 —— prompt cache 是按模型隔离的，切模型后同一
    *  会话的缓存对新模型而言是冷的。 */
   private warmKey(sid: string): string {
@@ -1922,8 +1949,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 从提示按钮触发的压缩：复用面板 compact 的完整链路（含看门狗保护）。 */
   private async compactSession(ctx: SessionCtx): Promise<void> {
+    // 弹窗是非模态的，用户可能过很久才点。这期间 tab 可能已经关了——给一个
+    // 谁都不持有的 ctx 起进程，就是个永远不会被回收的孤儿。
+    if (!this.alive(ctx)) {
+      vscode.window.showInformationMessage("该会话的窗口已关闭，请重新打开会话后再压缩。");
+      return;
+    }
+    if (ctx.proc?.isBusy) {
+      vscode.window.showInformationMessage("当前会话正在回复中，等这一轮结束再压缩。");
+      return;
+    }
     const proc = await this.ensureProcess(ctx);
-    if (!proc) return;
+    if (!proc) {
+      this.post(ctx, { kind: "busy", busy: false });
+      vscode.window.showErrorMessage("启动 Claude 失败，无法压缩。");
+      return;
+    }
+    if (!this.alive(ctx)) return; // 起进程期间 tab 被关掉
     this.post(ctx, { kind: "busy", busy: true });
     proc.compact();
     ctx.lastEventAt = Date.now();
@@ -1958,7 +2000,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 超大会话的预热是笔亏本买卖：实测 16.7MB 的会话预热完 1 分钟后发送，首字
     // 延迟仍有 13.4 秒（没焐上），但 token 照花。这种会话该 /compact，不该硬焐。
     const capMB = this.config().get<number>("prewarmMaxSizeMB", 12);
-    const sizeMB = this.transcriptSize(sid) / 1_000_000;
+    // 用压缩边界之后的体量：压缩过的会话不该再被判为"超大"。
+    const sizeMB = this.effectiveTranscriptSize(sid) / 1_000_000;
     if (capMB > 0 && sizeMB > capMB) {
       this.output.appendLine(
         `[prewarm] ${sid.slice(0, 8)} skipped: 会话 ${sizeMB.toFixed(1)}MB 超过预热上限 ${capMB}MB（预热成本高且收效甚微，建议 /compact 压缩上下文）`,
@@ -2245,42 +2288,81 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return path.join(os.homedir(), ".claude-chat", "qq-bot.lock");
   }
 
-  /** 抢锁：没人占、锁过期、或本来就是自己的，都算抢到。 */
-  private acquireQQLock(): boolean {
-    const file = this.qqLockFile();
+  /** 读当前锁持有者。文件不存在/损坏都返回 undefined。 */
+  private readQQLock(): { owner?: string; at?: number } | undefined {
     try {
-      fs.mkdirSync(path.dirname(file), { recursive: true });
-      let cur: { owner?: string; at?: number } | undefined;
-      try {
-        cur = JSON.parse(fs.readFileSync(file, "utf8"));
-      } catch {
-        cur = undefined; // 没有锁文件或内容损坏
-      }
-      const fresh = cur?.at && Date.now() - cur.at < ChatViewProvider.QQ_LOCK_TTL;
-      if (fresh && cur?.owner !== this.qqLockOwner) return false; // 别的窗口正持有
-      fs.writeFileSync(file, JSON.stringify({ owner: this.qqLockOwner, at: Date.now() }), "utf8");
-      this.qqHoldsLock = true;
-      return true;
+      return JSON.parse(fs.readFileSync(this.qqLockFile(), "utf8"));
     } catch {
-      return true; // 锁机制本身出问题时不阻断功能（单窗口是常态）
+      return undefined;
     }
   }
 
-  private renewQQLock(): void {
-    if (!this.qqHoldsLock) return;
+  /** 写锁文件。用 tmp+rename 保证原子，避免别的窗口读到写了一半的内容
+   *  （truncate 后、写入前那一瞬读到空文件，会被当成"没人持锁"）。 */
+  private writeQQLock(): boolean {
+    const file = this.qqLockFile();
+    const tmp = `${file}.${process.pid}.tmp`;
     try {
-      fs.writeFileSync(this.qqLockFile(), JSON.stringify({ owner: this.qqLockOwner, at: Date.now() }), "utf8");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(tmp, JSON.stringify({ owner: this.qqLockOwner, at: Date.now() }), "utf8");
+      fs.renameSync(tmp, file);
+      return true;
     } catch {
-      /* ignore */
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* ignore */
+      }
+      return false;
     }
+  }
+
+  /** 抢锁：没人占、锁过期、或本来就是自己的，都算抢到。
+   *  抢到后再回读校验一次——两个窗口同时判定"锁已过期"并各自写入时，
+   *  只有最后写成功的那个才算数，另一个必须认输（否则两个 bot 并存）。 */
+  private acquireQQLock(): boolean {
+    try {
+      const cur = this.readQQLock();
+      const fresh = cur?.at && Date.now() - cur.at < ChatViewProvider.QQ_LOCK_TTL;
+      if (fresh && cur?.owner !== this.qqLockOwner) return false; // 别的窗口正持有
+      if (!this.writeQQLock()) {
+        // 写不进去（权限/磁盘）：不能假装持有——那样永远不会续期，90 秒后
+        // 别的窗口会接管，形成双 bot。宁可本窗口不上线。
+        this.qqHoldsLock = false;
+        this.output.appendLine(`[${new Date().toISOString()}] [qq] 锁文件写入失败，本窗口不启动机器人`);
+        return false;
+      }
+      // 回读确认：并发抢锁时以最终落盘的 owner 为准。
+      if (this.readQQLock()?.owner !== this.qqLockOwner) {
+        this.qqHoldsLock = false;
+        return false;
+      }
+      this.qqHoldsLock = true;
+      return true;
+    } catch {
+      this.qqHoldsLock = false;
+      return false;
+    }
+  }
+
+  /** 续期。续期前先确认锁还是自己的——宿主被长时间阻塞（合盖、超大会话渲染）
+   *  超过 TTL 后别的窗口会合法接管，这时必须让位，而不是把 owner 盖回来
+   *  （盖回去就成了两个 bot 互相覆盖、永不收敛）。返回 false = 已失去锁。 */
+  private renewQQLock(): boolean {
+    if (!this.qqHoldsLock) return false;
+    const cur = this.readQQLock();
+    if (cur?.owner && cur.owner !== this.qqLockOwner) {
+      this.qqHoldsLock = false;
+      return false;
+    }
+    return this.writeQQLock();
   }
 
   private releaseQQLock(): void {
     if (!this.qqHoldsLock) return;
     this.qqHoldsLock = false;
     try {
-      const cur = JSON.parse(fs.readFileSync(this.qqLockFile(), "utf8"));
-      if (cur?.owner === this.qqLockOwner) fs.unlinkSync(this.qqLockFile());
+      if (this.readQQLock()?.owner === this.qqLockOwner) fs.unlinkSync(this.qqLockFile());
     } catch {
       /* ignore */
     }
@@ -2292,10 +2374,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.qqLockTimer = setInterval(() => {
       try {
         if (this.qqBot) {
-          this.renewQQLock();
+          // 续期失败 = 锁已被别人接管（本窗口卡了太久）。主动下线，避免双 bot。
+          if (!this.renewQQLock()) {
+            this.output.appendLine(`[${new Date().toISOString()}] [qq] 锁已被其它窗口接管，本窗口停止机器人`);
+            this.stopQQBot();
+            this.setQQState("offline", "另一个 VS Code 窗口已接管机器人");
+          }
           return;
         }
         if (!this.qqStored().enabled) return;
+        // 没配好就别去抢锁：抢了也起不来，白白把持锁窗口的锁删掉一瞬间。
+        if (!this.qqStored().appId) return;
         if (this.acquireQQLock()) {
           this.output.appendLine(`[${new Date().toISOString()}] [qq] 接管机器人（原持有窗口已退出）`);
           void this.startQQBot();
@@ -2333,17 +2422,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private qqStartSeq = 0;
 
   private async startQQBot(): Promise<void> {
-    this.stopQQBot(); // 重连前先拆掉旧连接
+    // 注意：先读配置、再拆旧连接。反过来的话 stopQQBot 会先把锁删掉，而读
+    // SecretStorage 是异步的（keychain 可能几百毫秒）——这段真空期里别的窗口
+    // 会抢到锁，机器人就莫名其妙搬到了用户没操作的那个窗口。
     const seq = ++this.qqStartSeq;
     const cfg = this.qqStored();
     const secret = (await this.context.secrets.get(ChatViewProvider.QQ_SECRET_KEY)) ?? "";
     if (seq !== this.qqStartSeq) return; // await 期间被 stop / 新 start 作废
     const allowed = cfg.allowed.split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
     if (!cfg.appId || !secret) {
+      this.stopQQBot();
       this.setQQState("offline", "缺少 AppID / AppSecret");
       this.qqPanel?.webview.postMessage({ kind: "qq_result", ok: false, message: "请先填写 AppID 和 AppSecret 并保存" } satisfies ToWebview);
       return;
     }
+    // 配置齐全，现在才拆旧连接（此时若本窗口持锁，锁会被释放又立刻抢回）。
+    const heldLock = this.qqHoldsLock;
+    this.stopQQBot();
+    if (heldLock) this.acquireQQLock(); // 本来就是自己的锁，立即抢回，不给真空期
     // 跨窗口单实例：抢不到锁说明另一个 VS Code 窗口已经在跑机器人了，本窗口
     // 不再连接（否则同一条消息会被两个窗口各跑一遍、回两次）。
     this.ensureQQLockTimer();
@@ -3513,12 +3609,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       { location: vscode.ProgressLocation.Window, title: `定位 ${name}…` },
       async () => {
         const lt = Date.now();
-        // 只有"可用性未知 + 扩展刚起不久"才可能是冷启动，才值得重试等待。
-        const mayBeCold = this.lspSymbolUsable === undefined && Date.now() - this.bootAt < 60_000;
-        const tries = mayBeCold ? 3 : 1;
+        // 冷启动重试的适用条件：索引可用性还未知。Java/Kotlin 大仓的语言服务
+        // 常要 30s~2min 才建好索引，用"扩展启动 60 秒内"卡窗口会把冷启动期
+        // 排除在外，等于退回了"第一次点击掉进搜索面板"的老问题——所以只看
+        // 可用性未知，并给足退避预算（累计 ~3s，与旧实现一致）。
+        const mayBeCold = this.lspSymbolUsable === undefined;
+        const tries = mayBeCold ? 4 : 1;
         try {
           for (let attempt = 0; attempt < tries; attempt++) {
-            if (attempt) await new Promise((r) => setTimeout(r, 400));
+            if (attempt) await new Promise((r) => setTimeout(r, 500 + attempt * 500));
             let syms: vscode.SymbolInformation[];
             try {
               syms =
@@ -3593,7 +3692,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       /* ignore */
     }
     // 4) Last resort: open the Search panel pre-filled.
-    this.noteLspMiss(); // 到这一步说明 LSP 也没帮上忙，同样计入"索引不可用"的证据
+    // 注意：这里"什么都没找到"不能计入 LSP 不可用的证据——符号本来就不存在
+    // （模型编的名字）时也会走到这，误判会把装了语言服务的工作区也降级掉。
+    // 只有"我们自己找到了、LSP 没找到"（前两个分支）才是索引不管用的实锤。
     done("找不到→搜索面板");
     try {
       await vscode.commands.executeCommand("workbench.action.findInFiles", {

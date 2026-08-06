@@ -56,8 +56,8 @@ code --install-extension claude-chat-*.vsix --force
 
 - 日志固定在 **`~/.claude-chat/logs/`**（按天分文件，保留 7 天）。命令面板运行
   `Claude: 打开日志文件夹` 可直接打开；反馈问题时把当天的 `.log` 发出来即可。
-- 若怀疑是新的对接引擎导致，设置里把 **`claudeChat.engine`** 从 `sdk` 切回
-  `stream-json`，重开会话即恢复旧链路（两条链路功能等价）。
+- 确认 `claude` CLI 本身正常：终端里跑 `claude --version`、随便对话一句。插件的
+  所有请求都由这个本地 CLI 发出，它不通插件必然不通。
 
 ## 卸载
 

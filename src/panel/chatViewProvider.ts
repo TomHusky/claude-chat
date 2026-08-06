@@ -5,8 +5,7 @@ import * as fs from "node:fs";
 import * as https from "node:https";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { PermissionRequest } from "../claude/process";
-import { createClaudeProcess, EngineProcess } from "../claude/engine";
+import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager } from "../checkpoints";
 import { ChangedFile, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, QQConfig, SlsConfig, ToWebview } from "../shared";
@@ -25,8 +24,8 @@ interface SessionCtx {
   panel: vscode.WebviewPanel;
   webview: vscode.Webview;
   sessionId?: string; // undefined until the first turn creates one
-  proc?: EngineProcess;
-  starting?: Promise<EngineProcess | undefined>;
+  proc?: ClaudeProcess;
+  starting?: Promise<ClaudeProcess | undefined>;
   checkpoints: CheckpointManager;
   /** Selection added while the webview was still loading — replayed as a
    *  visible chip on ready. NEVER silently attached at send time: what the
@@ -149,13 +148,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // 4 次，每次都是一份完整上下文的 input token。这是"莫名其妙很费 token"的真凶。
   private readonly prewarmStarted = new PrewarmLedger("s"); // warmKey -> ts (dedupe in-flight)
   private readonly prewarmDone = new PrewarmLedger("d"); // warmKey -> ts of last completed warm
-  private prewarmProc?: EngineProcess; // at most one warm-up runs at a time (they're token-expensive)
+  private prewarmProc?: ClaudeProcess; // at most one warm-up runs at a time (they're token-expensive)
   private usageTimer?: ReturnType<typeof setInterval>; // 用量胶囊定时刷新（不然要点开菜单才更新）
   private watchdogTimer?: ReturnType<typeof setInterval>; // webview 通道半死检测 + 自愈
   private sidebarMissedPings = 0; // 侧边栏的看门狗计数（它不在 sessions 里）
   // -- QQ 开放平台机器人（远程操控，专用后台会话）--
   private qqBot?: QQBot;
-  private qqProc?: EngineProcess; // 机器人专用的 Claude 进程（与聊天 tab 完全隔离）
+  private qqProc?: ClaudeProcess; // 机器人专用的 Claude 进程（与聊天 tab 完全隔离）
   private qqSessionId?: string;
   private qqState: QQState = "offline";
   /** QQ 配置的独立 webview 面板——与侧边栏零耦合，坏也只坏它自己。 */
@@ -1263,9 +1262,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.refreshSessions();
           this.postUpdateDot();
           break;
-        case "listCheckpoints":
-          this.post(ctx, { kind: "checkpoints", list: ctx.checkpoints.list() });
-          break;
         case "restoreCheckpoint":
           await this.restoreCheckpoint(ctx, m.checkpointId);
           break;
@@ -1609,8 +1605,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Every live process (all tabs + background runs) — the settings below are
    *  global, so applying them to only the current tab left other tabs on the
    *  old mode, still asking for permissions the user thought they'd disabled. */
-  private allProcs(): EngineProcess[] {
-    const out: EngineProcess[] = [];
+  private allProcs(): ClaudeProcess[] {
+    const out: ClaudeProcess[] = [];
     for (const c of this.sessions) if (c.proc) out.push(c.proc);
     for (const c of this.detached.values()) if (c.proc) out.push(c.proc);
     return out;
@@ -1818,10 +1814,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   // -- Process management --------------------------------------------------
 
-  private ensureProcess(ctx: SessionCtx): Promise<EngineProcess | undefined> {
+  private ensureProcess(ctx: SessionCtx): Promise<ClaudeProcess | undefined> {
     // `starting` first: spawnProcess assigns ctx.proc BEFORE the initialize
-    // handshake finishes, and sendUserMessage on an uninitialized proc silently
-    // drops the message. Wait for the in-flight start instead.
+    // handshake finishes, and sendUserMessage on an uninitialized proc rejects
+    // the send (returns false). Wait for the in-flight start instead.
     if (ctx.starting) return ctx.starting;
     // A dead process must never be handed to a sender — sends would be dropped
     // and the UI spins forever. Discard and respawn (with --resume) instead.
@@ -1836,14 +1832,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return ctx.starting;
   }
 
-  private async spawnProcess(ctx: SessionCtx): Promise<EngineProcess | undefined> {
+  private async spawnProcess(ctx: SessionCtx): Promise<ClaudeProcess | undefined> {
     const isResume = !!ctx.sessionId;
     const sessionId = ctx.sessionId ?? randomUUID();
     if (!isResume) {
       ctx.sessionId = sessionId;
       ctx.checkpoints.setSession(sessionId);
     }
-    const proc = createClaudeProcess(
+    const proc = new ClaudeProcess(
       {
         claudePath: this.config().get<string>("claudePath", "claude"),
         cwd: this.cwd(),
@@ -2083,7 +2079,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     };
     // 系统提示/历史前缀必须与 spawnProcess 完全一致 —— 缓存按前缀精确匹配。
     // effort 是请求级参数、不进缓存前缀，预热用 low 省 token（不用思考半天）。
-    const proc = createClaudeProcess(
+    const proc = new ClaudeProcess(
       {
         claudePath: this.config().get<string>("claudePath", "claude"),
         cwd: this.cwd(),
@@ -2117,7 +2113,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   // -- QQ 开放平台机器人 ----------------------------------------------------
-  // 远程操控：QQ 消息 -> 专用后台 EngineProcess -> 回复发回 QQ。刻意不复用
+  // 远程操控：QQ 消息 -> 专用后台 ClaudeProcess -> 回复发回 QQ。刻意不复用
   // SessionCtx（它强依赖 panel），这样完全不干扰用户在 VS Code 里开的 tab；
   // 这个会话是真实 transcript，仍会出现在侧边栏列表里可点开查看。
 
@@ -2946,13 +2942,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** 机器人专用进程。权限模式取配置；工具请求自动放行——远程没有弹窗可确认，
    *  不放行就会永久卡住（所以白名单是这套东西唯一的安全边界）。 */
-  private async ensureQQProcess(): Promise<EngineProcess | undefined> {
+  private async ensureQQProcess(): Promise<ClaudeProcess | undefined> {
     if (this.qqProc && !this.qqProc.isExited) return this.qqProc;
     const stored = this.context.globalState.get<string>(ChatViewProvider.QQ_SESSION_KEY);
     const resume = stored && this.store.findFile(stored) ? stored : undefined;
     const sid = resume ?? randomUUID();
     this.qqSessionId = sid;
-    const proc = createClaudeProcess(
+    const proc = new ClaudeProcess(
       {
         claudePath: this.config().get<string>("claudePath", "claude"),
         cwd: this.cwd(),
@@ -3331,7 +3327,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private onProcessClose(ctx: SessionCtx, code: number | null, proc: EngineProcess): void {
+  private onProcessClose(ctx: SessionCtx, code: number | null, proc: ClaudeProcess): void {
     this.output.appendLine(`[claude] process closed (code ${code})`);
     if (ctx.proc !== proc) return; // stale process, already replaced
     ctx.proc = undefined; // next send respawns with --resume to keep context

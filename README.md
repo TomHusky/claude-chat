@@ -53,7 +53,6 @@ code --install-extension release/claude-chat.vsix --force
 
 | 配置 | 说明 | 默认 |
 | --- | --- | --- |
-| `claudeChat.engine` | 对接引擎：`sdk`（官方 Agent SDK）/ `stream-json`（自维护协议层，回退用） | `sdk` |
 | `claudeChat.claudePath` | `claude` 可执行文件路径（不在 PATH 时填绝对路径） | `claude` |
 | `claudeChat.model` | 模型（`opus` / `sonnet` / `fable` 或完整 id），留空用 CLI 默认 | `""` |
 | `claudeChat.permissionMode` | 新会话的初始权限模式 | `default` |
@@ -75,19 +74,19 @@ code --install-extension release/claude-chat.vsix --force
 
 ## 工作原理
 
-### 对接引擎
+### 与 claude CLI 的对接
 
-插件为每个会话维护**一个长驻的 `claude` 子进程**（这也是官方 Agent SDK 推荐的 streaming input 形态）。自 0.1.235 起默认走**官方 SDK**：
+插件为每个会话维护**一个长驻的 `claude` 子进程**，通过官方
+[`@anthropic-ai/claude-agent-sdk`](https://code.claude.com/docs/en/agent-sdk/typescript)
+的 streaming input mode 驱动 —— 这是官方推荐的集成形态，官方 VS Code 扩展亦然。
 
-```
-claudeChat.engine = "sdk"          ← 默认。@anthropic-ai/claude-agent-sdk
-claudeChat.engine = "stream-json"  ← 回退开关。自维护的协议解析
-```
+- **启动**：用官方 `startup()` / `WarmQuery` 先 spawn 子进程并完成 initialize 握手，再挂上消息流。（直接 `query()` 会把 spawn 推迟到第一条消息，预启动就失去意义。）
+- **权限**：`canUseTool` 回调 → 界面待确认区 → 用户点击后 resolve 挂起的 Promise。
+- **中断 / 切模型 / 切权限模式**：`Query` 对象的原生方法，进程保留不杀，中断后可继续对话。
+- **鉴权计费**：SDK 驱动的是你本机已登录的 `claude` CLI，与你自己在终端里敲 `claude` 完全一致，插件不接触任何凭据。
 
-- **sdk**：用官方 `startup()` 预热子进程并完成 initialize 握手，再挂上 `AsyncIterable` 消息流；权限走 `canUseTool` 回调，中断/切模型/切权限模式走 `Query` 的原生方法。协议层由官方维护，CLI 升级不再担心协议漂移。
-- **stream-json**：自己 spawn `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio` 并逐行解析。作为回退保留，SDK 稳定后将移除。
-
-两个引擎产生完全相同的界面事件序列，可随时切换（对新启动的进程生效）。
+协议层由官方维护，CLI 升级不必再追协议变化。（0.1.238 之前另有一套自维护的
+stream-json 解析实现，SDK 稳定后已整体移除。）
 
 ### 会话与还原点
 
@@ -111,10 +110,7 @@ src/
   extension.ts            激活入口，注册视图与命令，日志双写
   shared.ts               扩展 <-> webview 的消息契约（无运行时依赖）
   claude/
-    engine.ts             引擎工厂：按 claudeChat.engine 选实现
-    sdkProcess.ts         SdkClaudeProcess：官方 Agent SDK 对接（默认）
-    process.ts            ClaudeProcess：自维护 stream-json 协议层（回退）
-    protocol.ts           stream-json / 控制协议的类型定义
+    process.ts            ClaudeProcess：官方 Agent SDK 对接（进程、事件翻译、权限）
     session.ts            SessionStore：读写 CLI 的 .jsonl 会话记录
   checkpoints.ts          CheckpointManager：文件快照与还原点
   panel/

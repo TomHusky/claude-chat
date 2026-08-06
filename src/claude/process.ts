@@ -1,19 +1,7 @@
-import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+// SDK 是 ESM-only：类型走 import type（编译期擦除），运行时在 start() 里动态
+// import（esbuild 打包时会内联进 bundle，宿主侧无需真实 ESM 解析）。
+import type { Options, Query, PermissionResult, SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { randomUUID } from "node:crypto";
-import * as readline from "node:readline";
-import {
-  AssistantEvent,
-  ContentBlock,
-  ControlRequest,
-  isCanUseTool,
-  OutEvent,
-  PermissionDecision,
-  RateLimitEvent,
-  ResultEvent,
-  StreamEvent,
-  SystemInitEvent,
-  ToolUseBlock,
-} from "./protocol";
 import { contextWindowFor, PermissionSuggestionView, ToWebview } from "../shared";
 
 export interface ClaudeProcessOptions {
@@ -63,31 +51,47 @@ export interface ClaudeProcessHooks {
 }
 
 /**
- * Drives a single long-lived `claude` CLI process in bidirectional
- * stream-json mode. One instance == one chat session.
+ * 驱动一个长驻的 `claude` CLI 子进程 —— 一个实例 == 一个会话。
+ *
+ * 走官方 @anthropic-ai/claude-agent-sdk 的 streaming input mode（官方推荐形态，
+ * 官方 VSCode 扩展亦然）：协议解析、控制通道、权限往返都由官方维护，CLI 升级
+ * 不必再追协议变化。
+ *   - 启动：startup()/WarmQuery 先 spawn + 完成 initialize 握手，再挂上消息流；
+ *     直接 query() 会把 spawn 推迟到第一条消息，prespawn/预热就失去意义。
+ *   - 权限：options.canUseTool 回调 -> hooks.onPermission -> UI -> respondPermission
+ *     resolve 挂起的 Promise。
+ *   - 中断/切模型/切权限模式：Query 对象的原生方法（进程保留，不杀）。
+ *
+ * 事件出口统一是 hooks.emit(ToWebview)，webview 侧不感知底层实现。
  */
 export class ClaudeProcess {
-  private proc?: ChildProcessWithoutNullStreams;
-  private rl?: readline.Interface;
+  private q?: Query;
+  private readonly input = new AsyncQueue<SDKUserMessage>();
+  private readonly abort = new AbortController();
   private exited = false;
-  private readonly pendingControl = new Map<string, { resolve: (resp: unknown) => void; reject: (err: Error) => void }>();
-  /** Per pending can_use_tool ask: the original input (echoed back on allow)
-   *  plus the CLI's RAW permission suggestions — echoing a chosen suggestion in
-   *  `updatedPermissions` is what makes "总是允许" actually persist. */
-  private readonly pendingPermissions = new Map<string, { input: Record<string, unknown>; suggestions: unknown[] }>();
-  private sessionId?: string;
-  private initialized = false;
   private disposed = false;
-  private currentBlockType?: "text" | "thinking" | "tool_use";
-  private currentToolId?: string; // tool_use block currently streaming its input JSON
-  private currentToolName?: string;
-  private currentToolJson = ""; // accumulated partial input JSON for the live tool
-  private currentModel?: string; // model id from the init event (for context window)
+  private initialized = false;
+  private sessionId?: string;
   private busy = false;
-  private pendingMode?: string; // mode change requested before the handshake finished
-  private pendingModel?: string; // model change requested before the handshake finished
+  private currentModel?: string;
+  private currentToolId?: string;
+  private currentToolName?: string;
+  private currentToolJson = "";
   private readonly seenToolIds = new Set<string>();
+  private lastRateLimitLevel?: "warning" | "exhausted";
   private stderrTail = "";
+  /** 消息循环结束的信号（disposeAndWait 用）。 */
+  private closedPromise?: Promise<void>;
+  /** start() 整体完成（或失败）的信号。disposeAndWait 必须先等它——否则在
+   *  握手期（resume 大会话要好几秒）调用会立即返回，调用方接着去删/截断
+   *  transcript，而子进程才刚起来，随后把缓冲行刷回磁盘 → 会话"删不掉"、
+   *  还原被撤销。 */
+  private startPromise?: Promise<void>;
+  /** 等待用户应答的权限请求：requestId -> resolver + 原始 input/suggestions。 */
+  private readonly pendingPermissions = new Map<
+    string,
+    { resolve: (r: PermissionResult) => void; input: Record<string, unknown>; suggestions: unknown[] }
+  >();
 
   constructor(
     private readonly opts: ClaudeProcessOptions,
@@ -102,125 +106,189 @@ export class ClaudeProcess {
     return this.busy;
   }
 
-  /** CLI 进程是否已退出——退出后的实例不可再发送，调用方应丢弃并重建。 */
   get isExited(): boolean {
     return this.exited;
   }
 
-  /** Spawn the CLI and perform the initialize handshake. */
+  /** 启动 SDK 会话。注意：直接 query() 会把 spawn 推迟到第一条消息（实测 init
+   *  在首条消息之后才到）——那样 prespawn/预热就失去意义，start() 也会干等超时。
+   *  官方为此提供 startup()/WarmQuery：先 spawn + 完成 initialize 握手再挂 prompt。 */
   async start(): Promise<void> {
-    const args = this.buildArgs();
-    this.proc = spawn(this.opts.claudePath, args, {
-      cwd: this.opts.cwd,
-      // Identify as the VS Code entrypoint (not "sdk-cli") so the sessions we
-      // create show up in the official Claude extension's session list, which
-      // filters out headless/SDK sessions.
-      env: { ...process.env, CLAUDE_CODE_ENTRYPOINT: "claude-vscode", ...this.opts.env },
-      stdio: ["pipe", "pipe", "pipe"],
-    }) as ChildProcessWithoutNullStreams;
+    const p = this.startInner();
+    // 记下来给 disposeAndWait 等；这里不 catch，异常照常抛给调用方。
+    this.startPromise = p.then(
+      () => undefined,
+      () => undefined,
+    );
+    return p;
+  }
 
-    this.proc.on("error", (err) => {
-      this.hooks.emit({
-        kind: "error",
-        message:
-          `无法启动 claude CLI (${this.opts.claudePath}): ${err.message}。` +
-          ` 请检查 设置 claudeChat.claudePath，或确认 \`claude\` 在 PATH 中。`,
-      });
-      // spawn 本身失败（如 claudePath 配错的 ENOENT，pid 为空）不会再有 'close'
-      // 事件——不在这收尾的话 initialize 控制请求要干等满 30s 超时，期间
-      // spinner 一直转，最后还多弹一条"control_request timed out"。
-      if (this.proc?.pid === undefined && !this.exited) {
-        this.exited = true;
-        for (const [, pending] of this.pendingControl) pending.reject(new Error(`无法启动 claude CLI: ${err.message}`));
-        this.pendingControl.clear();
-        this.setBusy(false);
-        if (!this.disposed) this.hooks.onClose(null);
-      }
-    });
-
-    // Without a listener, an async EPIPE on stdin (CLI died mid-write) is an
-    // uncaught exception that takes down the whole extension host.
-    this.proc.stdin.on("error", () => undefined);
-
-    this.rl = readline.createInterface({ input: this.proc.stdout });
-    this.rl.on("line", (line) => this.onLine(line));
-
-    this.proc.stderr.on("data", (d: Buffer) => {
-      // Keep only the tail — the CLI is chatty and the buffer must not grow forever.
-      this.stderrTail = (this.stderrTail + d.toString()).slice(-4096);
-    });
-
-    this.proc.on("close", (code) => {
+  private async startInner(): Promise<void> {
+    try {
+      await this.startInnerUnsafe();
+    } catch (err) {
+      // 没起来的实例必须自称已退出，否则调用方拿它当活对象用（发消息、等退出）
+      // 会静默失败。
       this.exited = true;
-      // Unblock anyone awaiting the control channel (initialize/interrupt/…):
-      // the process is gone, no response will ever come. Without this, start()
-      // hangs for the full 30s timeout when the CLI dies during the handshake.
-      for (const [, pending] of this.pendingControl) pending.reject(new Error("claude 进程已退出"));
-      this.pendingControl.clear();
-      if (this.disposed) return; // intentional shutdown — don't disturb the ctx (a new proc may be live)
-      // Close out any permission dialogs still on screen — no answer will come.
-      for (const requestId of [...this.pendingPermissions.keys()]) {
-        this.pendingPermissions.delete(requestId);
-        this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
-      }
-      if (code && code !== 0 && this.stderrTail.trim()) {
-        this.hooks.emit({ kind: "error", message: `claude 进程退出 (code ${code}): ${this.stderrTail.trim().slice(0, 800)}` });
-      }
-      this.setBusy(false);
-      this.hooks.onClose(code);
-    });
+      throw err;
+    }
+  }
 
-    // Handshake: must complete before sending user turns, and it is what
-    // enables `can_use_tool` permission prompts over the control channel.
-    await this.sendControlRequest({ subtype: "initialize" });
+  private async startInnerUnsafe(): Promise<void> {
+    const { startup } = await import("@anthropic-ai/claude-agent-sdk");
+    const options: Options = {
+      pathToClaudeCodeExecutable: this.resolveCli(),
+      cwd: this.opts.cwd,
+      includePartialMessages: true,
+      permissionMode: (this.opts.permissionMode || "default") as Options["permissionMode"],
+      model: this.opts.model || undefined,
+      effort: (this.opts.effort || undefined) as Options["effort"],
+      resume: this.opts.resumeSessionId,
+      sessionId: this.opts.resumeSessionId ? undefined : this.opts.sessionId,
+      forkSession: this.opts.forkNoPersist ? true : undefined,
+      persistSession: this.opts.forkNoPersist ? false : undefined,
+      maxTurns: this.opts.maxTurns,
+      additionalDirectories: this.opts.addDirs,
+      // 必须显式指定 preset：省略 systemPrompt 时 SDK 会下发 `systemPrompt: [""]`，
+      // CLI 据此认为"调用方自定义了系统提示"，于是**根本不构建 Claude Code 的
+      // 默认系统提示**——模型会失去工具使用规范/身份/输出风格，且不报错。
+      // （已用假 CLI 抓包实证：省略时 initialize 报文里就是 systemPrompt:[""]。）
+      systemPrompt: {
+        type: "preset",
+        preset: "claude_code",
+        ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
+      },
+      abortController: this.abort,
+      stderr: (d) => {
+        this.stderrTail = (this.stderrTail + d).slice(-4096);
+      },
+      // 标识为 VSCode 入口，让会话出现在官方 Claude 插件的会话列表里。
+      env: { ...(process.env as Record<string, string>), CLAUDE_CODE_ENTRYPOINT: "claude-vscode", ...(this.opts.env as Record<string, string> | undefined) },
+      canUseTool: (toolName, input, extra) => this.onCanUseTool(toolName, input, extra),
+    };
+
+    // spawn + initialize 握手（失败会抛异常，由 spawnProcess 的 catch 兜住）。
+    const warm = await startup({ options, initializeTimeoutMs: 30_000 });
+    // 无论是否已被 dispose，都挂上消息流：只有这样才有一个"能等到子进程真死"
+    // 的 closedPromise。warm.close() 是 void，等不到任何东西——删会话/还原点
+    // 回退正需要等它，否则垂死的 CLI 会把缓冲行刷回刚被截断的 transcript。
+    // （handleMessage 入口有 disposed 守卫，这条路径不会碰 UI。）
+    this.q = warm.query(this.input);
+    this.startMessageLoop();
+    if (this.disposed) throw new Error("已在启动期间被丢弃");
     this.initialized = true;
-    // A mode change arrived mid-handshake — apply it now, or this process keeps
-    // running the mode it was spawned with while the picker says otherwise.
-    if (this.pendingMode) {
+    // 握手期间攒下的模式/模型切换现在补上（失败不致命，保持 spawn 时的值）。
+    if (this.pendingMode !== undefined) {
       const mode = this.pendingMode;
       this.pendingMode = undefined;
-      try { await this.setPermissionMode(mode); } catch { /* keep the spawned mode */ }
+      // init 事件是缓冲后才被消息循环取出的，那时 pendingMode 已清空——单独记
+      // 一份给 handleSystem 用，否则界面上的权限模式选择器会被打回 spawn 时的旧值。
+      this.modeOverride = mode;
+      try {
+        await this.q.setPermissionMode(mode as Parameters<Query["setPermissionMode"]>[0]);
+      } catch {
+        /* keep spawn mode */
+      }
     }
     if (this.pendingModel !== undefined) {
       const model = this.pendingModel;
       this.pendingModel = undefined;
-      try { await this.setModel(model); } catch { /* keep the spawned model */ }
+      try {
+        await this.q.setModel(model || undefined);
+      } catch {
+        /* keep spawn model */
+      }
     }
+
   }
 
-  private buildArgs(): string[] {
-    const a: string[] = [
-      "-p",
-      "--input-format",
-      "stream-json",
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--include-partial-messages",
-      "--permission-prompt-tool",
-      "stdio",
-      "--permission-mode",
-      this.opts.permissionMode || "default",
-    ];
-    if (this.opts.model) a.push("--model", this.opts.model);
-    if (this.opts.effort) a.push("--effort", this.opts.effort);
-    if (this.opts.resumeSessionId) a.push("--resume", this.opts.resumeSessionId);
-    else if (this.opts.sessionId) a.push("--session-id", this.opts.sessionId);
-    if (this.opts.forkNoPersist) a.push("--fork-session", "--no-session-persistence");
-    if (this.opts.maxTurns) a.push("--max-turns", String(this.opts.maxTurns));
-    for (const dir of this.opts.addDirs ?? []) a.push("--add-dir", dir);
-    if (this.opts.appendSystemPrompt) a.push("--append-system-prompt", this.opts.appendSystemPrompt);
-    return a;
+  /** 消息循环常驻后台。 */
+  private startMessageLoop(): void {
+    this.closedPromise = (async () => {
+      let code: number | null = 0;
+      try {
+        for await (const m of this.q!) {
+          this.handleMessage(m as Record<string, unknown>);
+        }
+      } catch (err) {
+        code = 1;
+        if (!this.disposed) {
+          const msg = String((err as Error)?.message ?? err);
+          this.hooks.emit({ kind: "error", message: `claude 会话异常退出: ${msg}${this.stderrTail ? `\n${this.stderrTail.slice(-800)}` : ""}` });
+        }
+      } finally {
+        this.exited = true;
+        // 挂起的 canUseTool Promise 必须 resolve，否则连同闭包永久悬挂。
+        const pending = [...this.pendingPermissions.entries()];
+        this.pendingPermissions.clear();
+        for (const [, p] of pending) {
+          try {
+            p.resolve({ behavior: "deny", message: "进程已退出。", interrupt: false });
+          } catch {
+            /* ignore */
+          }
+        }
+        // 主动 dispose 的进程不得再碰 UI：此时 ctx 上很可能已经挂了新进程
+        // （/clear、切 effort 都是"先 dispose 再立刻建新的"），旧进程迟到的
+        // busy:false / permission_resolved 会把新进程的转圈和权限弹窗掐掉。
+
+        if (this.disposed) return;
+        for (const [requestId] of pending) {
+          this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
+        }
+        this.setBusy(false);
+        this.hooks.onClose(code);
+      }
+    })();
   }
 
-  // -- Sending -------------------------------------------------------------
+  /** SDK 不做 PATH 查找（实测裸 "claude" 会报 Native CLI binary not found）——
+   *  裸命令名要先解析成真实路径。结果按进程缓存，日常只付一次。 */
+  private resolveCli(): string {
+    const p = this.opts.claudePath || "claude";
+    if (p.includes("/") || p.includes("\\")) return p; // 已是路径
+    if (process.platform === "win32") {
+      if (ClaudeProcess.cliPathCache?.name === p) return ClaudeProcess.cliPathCache.path;
+      let resolved = p;
+      try {
+        const { execSync } = require("node:child_process") as typeof import("node:child_process");
+        const out = execSync(`where ${p}`, { encoding: "utf8", timeout: 3000 }).trim();
+        if (out) resolved = out.split(/\r?\n/)[0];
+      } catch {
+        /* 交给 SDK 自己去试 */
+      }
+      ClaudeProcess.cliPathCache = { name: p, path: resolved };
+      return resolved;
+    }
+    if (ClaudeProcess.cliPathCache?.name === p) return ClaudeProcess.cliPathCache.path;
+    let resolved = p;
+    try {
+      const { execSync } = require("node:child_process") as typeof import("node:child_process");
+      const out = execSync(`command -v ${JSON.stringify(p)}`, { encoding: "utf8", shell: "/bin/zsh", timeout: 3000 }).trim();
+      if (out) resolved = out.split("\n")[0];
+    } catch {
+      // which 失败就试常见安装位置
+      const os = require("node:os") as typeof import("node:os");
+      const fs = require("node:fs") as typeof import("node:fs");
+      for (const cand of [`${os.homedir()}/.local/bin/${p}`, `/opt/homebrew/bin/${p}`, `/usr/local/bin/${p}`]) {
+        if (fs.existsSync(cand)) {
+          resolved = cand;
+          break;
+        }
+      }
+    }
+    ClaudeProcess.cliPathCache = { name: p, path: resolved };
+    return resolved;
+  }
 
-  /** Send a user turn. `context` is prepended; `images` are attached as blocks.
-   *  Returns false when the process can't take input (exited / not initialized /
-   *  stdin gone) — the caller MUST surface that, or the UI spins forever on a
-   *  message that was silently dropped. */
+  private static cliPathCache?: { name: string; path: string };
+
+  // -- 发送 ----------------------------------------------------------------
+
   sendUserMessage(text: string, context?: string, images?: { mediaType: string; data: string }[]): boolean {
-    if (!this.proc || !this.initialized || this.exited || this.proc.stdin.destroyed) return false;
+    // 必须判 disposed：dispose() 只关输入流、不置 exited（要等消息循环收尾），
+    // 这中间返回 true 的话消息会被 AsyncQueue 静默吞掉，用户的消息凭空消失。
+    if (this.disposed || this.exited || !this.initialized) return false;
     const body = context ? `${context}\n\n${text}` : text;
     this.setBusy(true);
     const content: Array<Record<string, unknown>> = [];
@@ -228,296 +296,100 @@ export class ClaudeProcess {
       content.push({ type: "image", source: { type: "base64", media_type: img.mediaType, data: img.data } });
     }
     content.push({ type: "text", text: body });
-    this.write({ type: "user", message: { role: "user", content } });
+    this.pushUser(content);
     return true;
   }
 
-  /** Run `/compact`: ask the CLI to summarize and shrink the conversation
-   *  context. The CLI streams a `compacting` status, then a `compact_boundary`
-   *  system event with pre/post token counts, then a normal `result`. */
   compact(): void {
-    if (!this.proc || !this.initialized || this.exited || this.proc.stdin.destroyed) return;
+    if (this.exited || !this.initialized) return;
     this.setBusy(true);
-    this.write({ type: "user", message: { role: "user", content: [{ type: "text", text: "/compact" }] } });
+    this.pushUser([{ type: "text", text: "/compact" }]);
   }
 
-  /** Resolve a pending permission request (called by the provider). When the
-   *  user chose a suggestion ("总是允许…"), echo the CLI's raw suggestion object
-   *  in `updatedPermissions` — the CLI then applies it to the live session AND
-   *  persists it (settings), so the same ask doesn't come back forever. */
+  private pushUser(content: Array<Record<string, unknown>>): void {
+    this.input.push({
+      type: "user",
+      message: { role: "user", content },
+      parent_tool_use_id: null,
+      // 键盘输入必须显式标 human（transcript 的 origin.kind 判别依赖它）。
+      origin: { kind: "human" },
+      session_id: this.sessionId ?? "",
+    } as unknown as SDKUserMessage);
+  }
+
+  // -- 权限（canUseTool 回调 <-> UI 应答）-----------------------------------
+
+  private onCanUseTool(
+    toolName: string,
+    input: Record<string, unknown>,
+    // 注意：SDK 回调的附加字段是 camelCase（toolUseID/blockedPath/displayName），
+    // 和 stream-json 控制通道的 snake_case 不同——按 .d.ts 实际字段读。
+    extra: {
+      signal: AbortSignal;
+      suggestions?: unknown[];
+      blockedPath?: string;
+      displayName?: string;
+      description?: string;
+      toolUseID?: string;
+      requestId?: string;
+    },
+  ): Promise<PermissionResult> {
+    const requestId = extra?.requestId || `req-${randomUUID()}`;
+    return new Promise<PermissionResult>((resolve) => {
+      const suggestionsRaw = (extra?.suggestions as unknown[]) ?? [];
+      this.pendingPermissions.set(requestId, { resolve, input, suggestions: suggestionsRaw });
+      extra?.signal?.addEventListener?.("abort", () => {
+        // 轮次被中断/进程退出：撤掉 UI 上的弹窗。
+        if (this.pendingPermissions.delete(requestId)) {
+          this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "deny" });
+          resolve({ behavior: "deny", message: "已中断。", interrupt: false });
+        }
+      });
+      this.hooks.onPermission({
+        requestId,
+        toolUseId: extra?.toolUseID,
+        toolName,
+        displayName: extra?.displayName,
+        input,
+        description: extra?.description,
+        blockedPath: extra?.blockedPath,
+        suggestions: this.normalizeSuggestions(suggestionsRaw),
+      });
+    });
+  }
+
   respondPermission(requestId: string, decision: { behavior: "allow" | "deny"; message?: string; suggestionId?: string }): void {
     const pending = this.pendingPermissions.get(requestId);
     if (pending === undefined) return;
     this.pendingPermissions.delete(requestId);
-
-    let response: PermissionDecision;
     if (decision.behavior === "allow") {
-      response = { behavior: "allow", updatedInput: pending.input };
+      const result: PermissionResult = { behavior: "allow", updatedInput: pending.input };
       const m = /^sugg:(\d+)$/.exec(decision.suggestionId ?? "");
       const raw = m ? pending.suggestions[Number(m[1])] : undefined;
-      if (raw) (response as Record<string, unknown>).updatedPermissions = [raw];
+      if (raw) (result as Record<string, unknown>).updatedPermissions = [raw];
+      pending.resolve(result);
     } else {
-      response = { behavior: "deny", message: decision.message ?? "用户拒绝了此操作。", interrupt: false };
+      pending.resolve({ behavior: "deny", message: decision.message ?? "用户拒绝了此操作。", interrupt: false });
     }
-
-    this.write({
-      type: "control_response",
-      response: { subtype: "success", request_id: requestId, response },
-    });
     this.hooks.emit({ kind: "permission_resolved", requestId, behavior: decision.behavior });
   }
 
-  /** Answer an AskUserQuestion tool: echo the input plus an `answers` map
-   *  (question text -> chosen label / labels) so the CLI returns the selection. */
   answerQuestion(requestId: string, answers: Record<string, string | string[]>): void {
     const pending = this.pendingPermissions.get(requestId);
     if (pending === undefined) return;
     this.pendingPermissions.delete(requestId);
-    const response: PermissionDecision = {
-      behavior: "allow",
-      updatedInput: { ...pending.input, answers },
-    };
-    this.write({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });
+    pending.resolve({ behavior: "allow", updatedInput: { ...pending.input, answers } });
     this.hooks.emit({ kind: "permission_resolved", requestId, behavior: "allow" });
   }
 
-  /** Interrupt the current turn. */
-  async interrupt(): Promise<void> {
-    if (!this.proc) return;
-    // Clear the busy UI up front so Stop always feels instant — even if the
-    // control request is slow to come back (e.g. fired during init or a
-    // non-streaming phase). Waiting on the round-trip first made Stop look dead.
-    this.setBusy(false);
-    // Deny any in-flight permission asks so the turn can unwind cleanly.
-    for (const requestId of [...this.pendingPermissions.keys()]) {
-      this.respondPermission(requestId, { behavior: "deny", message: "已中断。" });
-    }
-    try {
-      await this.sendControlRequest({ subtype: "interrupt" });
-    } catch {
-      /* best effort */
-    }
-  }
-
-  async setPermissionMode(mode: string): Promise<void> {
-    if (!this.proc || this.exited) return;
-    if (!this.initialized) {
-      // Spawned with the old mode but still handshaking: a control request now
-      // would wait out the 30s timeout. Remember it and apply after initialize.
-      this.pendingMode = mode;
-      return;
-    }
-    // Let rejections propagate — swallowing them made a refused mode switch look
-    // like success while the process kept asking for every permission.
-    await this.sendControlRequest({ subtype: "set_permission_mode", mode });
-  }
-
-  /** Hot-swap the model on the running process — the same control request the
-   *  official extension uses. Avoids tearing the process down and paying a full
-   *  `--resume` transcript reload on the next message. `model === ""` means the
-   *  user picked "默认", which maps to the CLI's own default (model: null). */
-  async setModel(model: string): Promise<void> {
-    if (!this.proc || this.exited) return;
-    if (!this.initialized) {
-      // Mid-handshake: a control request now would wait out the 30s timeout.
-      this.pendingModel = model;
-      return;
-    }
-    await this.sendControlRequest({ subtype: "set_model", model: model || null });
-  }
-
-  dispose(): void {
-    this.disposed = true;
-    this.rl?.close();
-    if (this.proc && !this.exited) {
-      try {
-        this.proc.stdin.end();
-      } catch {
-        /* ignore */
-      }
-      this.proc.kill("SIGTERM");
-      const p = this.proc;
-      setTimeout(() => {
-        // NOTE: `p.killed` is true as soon as SIGTERM was *sent*, not when the
-        // process exits — check actual exit state or the escalation never fires.
-        if (p.exitCode === null && p.signalCode === null) p.kill("SIGKILL");
-      }, 2000);
-    }
-  }
-
-  /** Dispose and wait until the child has actually exited (capped at ~3s).
-   *  Needed before touching the transcript file (truncate/delete): the dying
-   *  CLI can still flush buffered lines, silently undoing a rewind/delete. */
-  disposeAndWait(): Promise<void> {
-    const p = this.proc;
-    const done = new Promise<void>((resolve) => {
-      if (!p || this.exited || p.exitCode !== null || p.signalCode !== null) return resolve();
-      p.once("close", () => resolve());
-      setTimeout(resolve, 3000); // hard cap — don't block the UI forever
-    });
-    this.dispose();
-    return done;
-  }
-
-  // -- Control channel -----------------------------------------------------
-
-  private sendControlRequest(request: Record<string, unknown>): Promise<unknown> {
-    const requestId = `req-${randomUUID()}`;
-    return new Promise((resolve, reject) => {
-      if (this.exited) return reject(new Error("claude 进程已退出"));
-      const timer = setTimeout(() => {
-        this.pendingControl.delete(requestId);
-        reject(new Error(`control_request timed out: ${String(request.subtype)}`));
-      }, 30_000);
-      this.pendingControl.set(requestId, {
-        resolve: (resp) => {
-          clearTimeout(timer);
-          resolve(resp);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      });
-      this.write({ type: "control_request", request_id: requestId, request });
-    });
-  }
-
-  private write(obj: unknown): void {
-    if (!this.proc || this.proc.stdin.destroyed) return;
-    this.proc.stdin.write(JSON.stringify(obj) + "\n");
-  }
-
-  // -- Parsing -------------------------------------------------------------
-
-  private onLine(line: string): void {
-    const trimmed = line.trim();
-    if (!trimmed) return;
-    let ev: OutEvent;
-    try {
-      ev = JSON.parse(trimmed) as OutEvent;
-    } catch {
-      return; // ignore non-JSON noise
-    }
-    this.handleEvent(ev);
-  }
-
-  private handleEvent(ev: OutEvent): void {
-    // Events produced INSIDE a Task subagent carry parent_tool_use_id. Rendering
-    // them would stomp the live tool-input state and show the subagent's inner
-    // monologue as main-agent output — drop them (the Task tool_result summarizes).
-    if ((ev as any).parent_tool_use_id && (ev.type === "stream_event" || ev.type === "assistant" || ev.type === "user")) {
-      return;
-    }
-    switch (ev.type) {
-      case "control_response": {
-        const r = (ev as any).response;
-        const cb = this.pendingControl.get(r?.request_id);
-        if (cb) {
-          this.pendingControl.delete(r.request_id);
-          // A `subtype:"error"` reply is a REJECTION. Resolving it made every
-          // caller (initialize, set_permission_mode) believe it succeeded.
-          if (r?.subtype === "error") cb.reject(new Error(String(r.error ?? "control_request failed")));
-          else cb.resolve(r);
-        }
-        return;
-      }
-      case "control_request":
-        this.handleControlRequest(ev as ControlRequest);
-        return;
-      case "system":
-        this.handleSystem(ev as SystemInitEvent);
-        return;
-      case "stream_event":
-        this.handleStreamEvent(ev as StreamEvent);
-        return;
-      case "assistant":
-        this.handleAssistant(ev as AssistantEvent);
-        return;
-      case "user":
-        this.handleUser(ev as { message: { content: ContentBlock[] } });
-        return;
-      case "result":
-        this.handleResult(ev as ResultEvent);
-        return;
-      case "rate_limit_event":
-        this.handleRateLimit(ev as unknown as RateLimitEvent);
-        return;
-      default:
-        return;
-    }
-  }
-
-  /** The CLI pushes this after every API response on subscription accounts.
-   *  It is the ONLY signal that the quota is spent — surface it, don't drop it. */
-  private lastRateLimitLevel?: "warning" | "exhausted";
-  private handleRateLimit(ev: RateLimitEvent): void {
-    const info = ev.rate_limit_info ?? {};
-    const status = info.status;
-    let level: "warning" | "exhausted" | undefined;
-    if (status === "rejected" || status === "exhausted") level = "exhausted";
-    else if (status === "warning" || status === "allowed_warning") level = "warning";
-
-    if (!level) {
-      // Back under the cap (the window reset). Tell the UI so it unlocks the
-      // composer — otherwise the user stays blocked forever.
-      if (this.lastRateLimitLevel === "exhausted") {
-        this.hooks.emit({ kind: "rate_limit_cleared" });
-      }
-      this.lastRateLimitLevel = undefined;
-      return;
-    }
-    // Fires on every turn — only announce a change, or the chat fills with dupes.
-    if (this.lastRateLimitLevel === level) return;
-    this.lastRateLimitLevel = level;
-
-    this.hooks.emit({
-      kind: "rate_limit",
-      level,
-      limitLabel: info.rateLimitType === "seven_day" ? "每周用量" : "5 小时用量",
-      resetsAt: typeof info.resetsAt === "number" ? info.resetsAt : undefined,
-    });
-  }
-
-  private handleControlRequest(ev: ControlRequest): void {
-    if (isCanUseTool(ev.request)) {
-      const req = ev.request;
-      this.pendingPermissions.set(ev.request_id, {
-        input: req.input,
-        suggestions: (req.permission_suggestions as unknown[]) ?? [],
-      });
-      const suggestions = this.normalizeSuggestions(req);
-      this.hooks.onPermission({
-        requestId: ev.request_id,
-        toolUseId: req.tool_use_id,
-        toolName: req.tool_name,
-        displayName: req.display_name,
-        input: req.input,
-        description: req.description,
-        blockedPath: req.blocked_path,
-        suggestions,
-      });
-      return;
-    }
-    // Unknown inbound control request — respond with an error so the CLI
-    // doesn't block waiting on us.
-    this.write({
-      type: "control_response",
-      response: { subtype: "error", request_id: ev.request_id, error: "unsupported control_request" },
-    });
-  }
-
-  private normalizeSuggestions(req: { permission_suggestions?: unknown[] }): PermissionSuggestionView[] {
+  private normalizeSuggestions(raw: unknown[]): PermissionSuggestionView[] {
     const out: PermissionSuggestionView[] = [];
     const seen = new Set<string>();
-    (req.permission_suggestions ?? []).forEach((s, i) => {
+    raw.forEach((s, i) => {
       const sug = s as { type?: string; mode?: string };
       let label: string | undefined;
       if (sug.type === "setMode" && sug.mode) label = `本会话总是允许 (${sug.mode})`;
       else if (sug.type === "addRules") label = "总是允许此类操作";
-      // The id is the index into the RAW suggestion list — respondPermission
-      // echoes that raw object back so the CLI applies AND persists it.
-      // De-dupe by label: several scope variants would render identically.
       if (label && !seen.has(label)) {
         seen.add(label);
         out.push({ id: `sugg:${i}`, label });
@@ -526,7 +398,112 @@ export class ClaudeProcess {
     return out;
   }
 
-  private handleSystem(ev: SystemInitEvent): void {
+  // -- 控制 ----------------------------------------------------------------
+
+  async interrupt(): Promise<void> {
+    if (this.exited) return;
+    // busy 先行复位让 Stop 永远跟手（不等控制请求往返）。
+    this.setBusy(false);
+    for (const requestId of [...this.pendingPermissions.keys()]) {
+      this.respondPermission(requestId, { behavior: "deny", message: "已中断。" });
+    }
+    try {
+      await this.q?.interrupt();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  async setPermissionMode(mode: string): Promise<void> {
+    if (this.exited) return;
+    if (!this.initialized || !this.q) {
+      // 握手期先记下，start() 收尾时统一应用（否则这次切换会被静默丢失）。
+      this.pendingMode = mode;
+      return;
+    }
+    // init 事件可能还堵在消息循环的缓冲里没被取出，那时它报的仍是 spawn 时的
+    // 旧模式——记一份覆盖值，别让界面上的选择器被打回去。
+    this.modeOverride = mode;
+    await this.q.setPermissionMode(mode as Parameters<Query["setPermissionMode"]>[0]);
+  }
+
+  async setModel(model: string): Promise<void> {
+    if (this.exited) return;
+    if (!this.initialized || !this.q) {
+      this.pendingModel = model;
+      return;
+    }
+    await this.q.setModel(model || undefined);
+  }
+
+  private pendingMode?: string;
+  private pendingModel?: string;
+  /** 握手期切过的权限模式——init 事件上报时用它盖掉 CLI 报的 spawn 时旧值。 */
+  private modeOverride?: string;
+
+  dispose(): void {
+    this.disposed = true;
+    this.input.end();
+    try {
+      this.abort.abort();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  disposeAndWait(): Promise<void> {
+    // 总预算 5s（两段共享，不是各算各的）：这条路径在 UI 上是同步等待的
+    // （删除会话、还原点回退都 await 它），不能让用户对着冻住的界面干等十几秒。
+    // 实测正常退出约 0.5s，这个上限只在 CLI 赖着不走时才付出。
+    const deadline = Date.now() + 5000;
+    const left = () => Math.max(0, deadline - Date.now());
+    const done = (async () => {
+      // 先等 start() 落定：握手期就被丢弃时 closedPromise 还不存在，
+      // 直接返回等于没等，调用方会去动一个正在被写的 transcript。
+      if (this.startPromise) await Promise.race([this.startPromise, delay(left())]);
+      // 注意不要因为 exited 就提前返回：start 失败时 exited 也是 true，但
+      // 只要有 closedPromise 就说明子进程存在过，必须等它收尾。
+      if (!this.closedPromise) return;
+      await Promise.race([this.closedPromise.catch(() => undefined), delay(left())]);
+    })();
+    this.dispose();
+    return done;
+  }
+
+  // -- 事件翻译（process.ts handleEvent 的移植版，逐段对齐）------------------
+
+  private handleMessage(m: Record<string, unknown>): void {
+    // 已被主动丢弃的进程一律闭嘴。dispose() 之后消息循环还会把缓冲里的消息
+    // 排完（实测能再吐十几个 text_delta/thinking_delta），而此时 ctx 上多半
+    // 已经挂了新进程——这些迟到事件会串进新轮次的气泡、打乱 token 计数。
+    if (this.disposed) return;
+    // 子 agent 内部事件不渲染（Task 的 tool_result 会汇总）。
+    if ((m as any).parent_tool_use_id && (m.type === "stream_event" || m.type === "assistant" || m.type === "user")) return;
+    switch (m.type) {
+      case "system":
+        this.handleSystem(m as any);
+        return;
+      case "stream_event":
+        this.handleStreamEvent(m as any);
+        return;
+      case "assistant":
+        this.handleAssistant(m as any);
+        return;
+      case "user":
+        this.handleUser(m as any);
+        return;
+      case "result":
+        this.handleResult(m as any);
+        return;
+      case "rate_limit_event":
+        this.handleRateLimit(m as any);
+        return;
+      default:
+        return;
+    }
+  }
+
+  private handleSystem(ev: any): void {
     if (ev.subtype === "init") {
       const resumed = !!this.opts.resumeSessionId;
       this.currentModel = ev.model;
@@ -539,57 +516,48 @@ export class ClaudeProcess {
         cwd: ev.cwd,
         tools: ev.tools ?? [],
         resumed,
-        // Ground truth from the CLI. But if a mode change arrived mid-handshake,
-        // init still reports the SPAWN-time mode — reporting it would snap the
-        // picker back to the mode the user just moved away from.
-        permissionMode: this.pendingMode ?? (ev as any).permissionMode,
+        // 握手期改过模式的话，init 报的还是 spawn 时的旧值，用覆盖值顶上。
+        permissionMode: this.modeOverride ?? ev.permissionMode,
       });
-    } else if ((ev as any).subtype === "status") {
-      const status = (ev as any).status;
-      // /compact lifecycle: a "compacting" status, then a status carrying
-      // compact_result, then the compact_boundary detail below.
-      if (status === "compacting") {
-        this.hooks.emit({ kind: "compacting" });
-      } else if ((ev as any).compact_result) {
-        // 成功时数字由 compact_boundary 带；失败必须说出来。
-        if ((ev as any).compact_result === "failed") {
-          this.hooks.emit({ kind: "error", message: `压缩上下文失败：${(ev as any).compact_error ?? "未知原因"}` });
+    } else if (ev.subtype === "status") {
+      if (ev.status === "compacting") this.hooks.emit({ kind: "compacting" });
+      else if (ev.compact_result) {
+        // 成功时数字由 compact_boundary 带；失败要说出来，否则用户只看到
+        // 转圈停了却不知道压缩没生效。
+        if (ev.compact_result === "failed") {
+          this.hooks.emit({ kind: "error", message: `压缩上下文失败：${ev.compact_error ?? "未知原因"}` });
         }
-      } else if (typeof status === "string") {
-        this.hooks.emit({ kind: "status", label: status });
-      }
-    } else if ((ev as any).subtype === "compact_boundary") {
-      const md = (ev as any).compact_metadata ?? {};
+      } else if (typeof ev.status === "string") this.hooks.emit({ kind: "status", label: ev.status });
+    } else if (ev.subtype === "compact_boundary") {
+      const md = ev.compact_metadata ?? {};
+      this.hooks.emit({ kind: "compacted", trigger: md.trigger ?? "manual", preTokens: md.pre_tokens ?? 0, postTokens: md.post_tokens ?? 0 });
+    } else if (ev.subtype === "api_retry") {
       this.hooks.emit({
-        kind: "compacted",
-        trigger: md.trigger ?? "manual",
-        preTokens: md.pre_tokens ?? 0,
-        postTokens: md.post_tokens ?? 0,
+        kind: "diag",
+        // 字段名以 sdk.d.ts 的 SDKAPIRetryMessage 为准（retry_delay_ms / error_status）。
+        message: `api_retry: ${JSON.stringify({
+          attempt: ev.attempt ?? ev.retry_count,
+          delayMs: ev.retry_delay_ms ?? ev.delay_ms,
+          maxRetries: ev.max_retries,
+          status: ev.error_status,
+          error: ev.error,
+        }).slice(0, 300)}`,
       });
-    } else if ((ev as any).subtype === "api_retry") {
-      // API 限流/过载时 CLI 自动退避重试——用户会感知为"莫名静默很久"。
-      // 不打扰界面，只上报给 provider 记日志（diag 事件 webview 直接忽略）。
-      const e = ev as any;
-      this.hooks.emit({ kind: "diag", message: `api_retry: ${JSON.stringify({ attempt: e.attempt ?? e.retry_count, delay: e.delay_ms ?? e.retry_in, error: e.error }).slice(0, 300)}` });
-    } else if ((ev as any).subtype === "thinking_tokens") {
-      // CLI 在扩展思考时会推真实的思考 token 累计数（官方 UI 的 "· Nk tokens" 就来自这里）。
-      // 字段名各版本可能不同，几个候选都试；取到正数才发，webview 用它盖掉字符估算值。
-      const e = ev as any;
-      const n = Number(e.tokens ?? e.thinking_tokens ?? e.count ?? e.output_tokens ?? 0);
+    } else if (ev.subtype === "thinking_tokens") {
+      // SDK 类型定义的字段是 estimated_tokens（老候选保留兜底）。
+      const n = Number(ev.estimated_tokens ?? ev.tokens ?? ev.thinking_tokens ?? ev.count ?? ev.output_tokens ?? 0);
       if (Number.isFinite(n) && n > 0) this.hooks.emit({ kind: "thinking_tokens", tokens: n });
     }
   }
 
-  private handleStreamEvent(ev: StreamEvent): void {
+  private handleStreamEvent(ev: any): void {
     const e = ev.event as any;
-    switch (e.type) {
+    switch (e?.type) {
       case "message_start": {
         const u = e.message?.usage;
         if (u) {
           if (typeof u.output_tokens === "number") this.hooks.emit({ kind: "tokens", output: u.output_tokens });
-          // Context size = full prompt this request: fresh input + cached history.
-          const used =
-            (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+          const used = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
           if (used > 0) {
             const model = e.message?.model || this.currentModel;
             this.hooks.emit({ kind: "context", used, total: contextWindowFor(model, used) });
@@ -598,7 +566,6 @@ export class ClaudeProcess {
         return;
       }
       case "message_delta": {
-        // Cumulative output tokens for the current assistant message.
         const out = e.usage?.output_tokens;
         if (typeof out === "number") this.hooks.emit({ kind: "tokens", output: out });
         return;
@@ -606,21 +573,12 @@ export class ClaudeProcess {
       case "content_block_start": {
         const t = e.content_block?.type;
         if (t === "text" || t === "thinking") {
-          this.currentBlockType = t;
           this.hooks.emit({ kind: "block_start", blockType: t });
         } else if (t === "tool_use") {
-          this.currentBlockType = "tool_use";
           this.currentToolId = e.content_block.id;
           this.currentToolName = e.content_block.name;
           this.currentToolJson = "";
-          // Card is rendered from the assistant event (has parsed input);
-          // announce it now for immediate "running" feedback.
-          this.hooks.emit({
-            kind: "block_start",
-            blockType: "tool_use",
-            toolId: e.content_block.id,
-            toolName: e.content_block.name,
-          });
+          this.hooks.emit({ kind: "block_start", blockType: "tool_use", toolId: e.content_block.id, toolName: e.content_block.name });
         }
         return;
       }
@@ -629,19 +587,12 @@ export class ClaudeProcess {
         if (d.type === "text_delta") this.hooks.emit({ kind: "text_delta", text: d.text });
         else if (d.type === "thinking_delta") this.hooks.emit({ kind: "thinking_delta", text: d.thinking });
         else if (d.type === "input_json_delta" && this.currentToolId) {
-          // Stream the tool's input JSON so the UI can show the file/lines live.
-          this.currentToolJson += (d as { partial_json?: string }).partial_json ?? "";
-          this.hooks.emit({
-            kind: "tool_input_partial",
-            toolId: this.currentToolId,
-            name: this.currentToolName || "tool",
-            json: this.currentToolJson,
-          });
+          this.currentToolJson += d.partial_json ?? "";
+          this.hooks.emit({ kind: "tool_input_partial", toolId: this.currentToolId, name: this.currentToolName || "tool", json: this.currentToolJson });
         }
         return;
       }
       case "content_block_stop":
-        this.currentBlockType = undefined;
         this.currentToolId = undefined;
         this.currentToolName = undefined;
         this.currentToolJson = "";
@@ -651,45 +602,53 @@ export class ClaudeProcess {
     }
   }
 
-  private handleAssistant(ev: AssistantEvent): void {
-    for (const block of ev.message.content ?? []) {
+  private handleAssistant(ev: any): void {
+    for (const block of ev.message?.content ?? []) {
       if (block.type === "tool_use") {
-        const tu = block as ToolUseBlock;
-        if (this.seenToolIds.has(tu.id)) continue;
-        this.seenToolIds.add(tu.id);
-        this.hooks.emit({
-          kind: "tool_input",
-          toolId: tu.id,
-          name: tu.name,
-          input: tu.input ?? {},
-        });
+        if (this.seenToolIds.has(block.id)) continue;
+        this.seenToolIds.add(block.id);
+        this.hooks.emit({ kind: "tool_input", toolId: block.id, name: block.name, input: block.input ?? {} });
       }
     }
   }
 
-  private handleUser(ev: { message: { content: ContentBlock[] } }): void {
-    for (const block of ev.message.content ?? []) {
+  private handleUser(ev: any): void {
+    for (const block of ev.message?.content ?? []) {
       if (block.type === "tool_result") {
-        const tr = block as { tool_use_id: string; content: unknown; is_error?: boolean };
         this.hooks.emit({
           kind: "tool_result",
-          toolUseId: tr.tool_use_id,
-          content: stringifyToolResult(tr.content),
-          isError: !!tr.is_error,
+          toolUseId: block.tool_use_id,
+          content: stringifyToolResult(block.content),
+          isError: !!block.is_error,
         });
       }
     }
   }
 
-  private handleResult(ev: ResultEvent): void {
-    this.seenToolIds.clear(); // per-turn de-dupe only; don't grow forever
+  private handleResult(ev: any): void {
+    this.seenToolIds.clear();
     this.setBusy(false);
+    this.hooks.emit({ kind: "result", isError: ev.is_error, costUsd: ev.total_cost_usd, durationMs: ev.duration_ms, numTurns: ev.num_turns });
+  }
+
+  private handleRateLimit(ev: any): void {
+    const info = ev.rate_limit_info ?? {};
+    const status = info.status;
+    let level: "warning" | "exhausted" | undefined;
+    if (status === "rejected" || status === "exhausted") level = "exhausted";
+    else if (status === "warning" || status === "allowed_warning") level = "warning";
+    if (!level) {
+      if (this.lastRateLimitLevel === "exhausted") this.hooks.emit({ kind: "rate_limit_cleared" });
+      this.lastRateLimitLevel = undefined;
+      return;
+    }
+    if (this.lastRateLimitLevel === level) return;
+    this.lastRateLimitLevel = level;
     this.hooks.emit({
-      kind: "result",
-      isError: ev.is_error,
-      costUsd: ev.total_cost_usd,
-      durationMs: ev.duration_ms,
-      numTurns: ev.num_turns,
+      kind: "rate_limit",
+      level,
+      limitLabel: info.rateLimitType === "seven_day" ? "每周用量" : "5 小时用量",
+      resetsAt: typeof info.resetsAt === "number" ? info.resetsAt : undefined,
     });
   }
 
@@ -700,17 +659,52 @@ export class ClaudeProcess {
   }
 }
 
-/** Posting multi-MB tool outputs (huge Reads, base64 blobs) through postMessage
- *  and into the DOM stalls the webview — cap what we ship. */
+/** race 用的超时。定时器加 unref：race 被另一边赢下后它还挂着，批量
+ *  disposeAndWait 会留下一堆，unref 让它们不阻塞宿主退出。 */
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => {
+    const t = setTimeout(r, ms);
+    (t as unknown as { unref?: () => void }).unref?.();
+  });
+}
+
+/** 简单的可推送异步队列（SDK streaming input 的 prompt 载体）。 */
+class AsyncQueue<T> implements AsyncIterable<T> {
+  private readonly items: T[] = [];
+  private waiters: Array<(r: IteratorResult<T>) => void> = [];
+  private done = false;
+
+  push(item: T): void {
+    if (this.done) return;
+    const w = this.waiters.shift();
+    if (w) w({ value: item, done: false });
+    else this.items.push(item);
+  }
+
+  end(): void {
+    this.done = true;
+    for (const w of this.waiters.splice(0)) w({ value: undefined as never, done: true });
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<T> {
+    return {
+      next: (): Promise<IteratorResult<T>> => {
+        const item = this.items.shift();
+        if (item !== undefined) return Promise.resolve({ value: item, done: false });
+        if (this.done) return Promise.resolve({ value: undefined as never, done: true });
+        return new Promise((r) => this.waiters.push(r));
+      },
+    };
+  }
+}
+
 const MAX_TOOL_RESULT_CHARS = 200_000;
 
 function stringifyToolResult(content: unknown): string {
   let s: string;
   if (typeof content === "string") s = content;
   else if (Array.isArray(content)) {
-    s = content
-      .map((c) => (typeof c === "string" ? c : (c as { text?: string }).text ?? JSON.stringify(c)))
-      .join("\n");
+    s = content.map((c) => (typeof c === "string" ? c : (c as { text?: string }).text ?? JSON.stringify(c))).join("\n");
   } else if (content == null) s = "";
   else s = JSON.stringify(content, null, 2);
   if (s.length > MAX_TOOL_RESULT_CHARS) {

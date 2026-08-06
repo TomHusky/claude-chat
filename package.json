@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.233",
+  "version": "0.1.234",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -172,6 +172,19 @@
     "configuration": {
       "title": "Claude Chat",
       "properties": {
+        "claudeChat.engine": {
+          "type": "string",
+          "enum": [
+            "stream-json",
+            "sdk"
+          ],
+          "default": "stream-json",
+          "enumDescriptions": [
+            "自维护的 stream-json 协议层（默认，久经验证）",
+            "实验：官方 @anthropic-ai/claude-agent-sdk 对接，协议层交给官方维护，CLI 升级不再担心协议漂移；出问题可随时切回"
+          ],
+          "description": "与 Claude Code CLI 的对接引擎。切换后对新启动的进程生效（重开会话/重载窗口）。"
+        },
         "claudeChat.claudePath": {
           "type": "string",
           "default": "claude",
@@ -274,6 +287,7 @@
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.223",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.90.0",

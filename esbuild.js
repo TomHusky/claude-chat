@@ -31,6 +31,10 @@ const extensionConfig = {
   sourcemap: !production,
   minify: production,
   plugins: [logPlugin],
+  // @anthropic-ai/claude-agent-sdk 是 ESM（内部用 import.meta.url + createRequire），
+  // 打成 CJS 时 import.meta.url 变 undefined 会在加载期直接抛错——用 __filename 顶上。
+  define: { "import.meta.url": "__importMetaUrl" },
+  banner: { js: "const __importMetaUrl = require('url').pathToFileURL(__filename).href;" },
 };
 
 /** The webview bundle (browser / IIFE). markdown-it + highlight.js are inlined here. */

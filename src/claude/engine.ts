@@ -6,10 +6,11 @@ import { SdkClaudeProcess } from "./sdkProcess";
 export type EngineProcess = ClaudeProcess | SdkClaudeProcess;
 
 /** 按设置选择对接引擎：
- *  - "stream-json"（默认）：自维护协议层（src/claude/process.ts），久经生产验证；
- *  - "sdk"（实验）：官方 @anthropic-ai/claude-agent-sdk，协议层交给官方维护。
- *  出问题随时切回，无需重启会话以外的任何代价（下一个新进程生效）。 */
+ *  - "sdk"（默认）：官方 @anthropic-ai/claude-agent-sdk，协议层由官方维护，
+ *    CLI 升级不再担心协议漂移（0.1.235 起转正）；
+ *  - "stream-json"：自维护协议层（src/claude/process.ts），保留作回退开关，
+ *    SDK 路线稳定运行一段时间后整体移除。 */
 export function createClaudeProcess(opts: ClaudeProcessOptions, hooks: ClaudeProcessHooks): EngineProcess {
-  const engine = vscode.workspace.getConfiguration("claudeChat").get<string>("engine", "stream-json");
-  return engine === "sdk" ? new SdkClaudeProcess(opts, hooks) : new ClaudeProcess(opts, hooks);
+  const engine = vscode.workspace.getConfiguration("claudeChat").get<string>("engine", "sdk");
+  return engine === "stream-json" ? new ClaudeProcess(opts, hooks) : new SdkClaudeProcess(opts, hooks);
 }

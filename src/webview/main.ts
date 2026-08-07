@@ -151,7 +151,7 @@ const fileChips = $("file-chips");
 interface LiveBlock {
   type: "text";
   raw: string; // full text received so far (target)
-  shown: number; // chars currently revealed (typewriter cursor)
+  shown: number; // chars currently revealed (typewriter cursor; fractional — floor before slicing)
   el: HTMLElement; // the .text-seg wrapper
   committedEl: HTMLElement; // rendered markdown for complete lines
   lineEl: HTMLElement; // the current line being typed (plain text)
@@ -300,7 +300,7 @@ const railObservers: ResizeObserver[] = [];
  *  stay as plain text a moment longer, which is visually indistinguishable. */
 function renderLive() {
   if (!liveBlock) return;
-  const shownText = liveBlock.raw.slice(0, liveBlock.shown);
+  const shownText = liveBlock.raw.slice(0, Math.floor(liveBlock.shown));
   const lastNl = shownText.lastIndexOf("\n");
   const commitLen = lastNl >= 0 ? lastNl + 1 : 0;
   // Commit threshold grows with size: instant at first, ~1/16 of length later.
@@ -314,15 +314,35 @@ function renderLive() {
   maybeScroll();
 }
 
+/** 自适应打字速率（字符/毫秒的滑动估计）。CLI 2.1.x 把流事件节流成约 1 秒
+ *  一批（实测 p50≈850ms、每批约 20 字，SDK 与裸 CLI 一致），追赶型排字会变成
+ *  "闪现一段、冻一秒"。按到达速率匀速排字，把每批摊到下一批到来前的时间里。 */
+let charRate = 0.03;
+let lastDeltaAt = 0;
+
+function noteDeltaArrival(len: number) {
+  const now = performance.now();
+  if (lastDeltaAt) {
+    const gap = now - lastDeltaAt;
+    // 同一批连发（<30ms）不算节奏；>3s 是工具调用等间隙，不是流速。
+    if (gap > 30 && gap < 3000) charRate = charRate * 0.7 + (len / gap) * 0.3;
+  }
+  lastDeltaAt = now;
+}
+
 function startTypewriter() {
   if (typewriterRAF) return;
-  const tick = () => {
+  let last = performance.now();
+  const tick = (now: number) => {
     typewriterRAF = 0;
     if (!liveBlock) return;
+    const dt = Math.min(100, now - last); // 页面切后台 rAF 暂停，回来别一口气跳完
+    last = now;
     const target = liveBlock.raw.length;
     if (liveBlock.shown < target) {
       const remaining = target - liveBlock.shown;
-      const step = Math.max(2, Math.ceil(remaining / 8)); // accelerate when far behind
+      // 匀速跟随到达速率；积压超过约 2.5 秒的量时按比例加速，保证不越拉越远。
+      const step = dt * Math.max(charRate, remaining / 2500);
       liveBlock.shown = Math.min(target, liveBlock.shown + step);
       renderLive();
     }
@@ -855,6 +875,7 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
   seg.append(committedEl, lineEl);
   body.appendChild(seg);
   liveBlock = { type: "text", raw: "", shown: 0, el: seg, committedEl, lineEl, committedLen: 0 };
+  lastDeltaAt = 0; // 新块重置节奏基准：上一块结束到现在的间隔不代表流速
   maybeScroll();
 }
 
@@ -862,6 +883,7 @@ function onTextDelta(text: string) {
   addStreamEst(text); // keep the running token estimate growing
   removeWorking();
   if (!liveBlock) onBlockStart("text");
+  noteDeltaArrival(text.length);
   liveBlock!.raw += text;
   startTypewriter(); // typewriter reveal, committing each line as it completes
 }

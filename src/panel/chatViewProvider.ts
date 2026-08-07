@@ -160,7 +160,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** QQ 配置的独立 webview 面板——与侧边栏零耦合，坏也只坏它自己。 */
   private qqPanel?: vscode.WebviewPanel;
   /** 当前正在处理的 QQ 消息（收集回复用）。机器人一次只处理一条，避免串台。 */
-  private qqTurn?: { target: QQIncoming; text: string; done: boolean };
+  private qqTurn?: { target: QQIncoming; text: string; done: boolean; blockStart?: number };
   private readonly qqQueue: QQIncoming[] = [];
   /** 轮次忙标记。命令处理期间 qqTurn 为空，只靠它防止并发跑第二条。 */
   private qqRunning = false;
@@ -3027,7 +3027,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const t = this.qqTurn;
     if (!t) return;
-    if (e.kind === "text_delta") t.text += e.text;
+    if (e.kind === "block_start" && e.blockType === "text") t.blockStart = t.text.length;
+    else if (e.kind === "text_delta") t.text += e.text;
+    else if (e.kind === "text_snap") t.text = t.text.slice(0, t.blockStart ?? t.text.length) + e.text; // 权威快照：替换当前文本块
     else if (e.kind === "error") this.output.appendLine(`[qq] ${e.message}`);
     else if (e.kind === "result") {
       if (t.done) return;

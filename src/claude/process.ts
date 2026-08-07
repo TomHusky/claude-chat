@@ -78,6 +78,8 @@ export class ClaudeProcess {
   private currentToolName?: string;
   private currentToolJson = "";
   private readonly seenToolIds = new Set<string>();
+  /** 每个流出的 text 块的 delta 累计，按完成顺序与完整 assistant 消息对账。 */
+  private textAccumQueue: string[] = [];
   private lastRateLimitLevel?: "warning" | "exhausted";
   private stderrTail = "";
   /** 消息循环结束的信号（disposeAndWait 用）。 */
@@ -573,6 +575,7 @@ export class ClaudeProcess {
       case "content_block_start": {
         const t = e.content_block?.type;
         if (t === "text" || t === "thinking") {
+          if (t === "text") this.textAccumQueue.push("");
           this.hooks.emit({ kind: "block_start", blockType: t });
         } else if (t === "tool_use") {
           this.currentToolId = e.content_block.id;
@@ -584,7 +587,11 @@ export class ClaudeProcess {
       }
       case "content_block_delta": {
         const d = e.delta;
-        if (d.type === "text_delta") this.hooks.emit({ kind: "text_delta", text: d.text });
+        if (d.type === "text_delta") {
+          if (!this.textAccumQueue.length) this.textAccumQueue.push("");
+          this.textAccumQueue[this.textAccumQueue.length - 1] += d.text;
+          this.hooks.emit({ kind: "text_delta", text: d.text });
+        }
         else if (d.type === "thinking_delta") this.hooks.emit({ kind: "thinking_delta", text: d.thinking });
         else if (d.type === "input_json_delta" && this.currentToolId) {
           this.currentToolJson += d.partial_json ?? "";
@@ -608,6 +615,23 @@ export class ClaudeProcess {
         if (this.seenToolIds.has(block.id)) continue;
         this.seenToolIds.add(block.id);
         this.hooks.emit({ kind: "tool_input", toolId: block.id, name: block.name, input: block.input ?? {} });
+      } else if (block.type === "text" && typeof block.text === "string") {
+        // 正文对账：CLI 会把 partial 事件节流成批，偶发整块或尾部不发（实测
+        // 过一轮收尾总结只存在于 transcript、界面上整段消失）。完整消息是权
+        // 威——delta 少了就补差量，对不上就整块快照。
+        const acc = this.textAccumQueue.shift() ?? "";
+        if (block.text === acc) continue;
+        if (block.text.startsWith(acc)) {
+          if (!acc) this.hooks.emit({ kind: "block_start", blockType: "text" });
+          const missing = block.text.slice(acc.length);
+          if (missing) {
+            this.hooks.emit({ kind: "text_delta", text: missing });
+            this.hooks.emit({ kind: "diag", message: `text 对账补齐 ${missing.length} 字符（delta 只到 ${acc.length}/${block.text.length}）` });
+          }
+        } else {
+          this.hooks.emit({ kind: "text_snap", text: block.text });
+          this.hooks.emit({ kind: "diag", message: `text 对账快照（delta 累计 ${acc.length} 与完整 ${block.text.length} 内容不一致）` });
+        }
       }
     }
   }
@@ -627,6 +651,7 @@ export class ClaudeProcess {
 
   private handleResult(ev: any): void {
     this.seenToolIds.clear();
+    this.textAccumQueue = [];
     this.setBusy(false);
     this.hooks.emit({ kind: "result", isError: ev.is_error, costUsd: ev.total_cost_usd, durationMs: ev.duration_ms, numTurns: ev.num_turns });
   }

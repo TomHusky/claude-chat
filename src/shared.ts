@@ -64,6 +64,8 @@ export type ToWebview =
   | { kind: "status"; label: string }
   | { kind: "block_start"; blockType: "text" | "thinking" | "tool_use"; toolId?: string; toolName?: string }
   | { kind: "text_delta"; text: string }
+  /** 完整消息与 delta 累计不一致时的权威快照：整块替换当前直播文本。 */
+  | { kind: "text_snap"; text: string }
   | { kind: "thinking_delta"; text: string }
   | { kind: "tool_input"; toolId: string; name: string; displayName?: string; input: Record<string, unknown> }
   | { kind: "tool_input_partial"; toolId: string; name: string; json: string }

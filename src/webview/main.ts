@@ -656,6 +656,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     stoppingView &&
     (m.kind === "block_start" ||
       m.kind === "text_delta" ||
+      m.kind === "text_snap" ||
       m.kind === "thinking_delta" ||
       m.kind === "tool_input" ||
       m.kind === "tool_input_partial" ||
@@ -703,6 +704,16 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "text_delta":
       onTextDelta(m.text);
+      break;
+    case "text_snap":
+      // 完整消息与 delta 累计不一致时的权威快照：整块替换重排。
+      removeWorking();
+      if (!liveBlock) onBlockStart("text");
+      liveBlock!.raw = m.text;
+      liveBlock!.shown = Math.min(liveBlock!.shown, m.text.length);
+      liveBlock!.committedLen = 0;
+      liveBlock!.committedEl.innerHTML = "";
+      startTypewriter();
       break;
     case "thinking_delta":
       addStreamEst(m.text); // not displayed, but grows the live token estimate

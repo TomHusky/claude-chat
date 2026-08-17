@@ -93,7 +93,21 @@ html, body {
 .question-bar:hover { color: var(--vscode-foreground); }
 .question-bar .qb-icon { flex: 0 0 auto; display: flex; opacity: .75; }
 .question-bar .qb-icon svg { width: 13px; height: 13px; }
-.question-bar .qb-text { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.question-bar .qb-thumbs { display: flex; gap: 4px; flex: 0 0 auto; }
+.question-bar .qb-thumbs img {
+  width: 30px; height: 30px; object-fit: cover; border-radius: 5px;
+  border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, .3));
+}
+.question-bar .qb-text {
+  flex: 0 1 auto;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2; /* 最多两行，超出省略 */
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.5;
+}
 
 /* Empty/new-session placeholder */
 .empty-state {

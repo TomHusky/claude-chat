@@ -653,8 +653,9 @@ messagesEl.addEventListener("scroll", () => {
 const questionBar = el("div", "question-bar hidden");
 questionBar.innerHTML =
   '<span class="qb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10a2 2 0 0 1-2 2H6l-3 3V4a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2z"/></svg></span>';
+const qbThumbsEl = el("span", "qb-thumbs");
 const qbTextEl = el("span", "qb-text");
-questionBar.appendChild(qbTextEl);
+questionBar.append(qbThumbsEl, qbTextEl);
 messagesEl.parentElement!.insertBefore(questionBar, messagesEl);
 let qbTarget: HTMLElement | null = null;
 questionBar.addEventListener("click", () => qbTarget?.scrollIntoView({ behavior: "smooth", block: "start" }));
@@ -665,19 +666,31 @@ function updateQuestionBar() {
   qbRAF = requestAnimationFrame(() => {
     qbRAF = 0;
     // 已完全滚出可视区顶部的最后一条用户消息，就是当前可见回复所属的提问。
-    const topEdge = messagesEl.getBoundingClientRect().top + 34; // 栏自身高度容差
+    const topEdge = messagesEl.getBoundingClientRect().top + (questionBar.offsetHeight || 34) + 4;
     let cur: HTMLElement | null = null;
     for (const u of Array.from(messagesEl.querySelectorAll<HTMLElement>(".msg.user"))) {
       if (u.getBoundingClientRect().bottom < topEdge) cur = u;
       else break;
     }
-    const text = cur?.dataset.rawText?.replace(/\s+/g, " ").trim() || "";
-    qbTarget = text ? cur : null;
-    if (!qbTarget) {
+    const text = cur?.dataset.rawText?.trim() || "";
+    const imgs = cur ? Array.from(cur.querySelectorAll<HTMLImageElement>(".msg-images img")) : [];
+    if (!cur || (!text && !imgs.length)) {
+      qbTarget = null;
       questionBar.classList.add("hidden");
       return;
     }
-    if (qbTextEl.textContent !== text) qbTextEl.textContent = text;
+    if (qbTarget !== cur) {
+      // 只在归属的提问变化时重建内容，滚动过程中不反复动 DOM
+      qbTarget = cur;
+      qbTextEl.textContent = text.replace(/\s+/g, " ");
+      qbThumbsEl.innerHTML = "";
+      for (const im of imgs.slice(0, 4)) {
+        const t = document.createElement("img");
+        t.src = im.src;
+        qbThumbsEl.appendChild(t);
+      }
+      qbThumbsEl.classList.toggle("hidden", !imgs.length);
+    }
     questionBar.classList.remove("hidden");
   });
 }

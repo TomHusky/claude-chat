@@ -74,6 +74,27 @@ html, body {
 }
 .msg { display: flex; gap: 8px; }
 
+/* ---- 顶部问题栏：滚动时悬浮显示当前可见回复对应的提问，点击跳回 ---- */
+.question-bar {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  z-index: 4; /* 在消息之上、抽屉遮罩(5)之下 */
+  display: flex; align-items: center; gap: 7px;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 86%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, .25));
+  cursor: pointer;
+  user-select: none;
+}
+.question-bar:hover { color: var(--vscode-foreground); }
+.question-bar .qb-icon { flex: 0 0 auto; display: flex; opacity: .75; }
+.question-bar .qb-icon svg { width: 13px; height: 13px; }
+.question-bar .qb-text { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* Empty/new-session placeholder */
 .empty-state {
   margin: auto;

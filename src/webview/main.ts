@@ -643,7 +643,44 @@ function maybeScroll() {
 }
 messagesEl.addEventListener("scroll", () => {
   pinnedToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+  updateQuestionBar();
 });
+
+// ---------------------------------------------------------------------------
+// 顶部问题栏：滚动阅读长回复时固定显示它对应的是哪条提问，点击跳回该提问
+// （参考官方 Claude 客户端；提问本身可见时不显示）
+// ---------------------------------------------------------------------------
+const questionBar = el("div", "question-bar hidden");
+questionBar.innerHTML =
+  '<span class="qb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10a2 2 0 0 1-2 2H6l-3 3V4a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2z"/></svg></span>';
+const qbTextEl = el("span", "qb-text");
+questionBar.appendChild(qbTextEl);
+messagesEl.parentElement!.insertBefore(questionBar, messagesEl);
+let qbTarget: HTMLElement | null = null;
+questionBar.addEventListener("click", () => qbTarget?.scrollIntoView({ behavior: "smooth", block: "start" }));
+
+let qbRAF = 0;
+function updateQuestionBar() {
+  if (qbRAF) return; // 滚动事件很密，rAF 合并到每帧一次
+  qbRAF = requestAnimationFrame(() => {
+    qbRAF = 0;
+    // 已完全滚出可视区顶部的最后一条用户消息，就是当前可见回复所属的提问。
+    const topEdge = messagesEl.getBoundingClientRect().top + 34; // 栏自身高度容差
+    let cur: HTMLElement | null = null;
+    for (const u of Array.from(messagesEl.querySelectorAll<HTMLElement>(".msg.user"))) {
+      if (u.getBoundingClientRect().bottom < topEdge) cur = u;
+      else break;
+    }
+    const text = cur?.dataset.rawText?.replace(/\s+/g, " ").trim() || "";
+    qbTarget = text ? cur : null;
+    if (!qbTarget) {
+      questionBar.classList.add("hidden");
+      return;
+    }
+    if (qbTextEl.textContent !== text) qbTextEl.textContent = text;
+    questionBar.classList.remove("hidden");
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Incoming messages
@@ -813,6 +850,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       break;
     case "load_history":
       loadHistory(m.items, m.title, m.checkpoints, m.sessionId);
+      updateQuestionBar(); // 短历史不触发滚动事件，主动对一次
+
       break;
     case "sessions":
       if (m.runningIds !== undefined) runningSessionIds = new Set(m.runningIds);

@@ -91,8 +91,6 @@ html, body {
   user-select: none;
 }
 .question-bar:hover { color: var(--vscode-foreground); }
-.question-bar .qb-icon { flex: 0 0 auto; display: flex; opacity: .75; }
-.question-bar .qb-icon svg { width: 13px; height: 13px; }
 .question-bar .qb-thumbs { display: flex; gap: 4px; flex: 0 0 auto; }
 .question-bar .qb-thumbs img {
   width: 30px; height: 30px; object-fit: cover; border-radius: 5px;

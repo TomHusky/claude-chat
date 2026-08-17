@@ -651,8 +651,6 @@ messagesEl.addEventListener("scroll", () => {
 // （参考官方 Claude 客户端；提问本身可见时不显示）
 // ---------------------------------------------------------------------------
 const questionBar = el("div", "question-bar hidden");
-questionBar.innerHTML =
-  '<span class="qb-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 10a2 2 0 0 1-2 2H6l-3 3V4a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2z"/></svg></span>';
 const qbThumbsEl = el("span", "qb-thumbs");
 const qbTextEl = el("span", "qb-text");
 questionBar.append(qbThumbsEl, qbTextEl);

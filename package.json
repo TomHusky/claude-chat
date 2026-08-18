@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.247",
+  "version": "0.1.248",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -276,7 +276,7 @@
           "type": "number",
           "default": 60,
           "minimum": 0,
-          "description": "任务执行时长达到该秒数才推送（默认 60 秒——短任务你多半还盯着屏幕，不值得打扰）。另外只有当前 VS Code 窗口未聚焦时才会推送：窗口在前台说明你已经看到结果了。"
+          "description": "任务执行时长达到该秒数才推送（默认 60 秒）。"
         },
         "claudeChat.pythonPath": {
           "type": "string",

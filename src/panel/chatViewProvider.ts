@@ -2400,7 +2400,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 <body>
 <div class="wrap">
   <h2>🔔 任务完成推送</h2>
-  <div class="sub">长任务跑完时向 webhook 推一条通知。只有同时满足「任务耗时达到阈值」和「当前 VS Code 窗口未聚焦」才会推送——窗口在前台说明你已经看到结果了。</div>
+  <div class="sub">长任务跑完时向 webhook 推一条通知：任务耗时达到阈值即推送。</div>
   <label class="f"><span>Webhook 地址</span><input id="webhook" type="text" spellcheck="false" placeholder="飞书/企业微信/钉钉群机器人的 webhook，或任意接收 JSON 的地址" /></label>
   <label class="f"><span>耗时阈值（秒）</span><input id="minsec" type="number" min="0" step="10" placeholder="60" /></label>
   <div id="status" class="status hidden"></div>
@@ -3354,9 +3354,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** 长任务完成的 webhook 推送：耗时达到阈值、且本 VS Code 窗口未聚焦（聚焦说明
-   *  用户正看着，没必要打扰）才发。支持飞书/企微/钉钉群机器人（按域名适配报文），
-   *  其他地址收到通用 JSON。失败只记日志，绝不影响会话流程。 */
+  /** 长任务完成的 webhook 推送：耗时达到阈值就发（曾按窗口聚焦跳过，实际用下来
+   *  人在电脑前窗口常年聚焦、一条都收不到，已去掉该判断）。支持飞书/企微/钉钉
+   *  群机器人（按域名适配报文），其他地址收到通用 JSON。失败只记日志，绝不影响
+   *  会话流程。 */
   private maybeNotifyTurnDone(ctx: SessionCtx, e: { durationMs?: number; isError: boolean }): void {
     // 一次性消费本轮提问：/compact 等没有用户提问的收尾也是普通 result，
     // 不消费的话会带着上一轮的提问误推一条"任务完成"。
@@ -3369,7 +3370,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const minSec = cfg.get<number>("notifyMinDurationSec") ?? 60;
     const dur = e.durationMs ?? 0;
     if (dur < minSec * 1000) return;
-    if (vscode.window.state.focused) return;
     const mins = Math.floor(dur / 60000);
     const secs = Math.round((dur % 60000) / 1000);
     const durText = mins ? `${mins} 分 ${secs} 秒` : `${secs} 秒`;

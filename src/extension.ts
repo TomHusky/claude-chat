@@ -78,6 +78,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
     vscode.commands.registerCommand("claude-chat.slsConfig", () => provider.showSlsConfig()),
     vscode.commands.registerCommand("claude-chat.qqConfig", () => provider.showQQConfig()),
+    vscode.commands.registerCommand("claude-chat.notifyConfig", () => provider.showNotifyConfig()),
     vscode.commands.registerCommand("claude-chat.openLogs", () => {
       try {
         fs.mkdirSync(LOG_DIR, { recursive: true });

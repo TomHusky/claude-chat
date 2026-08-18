@@ -161,6 +161,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private qqState: QQState = "offline";
   /** QQ 配置的独立 webview 面板——与侧边栏零耦合，坏也只坏它自己。 */
   private qqPanel?: vscode.WebviewPanel;
+  private notifyPanel?: vscode.WebviewPanel;
   /** 当前正在处理的 QQ 消息（收集回复用）。机器人一次只处理一条，避免串台。 */
   private qqTurn?: { target: QQIncoming; text: string; done: boolean; blockStart?: number };
   private readonly qqQueue: QQIncoming[] = [];
@@ -2296,6 +2297,155 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </html>`;
   }
 
+  /** 「推送通知」独立配置面板：读写 VS Code 设置（与设置页互通），带测试按钮。 */
+  showNotifyConfig(): void {
+    if (this.notifyPanel) {
+      this.notifyPanel.reveal();
+      this.postNotifyConfig();
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "claude-chat.notify",
+      "任务完成推送",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    this.notifyPanel = panel;
+    panel.webview.html = this.notifyHtml();
+    panel.webview.onDidReceiveMessage(async (m: FromWebview) => {
+      try {
+        switch (m.type) {
+          case "webviewError":
+            this.output.appendLine(`[${new Date().toISOString()}] [webview] 推送面板脚本错误: ${m.message}`);
+            break;
+          case "notifyLoad":
+            this.postNotifyConfig();
+            break;
+          case "notifySave": {
+            const cfg = vscode.workspace.getConfiguration("claudeChat");
+            await cfg.update("notifyWebhook", m.webhook.trim(), vscode.ConfigurationTarget.Global);
+            await cfg.update("notifyMinDurationSec", Math.max(0, Math.round(m.minSec) || 0), vscode.ConfigurationTarget.Global);
+            panel.webview.postMessage({ kind: "notify_result", ok: true, message: "已保存。" } satisfies ToWebview);
+            break;
+          }
+          case "notifyTest": {
+            const url = m.webhook.trim();
+            if (!url) {
+              panel.webview.postMessage({ kind: "notify_result", ok: false, message: "请先填写 webhook 地址。" } satisfies ToWebview);
+              break;
+            }
+            const r = await this.sendWebhook(url, "🔔 ClaudeCopilot 推送测试：webhook 配置成功。", { test: true });
+            panel.webview.postMessage({
+              kind: "notify_result",
+              ok: r.ok,
+              message: r.ok ? `测试消息已发出（HTTP ${r.status}），请到群里确认。` : `发送失败：${r.error}`,
+            } satisfies ToWebview);
+            break;
+          }
+        }
+      } catch (err) {
+        this.output.appendLine(`[notify] 面板消息处理失败(${m.type}): ${String(err)}`);
+      }
+    });
+    // 设置页里改了配置，已打开的面板同步刷新——"互通"要双向。
+    const cfgSub = vscode.workspace.onDidChangeConfiguration((ev) => {
+      if (ev.affectsConfiguration("claudeChat.notifyWebhook") || ev.affectsConfiguration("claudeChat.notifyMinDurationSec")) {
+        this.postNotifyConfig();
+      }
+    });
+    panel.onDidDispose(() => {
+      cfgSub.dispose();
+      if (this.notifyPanel === panel) this.notifyPanel = undefined;
+    });
+  }
+
+  private postNotifyConfig(): void {
+    const cfg = vscode.workspace.getConfiguration("claudeChat");
+    this.notifyPanel?.webview.postMessage({
+      kind: "notify_config",
+      webhook: cfg.get<string>("notifyWebhook") ?? "",
+      minSec: cfg.get<number>("notifyMinDurationSec") ?? 60,
+    } satisfies ToWebview);
+  }
+
+  private notifyHtml(): string {
+    const nonce = randomUUID().replace(/-/g, "");
+    return /* html */ `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'" />
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 0; display: flex; justify-content: center; }
+  .wrap { width: 100%; max-width: 560px; padding: 24px 20px 40px; box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; }
+  h2 { margin: 0; font-size: 16px; }
+  label.f { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+  label.f > span { font-weight: 600; opacity: .85; }
+  input[type=text], input[type=number] { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, rgba(127,127,127,.35)); border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+  input:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
+  .status { font-size: 12px; line-height: 1.6; padding: 7px 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all;
+    background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.12)); }
+  .status.hidden { display: none; }
+  .status.ok { color: #3fb950; }
+  .status.err { color: var(--vscode-errorForeground, #e5534b); }
+  .acts { display: flex; gap: 10px; }
+  button.btn { flex: 1; padding: 7px 0; font: inherit; font-size: 12.5px; cursor: pointer; border-radius: 6px;
+    border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); background: none; color: var(--vscode-foreground); }
+  button.btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+  button.btn:hover { filter: brightness(1.1); }
+  .sub { font-size: 11px; opacity: .65; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>🔔 任务完成推送</h2>
+  <div class="sub">长任务跑完时向 webhook 推一条通知。只有同时满足「任务耗时达到阈值」和「当前 VS Code 窗口未聚焦」才会推送——窗口在前台说明你已经看到结果了。</div>
+  <label class="f"><span>Webhook 地址</span><input id="webhook" type="text" spellcheck="false" placeholder="飞书/企业微信/钉钉群机器人的 webhook，或任意接收 JSON 的地址" /></label>
+  <label class="f"><span>耗时阈值（秒）</span><input id="minsec" type="number" min="0" step="10" placeholder="60" /></label>
+  <div id="status" class="status hidden"></div>
+  <div class="acts">
+    <button id="test" class="btn">发送测试消息</button>
+    <button id="save" class="btn primary">保存</button>
+  </div>
+  <div class="sub">飞书 / 企业微信 / 钉钉的群机器人按域名自动适配报文格式，直接收到文本；其他地址收到通用 JSON：{ text, isError, durationMs, project, question }。配置与 VS Code 设置（claudeChat.notifyWebhook / notifyMinDurationSec）互通。</div>
+</div>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  window.addEventListener("error", (e) => {
+    try { vscode.postMessage({ type: "webviewError", message: (e.message || "?") + " @notify:" + e.lineno }); } catch {}
+  });
+  const $ = (id) => document.getElementById(id);
+  function status(text, kind) {
+    const el = $("status");
+    el.textContent = text || "";
+    el.className = "status" + (text ? "" : " hidden") + (kind ? " " + kind : "");
+  }
+  window.addEventListener("message", (ev) => {
+    const m = ev.data;
+    if (!m) return;
+    if (m.kind === "notify_config") {
+      $("webhook").value = m.webhook || "";
+      $("minsec").value = m.minSec;
+    } else if (m.kind === "notify_result") {
+      status(m.message, m.ok ? "ok" : "err");
+    }
+  });
+  $("save").addEventListener("click", () => {
+    // 阈值留空按默认 60 处理——空值存成 0 会变成"任何时长都推"，与占位符暗示不符
+    const raw = $("minsec").value.trim();
+    vscode.postMessage({ type: "notifySave", webhook: $("webhook").value, minSec: raw === "" ? 60 : Number(raw) });
+  });
+  $("test").addEventListener("click", () => {
+    status("发送中…");
+    vscode.postMessage({ type: "notifyTest", webhook: $("webhook").value });
+  });
+  vscode.postMessage({ type: "notifyLoad" });
+</script>
+</body>
+</html>`;
+  }
+
   /** 非敏感配置存 globalState，AppSecret 存 SecretStorage（加密，不落明文）。 */
   private qqStored(): Omit<QQConfig, "appSecret"> {
     const d = this.context.globalState.get<Omit<QQConfig, "appSecret">>(ChatViewProvider.QQ_STATE_KEY);
@@ -3208,6 +3358,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    *  用户正看着，没必要打扰）才发。支持飞书/企微/钉钉群机器人（按域名适配报文），
    *  其他地址收到通用 JSON。失败只记日志，绝不影响会话流程。 */
   private maybeNotifyTurnDone(ctx: SessionCtx, e: { durationMs?: number; isError: boolean }): void {
+    // 一次性消费本轮提问：/compact 等没有用户提问的收尾也是普通 result，
+    // 不消费的话会带着上一轮的提问误推一条"任务完成"。
+    const lastText = ctx.lastUserText;
+    ctx.lastUserText = undefined;
+    if (!lastText) return;
     const cfg = vscode.workspace.getConfiguration("claudeChat");
     const url = (cfg.get<string>("notifyWebhook") || "").trim();
     if (!url) return;
@@ -3219,22 +3374,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const secs = Math.round((dur % 60000) / 1000);
     const durText = mins ? `${mins} 分 ${secs} 秒` : `${secs} 秒`;
     const proj = vscode.workspace.workspaceFolders?.[0]?.name ?? "";
-    const q = (ctx.lastUserText || "").replace(/\s+/g, " ").slice(0, 80);
+    const q = lastText.replace(/\s+/g, " ").slice(0, 80);
     const msg =
       `${e.isError ? "⚠️ Claude 任务出错" : "✅ Claude 任务完成"}（耗时 ${durText}）` +
       `${proj ? `\n项目：${proj}` : ""}${q ? `\n提问：${q}` : ""}`;
+    void this.sendWebhook(url, msg, { isError: e.isError, durationMs: dur, project: proj, question: q }).then((r) =>
+      this.output.appendLine(`[${new Date().toISOString()}] [notify] ${r.ok ? `webhook HTTP ${r.status}` : `webhook 失败: ${r.error}`}`),
+    );
+  }
+
+  /** 按目标域名适配报文：飞书/企微/钉钉群机器人收纯文本，其他地址收通用 JSON。 */
+  private async sendWebhook(
+    url: string,
+    msg: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<{ ok: boolean; status?: number; error?: string }> {
     let payload: unknown;
     if (/open\.feishu\.cn|open\.larksuite\.com/.test(url)) payload = { msg_type: "text", content: { text: msg } };
     else if (/qyapi\.weixin\.qq\.com|oapi\.dingtalk\.com/.test(url)) payload = { msgtype: "text", text: { content: msg } };
-    else payload = { source: "claude-chat", text: msg, isError: e.isError, durationMs: dur, project: proj, question: q };
-    fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10_000),
-    })
-      .then((r) => this.output.appendLine(`[${new Date().toISOString()}] [notify] webhook HTTP ${r.status}`))
-      .catch((err) => this.output.appendLine(`[${new Date().toISOString()}] [notify] webhook 失败: ${err?.message ?? err}`));
+    else payload = { source: "claude-chat", text: msg, ...extra };
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(10_000),
+      });
+      return { ok: r.ok, status: r.status, ...(r.ok ? {} : { error: `HTTP ${r.status}` }) };
+    } catch (err) {
+      return { ok: false, error: String((err as Error)?.message ?? err) };
+    }
   }
 
   /** All sessions (live tabs AND detached/background runs) currently streaming.

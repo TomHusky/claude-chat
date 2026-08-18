@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.246",
+  "version": "0.1.247",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -104,6 +104,11 @@
         "icon": "$(broadcast)"
       },
       {
+        "command": "claude-chat.notifyConfig",
+        "title": "Claude: 任务完成推送配置",
+        "icon": "$(bell)"
+      },
+      {
         "command": "claude-chat.openLogs",
         "title": "Claude: 打开日志文件夹"
       }
@@ -134,6 +139,11 @@
           "command": "claude-chat.qqConfig",
           "when": "view == claude-chat.chatView",
           "group": "navigation@4"
+        },
+        {
+          "command": "claude-chat.notifyConfig",
+          "when": "view == claude-chat.chatView",
+          "group": "navigation@5"
         }
       ],
       "editor/title": [

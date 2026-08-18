@@ -47,7 +47,7 @@ code --install-extension release/claude-chat.vsix --force
 
 - 🤖 **QQ 机器人**：接入 QQ 开放平台，手机上发消息即可远程操控 Claude 干活。白名单授权 + 配对模式；支持 `/help` `/status` `/usage` `/model` `/effort` `/compact` `/clear` `/stop` 命令。多窗口自动选主，全局只保持一个机器人连接
 - 📈 **SLS 日志查询**：接入阿里云 SLS，让 Claude 直接查生产日志辅助排查
-- 🔔 **任务完成推送**：长任务跑完时向 webhook（飞书/企微/钉钉群机器人）推一条通知；只在任务耗时超过阈值**且窗口未聚焦**时才推——你正看着屏幕就不打扰
+- 🔔 **任务完成推送**：长任务跑完时向 webhook（飞书/企微/钉钉群机器人）推一条通知；只在任务耗时超过阈值**且窗口未聚焦**时才推——你正看着屏幕就不打扰。面板标题栏铃铛图标（或命令 `Claude: 任务完成推送配置`）打开配置页，可发测试消息
 - ⌨️ **斜杠命令**：输入框支持 `/help` `/clear` `/compact` `/model` `/effort` `/usage`，未知的 `/` 命令原样透传给 CLI（不吞掉 skills）
 
 ## 配置项（设置 → 搜索 "Claude Chat"）

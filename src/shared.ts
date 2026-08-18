@@ -124,6 +124,9 @@ export type ToWebview =
   /** slsLoad 的应答，仅回填表单不弹开抽屉。 */
   | { kind: "sls_config"; config: SlsConfig; enginePresent: boolean }
   | { kind: "qq_config"; config: QQConfig; hasSecret: boolean }
+  // ---- 推送通知配置面板 ----
+  | { kind: "notify_config"; webhook: string; minSec: number }
+  | { kind: "notify_result"; ok: boolean; message: string }
   | { kind: "qq_state"; state: "connecting" | "online" | "offline"; detail?: string }
   | { kind: "qq_result"; ok: boolean; message: string }
   /** 配对模式下捕获到的发信人 openid —— 界面提供"填入白名单"一键操作。 */
@@ -260,6 +263,11 @@ export type FromWebview =
   | { type: "qqLoad" }
   | { type: "qqSave"; config: QQConfig }
   | { type: "qqToggle"; enabled: boolean }
+  // ---- 推送通知配置面板 ----
+  | { type: "notifyLoad" }
+  | { type: "notifySave"; webhook: string; minSec: number }
+  /** 用表单里的（可能未保存的）地址发一条测试消息。 */
+  | { type: "notifyTest"; webhook: string }
   | { type: "slsSave"; config: SlsConfig }
   | { type: "slsTest"; config: SlsConfig }
   /** 让 Claude 扫描工作区 Spring Boot 配置生成日志映射（预填 prompt 到聊天）。 */

@@ -48,6 +48,8 @@ interface SessionCtx {
   lastUsedAt?: number;
   /** 本条消息写入 CLI 的时刻；首个流事件到达时用来算真实等待并记日志（然后清掉）。 */
   sendAt?: number;
+  /** 本轮提问原文（截断留底）——任务完成 webhook 推送时带上，让通知可读。 */
+  lastUserText?: string;
   /** 轮次看门狗：本轮最后一次收到任何 CLI 事件的时刻；有值 = 轮次进行中。
    *  CLI 有已知的静默 hang 缺陷（stream-json 多轮、result 后不退出等），一旦发生
    *  我们永远等不到 result、界面永远转圈。超过静默上限就判定卡死并自愈。 */
@@ -1502,6 +1504,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     ctx.sendAt = Date.now(); // 埋点：首个流事件到达时计算真实等待时长
     ctx.lastEventAt = ctx.sendAt; // 轮次看门狗开始计时（任何事件都会刷新它）
+    ctx.lastUserText = (text || "(图片)").slice(0, 200); // 完成推送的通知正文用
     this.output.appendLine(
       `[${new Date().toISOString()}] [send] session=${ctx.sessionId?.slice(0, 8)} 正文${text.length}字 附加${attached?.length ?? 0}字 图片${images?.length ?? 0}`,
     );
@@ -3197,7 +3200,41 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       this.fetchUsage(); // throttled — subscription usage moved after this turn
       // 一轮真实对话本身就把缓存焐热了 —— 记下来，别再浪费 token 去预热。
       if (ctx.sessionId) this.prewarmDone.set(this.warmKey(ctx.sessionId), Date.now());
+      this.maybeNotifyTurnDone(ctx, e);
     }
+  }
+
+  /** 长任务完成的 webhook 推送：耗时达到阈值、且本 VS Code 窗口未聚焦（聚焦说明
+   *  用户正看着，没必要打扰）才发。支持飞书/企微/钉钉群机器人（按域名适配报文），
+   *  其他地址收到通用 JSON。失败只记日志，绝不影响会话流程。 */
+  private maybeNotifyTurnDone(ctx: SessionCtx, e: { durationMs?: number; isError: boolean }): void {
+    const cfg = vscode.workspace.getConfiguration("claudeChat");
+    const url = (cfg.get<string>("notifyWebhook") || "").trim();
+    if (!url) return;
+    const minSec = cfg.get<number>("notifyMinDurationSec") ?? 60;
+    const dur = e.durationMs ?? 0;
+    if (dur < minSec * 1000) return;
+    if (vscode.window.state.focused) return;
+    const mins = Math.floor(dur / 60000);
+    const secs = Math.round((dur % 60000) / 1000);
+    const durText = mins ? `${mins} 分 ${secs} 秒` : `${secs} 秒`;
+    const proj = vscode.workspace.workspaceFolders?.[0]?.name ?? "";
+    const q = (ctx.lastUserText || "").replace(/\s+/g, " ").slice(0, 80);
+    const msg =
+      `${e.isError ? "⚠️ Claude 任务出错" : "✅ Claude 任务完成"}（耗时 ${durText}）` +
+      `${proj ? `\n项目：${proj}` : ""}${q ? `\n提问：${q}` : ""}`;
+    let payload: unknown;
+    if (/open\.feishu\.cn|open\.larksuite\.com/.test(url)) payload = { msg_type: "text", content: { text: msg } };
+    else if (/qyapi\.weixin\.qq\.com|oapi\.dingtalk\.com/.test(url)) payload = { msgtype: "text", text: { content: msg } };
+    else payload = { source: "claude-chat", text: msg, isError: e.isError, durationMs: dur, project: proj, question: q };
+    fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(10_000),
+    })
+      .then((r) => this.output.appendLine(`[${new Date().toISOString()}] [notify] webhook HTTP ${r.status}`))
+      .catch((err) => this.output.appendLine(`[${new Date().toISOString()}] [notify] webhook 失败: ${err?.message ?? err}`));
   }
 
   /** All sessions (live tabs AND detached/background runs) currently streaming.

@@ -47,6 +47,7 @@ code --install-extension release/claude-chat.vsix --force
 
 - 🤖 **QQ 机器人**：接入 QQ 开放平台，手机上发消息即可远程操控 Claude 干活。白名单授权 + 配对模式；支持 `/help` `/status` `/usage` `/model` `/effort` `/compact` `/clear` `/stop` 命令。多窗口自动选主，全局只保持一个机器人连接
 - 📈 **SLS 日志查询**：接入阿里云 SLS，让 Claude 直接查生产日志辅助排查
+- 🔔 **任务完成推送**：长任务跑完时向 webhook（飞书/企微/钉钉群机器人）推一条通知；只在任务耗时超过阈值**且窗口未聚焦**时才推——你正看着屏幕就不打扰
 - ⌨️ **斜杠命令**：输入框支持 `/help` `/clear` `/compact` `/model` `/effort` `/usage`，未知的 `/` 命令原样透传给 CLI（不吞掉 skills）
 
 ## 配置项（设置 → 搜索 "Claude Chat"）
@@ -64,6 +65,8 @@ code --install-extension release/claude-chat.vsix --force
 | `claudeChat.prewarmMaxSizeMB` | 超过此大小不再预热，改为建议压缩；`0` 表示不限制 | `12` |
 | `claudeChat.turnStallTimeoutSec` | 一轮对话允许的最大完全静默秒数，超时判定卡死并自愈 | `720` |
 | `claudeChat.qqBotPermissionMode` | QQ 机器人专用会话的权限模式 | `acceptEdits` |
+| `claudeChat.notifyWebhook` | 任务完成推送的 webhook（支持飞书/企微/钉钉群机器人），留空关闭 | `""` |
+| `claudeChat.notifyMinDurationSec` | 任务时长达到该秒数、且窗口未聚焦时才推送 | `60` |
 | `claudeChat.pythonPath` | SLS 查询引擎初始化用的 python3 路径 | `""` |
 
 ## 快捷键

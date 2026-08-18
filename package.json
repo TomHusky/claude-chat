@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.245",
+  "version": "0.1.246",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -256,6 +256,17 @@
           "type": "string",
           "default": "",
           "description": "追加到系统提示的全局指令（对接 claude --append-system-prompt）。强制中文请填：IMPORTANT: 无论用户用什么语言提问，你都必须只用简体中文回复。（软指令如「请用中文」可能被英文提问盖过，需用这种强指令。）留空则只用 CLAUDE.md / settings 默认配置。"
+        },
+        "claudeChat.notifyWebhook": {
+          "type": "string",
+          "default": "",
+          "description": "任务完成推送的 webhook 地址。填飞书/企业微信/钉钉群机器人的 webhook 可直接收到文本消息；其他地址会收到通用 JSON（{text, isError, durationMs, project, question}）。留空关闭推送。"
+        },
+        "claudeChat.notifyMinDurationSec": {
+          "type": "number",
+          "default": 60,
+          "minimum": 0,
+          "description": "任务执行时长达到该秒数才推送（默认 60 秒——短任务你多半还盯着屏幕，不值得打扰）。另外只有当前 VS Code 窗口未聚焦时才会推送：窗口在前台说明你已经看到结果了。"
         },
         "claudeChat.pythonPath": {
           "type": "string",

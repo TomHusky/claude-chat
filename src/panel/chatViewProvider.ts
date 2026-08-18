@@ -1809,6 +1809,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       kind: "notice",
       message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。${skippedNote}下一条消息将从这里继续。`,
     });
+    // 被回退掉的那轮提问自动带回输入框，方便改完重发（webview 侧输入框非空
+    // 时不覆盖）；同步宿主侧留底，看门狗重建 webview 后也不丢。
+    if (result.userText) {
+      ctx.draft = result.userText;
+      this.post(ctx, { kind: "draft", text: result.userText });
+    }
     this.refreshChangedFiles(ctx);
   }
 

@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.248",
+  "version": "0.1.249",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -74,11 +74,6 @@
         "title": "Claude: Add Selection to Chat"
       },
       {
-        "command": "claude-chat.moveToRight",
-        "title": "Claude: 移到右侧栏 (不挡代码)",
-        "icon": "$(layout-sidebar-right)"
-      },
-      {
         "command": "claude-chat.openInEditor",
         "title": "Claude: 在编辑器右侧打开",
         "icon": "$(link-external)"
@@ -119,11 +114,6 @@
           "command": "claude-chat.openInEditor",
           "when": "view == claude-chat.chatView",
           "group": "navigation@0"
-        },
-        {
-          "command": "claude-chat.moveToRight",
-          "when": "view == claude-chat.chatView",
-          "group": "navigation@3"
         },
         {
           "command": "claude-chat.checkUpdate",

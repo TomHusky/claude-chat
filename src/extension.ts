@@ -74,7 +74,6 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.stop", () => provider.stop()),
     vscode.commands.registerCommand("claude-chat.focusInput", () => provider.focusInput()),
     vscode.commands.registerCommand("claude-chat.addSelectionToChat", () => provider.addSelection()),
-    vscode.commands.registerCommand("claude-chat.moveToRight", () => moveToRight()),
     vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
     vscode.commands.registerCommand("claude-chat.slsConfig", () => provider.showSlsConfig()),
     vscode.commands.registerCommand("claude-chat.qqConfig", () => provider.showQQConfig()),
@@ -95,33 +94,6 @@ export function activate(context: vscode.ExtensionContext): void {
   const updateTimer = setTimeout(() => void provider.checkForUpdate(true), 4000);
   context.subscriptions.push({ dispose: () => clearTimeout(updateTimer) });
 
-  // First run: recommend moving the chat to the right Secondary Side Bar.
-  // (A side-bar view — unlike an editor tab — lets you drag files from the
-  //  explorer into the input to attach them without VS Code opening them.)
-  if (!context.globalState.get("claudeChat.rightBarPrompted")) {
-    void context.globalState.update("claudeChat.rightBarPrompted", true);
-    void vscode.window
-      .showInformationMessage(
-        "把 Claude Chat 放到右侧栏吗？在右边不挡代码，并且可以从资源管理器拖文件到输入框附加（不会打开文件）。",
-        "移到右侧栏",
-        "暂不",
-      )
-      .then((choice) => {
-        if (choice === "移到右侧栏") void moveToRight();
-      });
-  }
-}
-
-/** Focus the chat view, then open VS Code's move picker (choose “Secondary Side Bar”). */
-async function moveToRight(): Promise<void> {
-  try {
-    await vscode.commands.executeCommand("claude-chat.chatView.focus");
-    await vscode.commands.executeCommand("workbench.action.moveFocusedView");
-  } catch {
-    void vscode.window.showInformationMessage(
-      "把左侧活动栏的 Claude Chat 图标拖到编辑器右侧，或右键它选择 “Move To → Secondary Side Bar” 即可。",
-    );
-  }
 }
 
 export function deactivate(): void {

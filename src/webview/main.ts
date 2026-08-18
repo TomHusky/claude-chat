@@ -2983,6 +2983,8 @@ function appendNotice(text: string, kind: "info" | "error") {
  *  the user can scroll past). */
 function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
   const exhausted = m.level === "exhausted";
+  // 按模型的周限用尽 ≠ 不能对话：切换其他模型就能继续，绝不锁输入框。
+  const blocking = exhausted && !m.modelScoped;
   messagesEl.querySelector(".rate-limit-banner")?.remove(); // never stack banners
 
   const box = el("div", `rate-limit-banner ${exhausted ? "exhausted" : "warning"}`);
@@ -2991,9 +2993,9 @@ function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
     el("span", "rl-ico", exhausted ? "⛔" : "⚠"),
     el("b", "rl-title", exhausted ? `${m.limitLabel}已用尽` : `${m.limitLabel}即将用尽`),
   );
-  if (!exhausted) {
-    // 警告级可关闭：本重置周期内不再提示（宿主记住 resetsAt，周期一过自然恢复）。
-    // 耗尽级是阻断性的，必须一直显示，不给关闭按钮。
+  if (!blocking) {
+    // 非阻断级可关闭：本重置周期内不再提示（宿主记住 resetsAt，周期一过自然恢复）。
+    // 全局耗尽是阻断性的，必须一直显示，不给关闭按钮。
     const x = el("button", "rl-close", "×");
     x.title = "本周期内不再提示";
     x.onclick = () => {
@@ -3008,14 +3010,16 @@ function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
     "div",
     "rl-body",
     exhausted
-      ? `已达到订阅限额,暂时无法继续对话。${when ? `将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
+      ? m.modelScoped
+        ? `该模型的额度已用尽,切换其他模型可立即继续。${when ? `此模型将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
+        : `已达到订阅限额,暂时无法继续对话。${when ? `将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
       : `接近订阅限额。${when ? `${when} 重置${cd ? `(${cd})` : ""}。` : ""}`,
   );
   box.append(head, body);
   messagesEl.appendChild(box);
   scrollToBottom();
 
-  if (exhausted) {
+  if (blocking) {
     rateLimited = true;
     setGlow("error");
     setBusy(false);

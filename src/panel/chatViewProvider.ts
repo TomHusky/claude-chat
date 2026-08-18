@@ -3139,8 +3139,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
     // 用量"警告"横幅被用户关过的话，本重置周期内不再弹（每个新进程都会重报一次，
-    // 不在这拦就永远关不干净）。exhausted 是阻断性的，永远放行。
-    if (e.kind === "rate_limit" && e.level === "warning") {
+    // 不在这拦就永远关不干净）。全局 exhausted 是阻断性的，永远放行；按模型的
+    // exhausted 不阻断、可关闭，所以同样尊重用户的关闭。
+    if (e.kind === "rate_limit" && (e.level === "warning" || (e.level === "exhausted" && e.modelScoped))) {
       const until = this.context.globalState.get<Record<string, number>>("claudeChat.rateLimitDismissed")?.[e.limitLabel] ?? 0;
       if (Date.now() < until) {
         this.output.appendLine(`[${new Date().toISOString()}] [ratelimit] 「${e.limitLabel}」警告已被关闭，跳过（至 ${new Date(until).toLocaleString()}）`);

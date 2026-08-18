@@ -669,11 +669,25 @@ export class ClaudeProcess {
     }
     if (this.lastRateLimitLevel === level) return;
     this.lastRateLimitLevel = level;
+    this.hooks.emit({ kind: "diag", message: `rate_limit: ${JSON.stringify(info).slice(0, 300)}` });
+    // 类型名与文案对照 CLI 二进制内部表（Vxt）：seven_day_overage_included 就是
+    // Fable 的按模型周限（"Fable 5 limit"）。按模型的限额用尽 ≠ 不能对话——
+    // 换个模型就能继续，所以标记 modelScoped 让前端别把输入框锁死。
+    const t = info.rateLimitType;
+    const modelScoped = t === "seven_day_opus" || t === "seven_day_sonnet" || t === "seven_day_overage_included";
+    const limitLabel =
+      t === "seven_day" ? "每周用量"
+      : t === "seven_day_opus" ? "Opus 模型每周用量"
+      : t === "seven_day_sonnet" ? "Sonnet 模型每周用量"
+      : t === "seven_day_overage_included" ? "Fable 模型每周用量"
+      : t === "overage" ? "超额用量"
+      : "5 小时用量";
     this.hooks.emit({
       kind: "rate_limit",
       level,
-      limitLabel: info.rateLimitType === "seven_day" ? "每周用量" : "5 小时用量",
+      limitLabel,
       resetsAt: typeof info.resetsAt === "number" ? info.resetsAt : undefined,
+      ...(modelScoped ? { modelScoped: true } : {}),
     });
   }
 

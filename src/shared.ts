@@ -99,8 +99,10 @@ export type ToWebview =
   | { kind: "usage"; sessionPct?: number; sessionResetAt?: number; sessionReset?: string; weekPct?: number; weekReset?: string; weekModelPct?: number; weekModelName?: string }
   | { kind: "compacting" }
   | { kind: "compacted"; trigger: string; preTokens: number; postTokens: number }
-  /** Subscription quota. `exhausted` blocks further turns until `resetsAt`. */
-  | { kind: "rate_limit"; level: "warning" | "exhausted"; limitLabel: string; resetsAt?: number }
+  /** Subscription quota. `exhausted` blocks further turns until `resetsAt` —
+   *  except `modelScoped`（按模型的周限）: switching models can continue, so the
+   *  composer must NOT be locked. */
+  | { kind: "rate_limit"; level: "warning" | "exhausted"; limitLabel: string; resetsAt?: number; modelScoped?: boolean }
   /** The quota window reset — unlock the composer. */
   | { kind: "rate_limit_cleared" }
   | { kind: "error"; message: string }

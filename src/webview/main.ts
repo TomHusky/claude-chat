@@ -283,7 +283,10 @@ function endTimelineAtLastNode(msg: HTMLElement) {
     line.style.display = "";
     const aTop = msg.getBoundingClientRect().top;
     const lineTop = line.getBoundingClientRect().top - aTop;
-    const endY = last.getBoundingClientRect().top - aTop + 9.5; // dot center (top: 9.5px)
+    // dot centers differ by node kind: steps anchor at 9.5px, the closing
+    // summary dot at 11.5px (13px×1.7 first line) — end the line on the right one.
+    const dotY = last.classList.contains("summary-node") ? 11.5 : 9.5;
+    const endY = last.getBoundingClientRect().top - aTop + dotY;
     line.style.flex = "0 0 auto";
     line.style.height = Math.max(0, endY - lineTop) + "px";
   };
@@ -1185,7 +1188,9 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
     box.appendChild(bodyDiv);
     bodyWrap.appendChild(box);
     // Only keep it collapsed (and show the toggle) if it actually overflows.
-    if (pre.scrollHeight - pre.clientHeight > 4) {
+    // Hidden hosts (folded history) measure 0 — fall back to the line count.
+    const overflows = pre.scrollHeight === 0 ? lines > 3 : pre.scrollHeight - pre.clientHeight > 4;
+    if (overflows) {
       const btn = el("button", "code-expand") as HTMLButtonElement;
       const setLabel = () =>
         (btn.innerHTML = box.classList.contains("collapsed") ? `${ICON.chevron}展开全部 ${lines} 行` : `${ICON.chevron}收起`);
@@ -3017,7 +3022,7 @@ messagesEl.addEventListener("click", (e) => {
     const block = action.closest(".code-block") as HTMLElement | null;
     if (block) {
       const collapsed = block.classList.toggle("collapsed");
-      action.textContent = collapsed ? `展开全部 ${block.dataset.lines || ""} 行` : "收起";
+      action.innerHTML = `${ICON.chevron}` + (collapsed ? `展开全部 ${block.dataset.lines || ""} 行` : "收起");
     }
   } else if (action.dataset.action === "diff") {
     const p = action.dataset.path;

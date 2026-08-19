@@ -4728,8 +4728,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <footer id="composer">
       <div id="changed-files" class="changed-files hidden">
         <div class="cf-header" id="cf-header">
-          <span class="cf-caret">▾</span>
+          <span class="cf-caret">${ICONS.chevron}</span>
           <span class="cf-title">已更改文件</span>
+          <span id="cf-count" class="cf-count"></span>
           <span id="cf-stat" class="cf-stat"></span>
         </div>
         <div id="cf-list" class="cf-list"></div>
@@ -4740,15 +4741,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="image-previews"></div>
       <div id="queue-hint" class="queue-hint hidden"><span class="qh-key">↵</span> 任务进行中 · 回车将内容加入<b>等待队列</b></div>
       <div class="input-wrap">
-        <textarea id="input" rows="1" placeholder="给 Claude 发消息…  (Enter 发送 / Shift+Enter 换行 · 📎 或拖拽附加文件)"></textarea>
+        <textarea id="input" rows="1" placeholder="给 Claude 发消息…"></textarea>
         <div class="composer-bottom">
-          <button id="btn-attach-file" class="composer-btn" title="附加文件/目录到会话">${ICONS.attach}</button>
-          <button id="model-trigger" class="composer-pick" title="选择模型"><span id="model-label">默认模型</span><span class="pick-caret">⌄</span></button>
-          <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji"></span><span id="mode-label"></span></button>
-          <button id="sls-toggle-btn" class="composer-pick sls-toggle-btn hidden" title="打开后，本条消息会带上 SLS 日志工具用法，Claude 可直接查后端日志"><span class="sls-dot"></span><span>SLS日志</span></button>
-          <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
-          <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>
-          <div class="spacer"></div>
+          <div class="composer-tools">
+            <button id="btn-attach-file" class="composer-btn" title="附加文件/目录到会话">${ICONS.attach}</button>
+            <span class="composer-sep"></span>
+            <button id="model-trigger" class="composer-pick" title="选择模型"><span class="pick-emoji">${ICONS.model}</span><span id="model-label" class="pick-label">默认模型</span><span class="pick-caret">${ICONS.chevron}</span></button>
+            <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji"></span><span id="mode-label" class="pick-label"></span><span class="pick-caret">${ICONS.chevron}</span></button>
+            <button id="sls-toggle-btn" class="composer-pick sls-toggle-btn hidden" title="打开后，本条消息会带上 SLS 日志工具用法，Claude 可直接查后端日志"><span class="pick-emoji sls-ico">${ICONS.database}</span><span class="pick-label">SLS日志</span></button>
+            <span class="composer-state">
+              <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
+              <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>
+            </span>
+          </div>
           <button id="btn-send" class="composer-send" title="发送">${ICONS.send}</button>
           <button id="btn-stop" class="composer-send stop hidden" title="停止">${ICONS.stop}</button>
         </div>
@@ -4757,7 +4762,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <div id="mode-menu" class="pick-menu hidden"></div>
       <div id="model-menu" class="pick-menu hidden"></div>
       <div id="usage-menu" class="pick-menu usage-menu hidden"></div>
-      <div id="status-line" class="status-line"></div>
+      <div class="composer-foot">
+        <span class="foot-keys"><kbd>Enter</kbd>发送<kbd>⇧↵</kbd>换行</span>
+        <span class="foot-spacer"></span>
+        <span id="status-line" class="status-line"></span>
+      </div>
     </footer>
   </div>
   <script nonce="${nonce}" src="${scriptUri}"></script>

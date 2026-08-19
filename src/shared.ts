@@ -26,9 +26,15 @@ export const ICONS: Record<string, string> = {
   trash: _s('<path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/>'),
   play: _s('<path d="M5 3.8v8.4l7-4.2z"/>'),
   update: _s('<path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/>'),
-  thumbUp: _s('<g transform="translate(.5 .5) scale(.625)" stroke-width="2.2"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z"/></g>'),
-  thumbDown: _s('<g transform="translate(.5 .5) scale(.625)" stroke-width="2.2"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/></g>'),
   database: _s('<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M3 8c0 1.1 2.24 2 5 2s5-.9 5-2"/>'),
+  // Directional/confirm glyphs — the UI used to draw these with text characters
+  // ("⌄", "‹", "›", "✓"), which pick up the UI font's own metrics and sit off-centre.
+  chevron: _s('<path d="M4.5 6.5 8 10l3.5-3.5"/>'),
+  chevronLeft: _s('<path d="M9.5 4.5 6 8l3.5 3.5"/>'),
+  chevronRight: _s('<path d="M6.5 4.5 10 8l-3.5 3.5"/>'),
+  check: _s('<path d="M3.5 8.4 6.3 11.2 12.5 5"/>'),
+  // four-point sparkle — the model picker's glyph
+  model: _s('<path d="M8 2.2 9.5 6.5 13.8 8 9.5 9.5 8 13.8 6.5 9.5 2.2 8 6.5 6.5z"/>'),
 };
 
 /** SLS 连接配置。持久化在 `~/sls-tools/config.json`，供 `sls` CLI 与本面板共用。
@@ -192,7 +198,8 @@ export type TimelineItem =
   | { type: "user"; text: string; context?: string; images?: string[]; files?: string[]; sls?: boolean }
   | { type: "image"; src: string } // standalone image (assistant/tool), data: URI
   | { type: "assistant_text"; text: string }
-  | { type: "thinking"; text: string }
+  /** secs：思考耗时（由相邻 transcript 记录的 timestamp 差估算，可能缺失）。 */
+  | { type: "thinking"; text: string; secs?: number }
   | {
       type: "tool";
       toolId: string;

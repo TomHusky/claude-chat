@@ -70,15 +70,19 @@ function wrapCodeBlock(highlighted: string, lang: string, raw: string, run: bool
   const collapsible = lineCount > COLLAPSE_THRESHOLD;
   const cls = "code-block" + (collapsible ? " collapsible collapsed" : "");
   const runBtn = run ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play} 执行</button>` : "";
-  const actionsHtml = actions
-    ? `<div class="code-actions">${runBtn}<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button></div>`
+  // A header strip naming the language, carrying copy/run. They used to float
+  // over the code and only appear on hover — undiscoverable, and they covered
+  // the first line while you were reading it.
+  const headHtml = actions
+    ? `<div class="code-head"><span class="code-lang">${escapeHtml(lang || "text")}</span>` +
+      `<div class="code-actions">${runBtn}<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button></div></div>`
     : "";
   const expandBtn = collapsible
-    ? `<button class="code-expand" data-action="toggle-code">展开全部 ${lineCount} 行</button>`
+    ? `<button class="code-expand" data-action="toggle-code">${ICON.chevron}展开全部 ${lineCount} 行</button>`
     : "";
   return (
     `<div class="${cls}" data-lines="${lineCount}">` +
-    actionsHtml +
+    headHtml +
     `<div class="code-body"><pre class="hljs"><code>${highlighted}</code></pre></div>` +
     expandBtn +
     `</div>`
@@ -139,6 +143,7 @@ const overlay = $("overlay");
 const changedFiles = $("changed-files");
 const cfList = $("cf-list");
 const cfStat = $("cf-stat");
+const cfCount = $("cf-count");
 const cfHeader = $("cf-header");
 const lightbox = $("lightbox");
 const lightboxImg = $<HTMLImageElement>("lightbox-img");
@@ -200,9 +205,12 @@ function ensureAssistant(): HTMLElement {
     const rail = el("div", "rail");
     const avatar = el("div", "avatar");
     avatar.innerHTML = SUNBURST;
-    const line = el("div", "thread-line");
-    rail.append(avatar, line);
+    rail.append(avatar);
     const body = el("div", "msg-body");
+    // The rail line is anchored INSIDE the body, off its left edge — the dots
+    // use the same containing block and the same left arithmetic, so no layout
+    // quirk can ever shift one without the other.
+    body.appendChild(el("div", "thread-line"));
     assistantEl.append(rail, body);
     messagesEl.appendChild(assistantEl);
   }
@@ -210,12 +218,13 @@ function ensureAssistant(): HTMLElement {
 }
 
 function finalizeTurn() {
+  flushThinkNode(); // 以思考收尾的轮次（如中断）也要把节点落下
   finalizeLive();
   removeWorking();
   cancelPendingInteractions();
   if (assistantEl) {
     assistantEl.classList.remove("streaming-turn");
-    assistantEl.querySelector(".rail .thread-active")?.remove(); // stop the progress pulse
+    assistantEl.querySelector(".thread-active")?.remove(); // stop the progress pulse
     const body = assistantEl.querySelector(".msg-body");
     // If the user manually stopped, mark it at the very end of the reply.
     if (body && userStopped) body.appendChild(el("div", "msg-interrupted", "[Request interrupted by user]"));
@@ -226,7 +235,12 @@ function finalizeTurn() {
       // start) — but only when it follows earlier content (not the very first item).
       const segs = body.querySelectorAll(".text-seg");
       const last = segs[segs.length - 1];
-      if (last && body.firstElementChild !== last) last.classList.add("summary-node");
+      // "first content" skips the thread-line/active divs that now live in the
+      // body — a lone text reply must NOT get a closing node.
+      const firstContent = Array.from(body.children).find(
+        (c) => !c.classList.contains("thread-line") && !c.classList.contains("thread-active"),
+      );
+      if (last && firstContent !== last) last.classList.add("summary-node");
       endTimelineAtLastNode(assistantEl); // stop the line at the last node
       // Footer: a row of borderless icon buttons under the reply.
       if (!body.querySelector(".msg-actions")) {
@@ -269,7 +283,7 @@ function endTimelineAtLastNode(msg: HTMLElement) {
     line.style.display = "";
     const aTop = msg.getBoundingClientRect().top;
     const lineTop = line.getBoundingClientRect().top - aTop;
-    const endY = last.getBoundingClientRect().top - aTop + 9; // ≈ dot center
+    const endY = last.getBoundingClientRect().top - aTop + 9.5; // dot center (top: 9.5px)
     line.style.flex = "0 0 auto";
     line.style.height = Math.max(0, endY - lineTop) + "px";
   };
@@ -382,14 +396,17 @@ function finalizeLive() {
 function updateActiveLine() {
   if (!assistantEl || !assistantEl.classList.contains("streaming-turn")) return;
   const rail = assistantEl.querySelector(".rail") as HTMLElement | null;
+  const body = assistantEl.querySelector(".msg-body") as HTMLElement | null;
   const line = assistantEl.querySelector(".thread-line") as HTMLElement | null;
-  if (!rail || !line) return;
-  let active = rail.querySelector(".thread-active") as HTMLElement | null;
+  if (!rail || !body || !line) return;
+  let active = assistantEl.querySelector(".thread-active") as HTMLElement | null;
   if (!active) {
     active = el("div", "thread-active");
-    rail.appendChild(active);
+    body.appendChild(active); // same containing block as line + dots
   }
-  const railTop = rail.getBoundingClientRect().top;
+  // body and rail share the same top (the row stretches both), but measure the
+  // active line's actual parent to be exact.
+  const railTop = body.getBoundingClientRect().top;
   // Last node = the last visible step dot, else the avatar (first node).
   const dots = assistantEl.querySelectorAll(".msg-body .step .step-dot");
   let startY: number;
@@ -506,6 +523,14 @@ function resetCountdown(resetAt?: number): string | undefined {
   const m = mins % 60;
   return h > 0 ? `还剩 ${h} 小时 ${m} 分` : `还剩 ${m} 分`;
 }
+/** Same countdown, compact enough to sit inside the quota banner's pill. */
+function resetCountdownShort(resetAt?: number): string | undefined {
+  if (!resetAt) return undefined;
+  const mins = Math.round((resetAt * 1000 - Date.now()) / 60000);
+  if (mins <= 0) return "即将重置";
+  const h = Math.floor(mins / 60);
+  return h > 0 ? `${h}h` : `${mins}m`;
+}
 /** Claude subscription usage (current session + weekly quota), where cost was.
  *  Mirrors the official /usage panel: session % w/ reset countdown + weekly %. */
 type UsageData = {
@@ -521,14 +546,20 @@ let lastUsageData: UsageData = {};
 const usageMenu = $("usage-menu");
 function renderUsage(sessionPct?: number, sessionReset?: string, weekPct?: number, weekReset?: string, weekModelPct?: number, weekModelName?: string) {
   lastUsageData = { sessionPct, sessionReset, weekPct, weekReset, weekModelPct, weekModelName };
+  // Dim label + bright number, no mini bars — the pill is a glance value, the
+  // full bars live one click away in the popover.
+  const item = (key: string, pct: number) =>
+    `<span class="up-item"><span class="up-key">${key}</span><span class="up-pct">${pct}%</span></span>`;
   const parts: string[] = [];
-  if (typeof sessionPct === "number") parts.push(`会话 ${sessionPct}%`);
-  if (typeof weekPct === "number") parts.push(`周 ${weekPct}%`);
+  if (typeof sessionPct === "number") parts.push(item("会话", sessionPct));
+  if (typeof weekPct === "number") parts.push(item("周", weekPct));
   if (!parts.length) return;
   usagePill.classList.remove("hidden");
   const peak = Math.max(sessionPct ?? 0, weekPct ?? 0);
-  usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-descriptionForeground)");
-  usagePill.textContent = parts.join(" · ");
+  usagePill.style.setProperty("--u-color", peak >= 90 ? "#e5534b" : peak >= 70 ? "#e0a33e" : "var(--vscode-textLink-foreground, #4a9eff)");
+  usagePill.classList.toggle("warn", peak >= 70);
+  usagePill.innerHTML = parts.join("");
+  refitComposer(); // the pill's arrival changes the row's natural width
   usagePill.title = "Claude 订阅用量 · 点击查看详情";
   if (!usageMenu.classList.contains("hidden")) buildUsageMenu(); // live-refresh while open
 }
@@ -571,12 +602,14 @@ function usageRow(label: string, pct: number | undefined, resetText: string): st
   const p = has ? Math.max(0, Math.min(100, pct as number)) : 0;
   const shown = has ? `${pct}%` : "—";
   const warn = p >= 90 ? " warn-high" : p >= 70 ? " warn-mid" : "";
+  // Name, reset and percentage share one baseline; the bar sits under them.
+  // The reset on its own line made every row three lines tall.
   return (
     `<div class="usage-row${warn}">` +
-    `<div class="usage-row-top"><span class="usage-name">${label}</span>` +
+    `<div class="usage-row-top"><span class="usage-name">${label}</span><span class="spacer"></span>` +
+    (resetText ? `<span class="usage-reset">${resetText}</span>` : "") +
     `<span class="usage-pct">${shown}</span></div>` +
     `<div class="usage-bar"><span style="width:${p}%"></span></div>` +
-    (resetText ? `<div class="usage-reset">${resetText}</div>` : "") +
     `</div>`
   );
 }
@@ -764,7 +797,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       startTypewriter();
       break;
     case "thinking_delta":
-      addStreamEst(m.text); // not displayed, but grows the live token estimate
+      addStreamEst(m.text); // grows the live token estimate
+      if (liveThink) liveThink.text += m.text; // 收集思考全文，落节点时挂 tooltip
       break;
     case "tokens":
       onTokens(m.output);
@@ -900,7 +934,27 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
   }
 });
 
+/** 直播中的思考块（进行中）。结束时落成与历史回放完全一致的时间线节点——
+ *  此前直播只给转圈药丸、不落节点，同一会话"直播看没有 Thinking、回放看有"。 */
+let liveThink: { startAt: number; text: string } | null = null;
+
+/** 思考块结束（下一个块开始/轮次收尾）时，落一个 "Thinking · Ns" 节点。 */
+function flushThinkNode() {
+  if (!liveThink) return;
+  const secs = Math.round((performance.now() - liveThink.startAt) / 1000);
+  const body = ensureAssistant();
+  const step = el("div", "step think");
+  const node = el("div", "think-node", secs > 0 ? `Thinking · ${secs}s` : "Thinking");
+  if (liveThink.text) node.title = truncateText(liveThink.text, 800);
+  step.append(el("div", "step-dot"), node);
+  body.appendChild(step);
+  liveThink = null;
+  updateActiveLine();
+  maybeScroll();
+}
+
 function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, toolName?: string) {
+  flushThinkNode(); // 上一个思考块到此结束（连续思考块也各落各的节点）
   const body = ensureAssistant();
   if (type === "tool_use" && toolId) {
     finalizeLive();
@@ -922,9 +976,10 @@ function onBlockStart(type: "text" | "thinking" | "tool_use", toolId?: string, t
     return;
   }
   if (type === "thinking") {
-    // Thinking content isn't shown — keep a live "Thinking · Ns" pill instead.
+    // 思考中显示转圈药丸；块结束时由 flushThinkNode 落下与回放一致的节点。
     finalizeLive();
     liveBlock = null;
+    liveThink = { startAt: performance.now(), text: "" };
     showWorking();
     return;
   }
@@ -967,8 +1022,9 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
   // 与官方 Claude Code 一致：TodoWrite 卡片标题显示为 "Update Todos"。
   const displayName = name === "TodoWrite" ? "Update Todos" : name;
   head.innerHTML =
+    `<span class="tool-name">${escapeHtml(displayName)}</span>` +
     `${icon ? `<span class="tool-icon">${icon}</span>` : ""}` +
-    `<span class="tool-name">${escapeHtml(displayName)}</span><span class="tool-why"></span><span class="tool-sub"></span>` +
+    `<span class="tool-why"></span><span class="tool-sub"></span>` +
     `<div class="tool-actions"></div>`;
   const bodyWrap = el("div", "tool-body");
   card.append(head, bodyWrap);
@@ -1008,8 +1064,8 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
     actions.innerHTML =
       name === "TodoWrite"
         ? ""
-        : (name === "Bash" ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play} 执行</button>` : "") +
-          `<button class="code-act" data-action="copy" title="复制">${ICON.copy} 复制</button>`;
+        : (name === "Bash" ? `<button class="code-act" data-action="run" title="在终端执行">${ICON.play}</button>` : "") +
+          `<button class="code-act" data-action="copy" title="复制">${ICON.copy}</button>`;
   }
 }
 
@@ -1081,11 +1137,18 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const bad = isError || interrupted;
   card.classList.toggle("error", bad);
   card.closest(".step")?.classList.toggle("error", bad); // red timeline dot
+  // A Bash step that ran clean turns its node green — executed, side effects in
+  // place — matching the green Edit/Write dots. Read stays a neutral gray.
+  if (!bad && (card.dataset.toolName || "") === "Bash") card.closest(".step")?.classList.add("ok");
   const why = card.querySelector(".tool-why") as HTMLElement | null;
   if (why) {
+    // Only name an interruption; a plain failure needs no badge — the red
+    // timeline node already carries it.
     why.classList.toggle("warn", interrupted && !isError);
-    why.textContent = bad ? (interrupted ? "已中断" : "执行失败") : "";
+    why.textContent = interrupted && !isError ? "已中断" : "";
   }
+  // A failed tool drops its head icon too, so the title is just the name.
+  if (bad) card.querySelector(".tool-head .tool-icon")?.remove();
   // Interrupted: the "[Request interrupted by user]" text is shown once at the
   // end of the reply, so don't also dump it in the tool body — the badge says it.
   if (interrupted && !isError) {
@@ -1104,11 +1167,44 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const bodyWrap = card.querySelector(".tool-body") as HTMLElement;
   const existing = card.querySelector(".tool-result");
   if (existing) existing.remove();
+  const shown = truncateText(content, 8000);
+  const lines = shown.replace(/\n+$/, "").split("\n").length;
+  if (isError) {
+    // Errors: no header row — the red node already says it failed. Fold to a
+    // ~3-line preview like a long Bash command, but decide by MEASURED height:
+    // this text is only 3 newlines yet wraps to ~8 visual lines.
+    const box = el("div", "tool-result err-flat collapsed");
+    const bodyDiv = el("div", "err-body");
+    const pre = el("pre", "tool-result-body");
+    pre.textContent = shown;
+    bodyDiv.appendChild(pre);
+    box.appendChild(bodyDiv);
+    bodyWrap.appendChild(box);
+    // Only keep it collapsed (and show the toggle) if it actually overflows.
+    if (pre.scrollHeight - pre.clientHeight > 4) {
+      const btn = el("button", "code-expand") as HTMLButtonElement;
+      const setLabel = () =>
+        (btn.innerHTML = box.classList.contains("collapsed") ? `${ICON.chevron}展开全部 ${lines} 行` : `${ICON.chevron}收起`);
+      btn.onclick = () => {
+        box.classList.toggle("collapsed");
+        setLabel();
+      };
+      setLabel();
+      box.appendChild(btn);
+    } else {
+      box.classList.remove("collapsed");
+    }
+    maybeScroll();
+    return;
+  }
   const details = el("details", "tool-result");
-  if (isError) details.setAttribute("open", "");
-  const summary = el("summary", "", isError ? "错误输出" : "查看结果");
+  const summary = el("summary");
+  summary.innerHTML =
+    `<span class="tr-caret">${ICON.chevron}</span>` +
+    `<span class="tr-title">查看结果</span>` +
+    `<span class="tr-count">${lines} 行</span>`;
   const pre = el("pre", "tool-result-body");
-  pre.textContent = truncateText(content, 8000);
+  pre.textContent = shown;
   details.append(summary, pre);
   bodyWrap.appendChild(details);
   maybeScroll();
@@ -1161,9 +1257,34 @@ function renderToolInput(name: string, input: Record<string, unknown>): { subtit
     }
     case "Bash": {
       const cmd = String(input.command ?? "");
-      const desc = input.description ? `<div class="muted">${escapeHtml(String(input.description))}</div>` : "";
-      // No header subtitle — the command is shown in the code block below.
-      return { subtitle: "", html: `${desc}${codeBlock(cmd, "bash")}` };
+      // The description belongs on the title line next to "Bash", not as the
+      // card's first row; without one, the command's first line stands in so
+      // the step is identifiable while collapsed/scrolling.
+      const subtitle = input.description ? String(input.description) : cmd.split("\n")[0];
+      // No syntax colours on shell commands — flags/strings lighting up in
+      // four hues adds noise, not structure. Plain mono, one colour.
+      return { subtitle, html: codeBlock(cmd, "") };
+    }
+    case "Task":
+    case "Agent": {
+      // A subagent launch is a task briefing, not a JSON payload: agent type on
+      // the title line, the prompt as readable prose (collapsed when long).
+      const type = String(input.subagent_type ?? input.agentType ?? "");
+      const desc = String(input.description ?? "");
+      const prompt = String(input.prompt ?? "");
+      if (!prompt) return { subtitle: desc || type, html: codeBlock(truncateText(JSON.stringify(input, null, 2), 3000), "json") };
+      const subtitle = [desc, type && desc !== type ? type : ""].filter(Boolean).join(" · ");
+      const lines = prompt.split("\n").length;
+      const long = lines > COLLAPSE_THRESHOLD || prompt.length > 420;
+      const expand = long
+        ? `<button class="code-expand" data-action="toggle-code">${ICON.chevron}展开全部 ${lines} 行</button>`
+        : "";
+      return {
+        subtitle,
+        html:
+          `<div class="code-block agent-brief${long ? " collapsible collapsed" : ""}" data-lines="${lines}">` +
+          `<div class="code-body"><pre>${escapeHtml(prompt)}</pre></div>${expand}</div>`,
+      };
     }
     case "Grep":
     case "Glob":
@@ -1193,23 +1314,27 @@ function attachPermission(m: Extract<ToWebview, { kind: "permission_request" }>)
     updateToolInput(m.toolUseId || m.requestId, m.toolName, m.input);
   }
   host.classList.add("needs-approval");
+  // The amber node on the timeline is the status marker for "waiting on you" —
+  // the bar itself stays neutral instead of painting the whole card yellow.
+  host.closest(".step")?.classList.add("needs-approval");
   const bar = el("div", "perm-bar");
   bar.dataset.requestId = m.requestId;
   const label = el("div", "perm-label");
   const strong = el("b");
   strong.textContent = m.displayName || m.toolName;
-  label.append(el("span", "perm-ico", "⚠"), document.createTextNode(" 需要你的确认 · "), strong);
+  label.append(document.createTextNode("需要确认 · "), strong);
   const actions = el("div", "perm-actions");
   const allow = el("button", "perm-allow", "允许");
   const deny = el("button", "perm-deny", "拒绝");
   allow.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "allow" });
   deny.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "deny" });
-  actions.append(allow, deny);
+  // Left to right = least to most committal: 总是允许 · 拒绝 · 允许.
   for (const s of m.suggestions || []) {
     const b = el("button", "perm-always", s.label);
     b.onclick = () => send({ type: "permission", requestId: m.requestId, behavior: "allow", suggestionId: s.id });
     actions.appendChild(b);
   }
+  actions.append(deny, allow);
   bar.append(label, actions);
   (host.querySelector(".tool-body") as HTMLElement).appendChild(bar);
   scrollToBottom();
@@ -1280,8 +1405,10 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   const optsBox = el("div", "askp-opts");
   const foot = el("div", "askp-foot");
   const pager = el("div", "askp-pager");
-  const prev = el("button", "askp-nav", "‹") as HTMLButtonElement;
-  const next = el("button", "askp-nav", "›") as HTMLButtonElement;
+  const prev = el("button", "askp-nav") as HTMLButtonElement;
+  const next = el("button", "askp-nav") as HTMLButtonElement;
+  prev.innerHTML = ICON.chevronLeft;
+  next.innerHTML = ICON.chevronRight;
   const idx = el("span", "askp-idx");
   pager.append(prev, idx, next);
   const submit = el("button", "askp-submit", "提交") as HTMLButtonElement;
@@ -1344,7 +1471,11 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
       txt.append(el("span", "askp-lbl", String(o.label)));
       if (o.description) txt.append(el("span", "askp-desc", String(o.description)));
       row.append(txt);
-      if (!q.multiSelect) row.append(el("span", "askp-check", "✓")); // right ✓ for single-select
+      if (!q.multiSelect) {
+        const check = el("span", "askp-check");
+        check.innerHTML = ICON.check; // right ✓ for single-select
+        row.append(check);
+      }
       row.onclick = () => {
         if (q.multiSelect) {
           if (sel[cur].has(o.label)) {
@@ -1446,7 +1577,11 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   };
 
   paint();
-  body.append(wrap);
+  // The picker is a step on the timeline like any other tool — blue node
+  // (waiting on a *choice*, distinct from the amber permission wait).
+  const step = el("div", "step ask");
+  step.append(el("div", "step-dot"), wrap);
+  body.append(step);
   scrollToBottom();
 }
 
@@ -1454,6 +1589,7 @@ function resolvePermission(requestId: string, behavior: "allow" | "deny") {
   const bar = messagesEl.querySelector(`.perm-bar[data-request-id="${requestId}"]`) as HTMLElement;
   if (!bar) return;
   bar.closest(".tool-card")?.classList.remove("needs-approval");
+  bar.closest(".step")?.classList.remove("needs-approval");
   if (behavior === "allow") {
     bar.remove(); // authorized — just proceed, no result shown
   } else {
@@ -1483,6 +1619,7 @@ function renderHistory(showAll: boolean) {
   railObservers.length = 0;
   assistantEl = null;
   liveBlock = null;
+  liveThink = null;
   lastUserEl = null;
   userMsgCount = 0;
   ctxGauge.classList.add("hidden"); // refreshes from the next turn's usage
@@ -1539,6 +1676,7 @@ function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<num
   const anchor = tail.firstElementChild; // first previously-visible node — keep the viewport on it
   assistantEl = null;
   liveBlock = null;
+  liveThink = null;
   lastUserEl = null;
   renderItemRange(items, 0, cutoff, cpByOrdinal);
   finalizeTurn();
@@ -1576,12 +1714,29 @@ function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOr
       linkifyRefs(seg);
       body.appendChild(seg);
     } else if (it.type === "thinking") {
-      // thinking is not displayed
+      // A quiet timeline node, like the official panel — the reply's first
+      // step is visibly "it thought for Ns", not a silent gap.
+      const body = ensureAssistant();
+      const step = el("div", "step think");
+      const label = it.secs ? `Thinking · ${it.secs}s` : "Thinking";
+      const node = el("div", "think-node", label);
+      if (it.text) node.title = truncateText(it.text, 800);
+      step.append(el("div", "step-dot"), node);
+      body.appendChild(step);
     } else if (it.type === "compaction") {
       finalizeTurn();
       messagesEl.appendChild(renderCompactionDivider(it.preTokens, it.postTokens));
     } else if (it.type === "tool") {
       if (it.name === "AskUserQuestion") {
+        if (it.isError) {
+          // The call itself failed (e.g. unparsable JSON): show it as a normal
+          // error step — red node, title, collapsible error output — instead of
+          // dumping the raw <tool_use_error> text into an "answered" card.
+          const body = ensureAssistant();
+          createToolCard(body, it.toolId, it.name);
+          if (it.result != null) setToolResult(it.toolId, it.result, true);
+          continue;
+        }
         // Show the answered question as a clean titled card (not the raw output).
         renderAnsweredQuestion(ensureAssistant(), typeof it.result === "string" ? it.result : "");
         continue;
@@ -1790,9 +1945,14 @@ function renderChangedFiles(
     return;
   }
   changedFiles.classList.remove("hidden");
+  // Header totals: the panel knew the numbers all along but only ever showed
+  // the two bulk buttons, so "how big is this change" meant expanding the list.
+  cfCount.textContent = `${files.length} 个`;
   cfStat.innerHTML =
-    `<button class="cf-all accept" data-cf="acceptAll" title="同意全部改动（保留）">✓ 全部</button>` +
-    `<button class="cf-all revert" data-cf="revertAll" title="回滚全部改动">↩ 全部</button>`;
+    `<span class="cf-total"><span class="add">+${totalAdded}</span> <span class="del">−${totalRemoved}</span></span>` +
+    `<span class="cf-sep"></span>` +
+    `<button class="cf-all accept" data-cf="acceptAll" title="同意全部改动（保留）">保留全部</button>` +
+    `<button class="cf-all revert" data-cf="revertAll" title="回滚全部改动">回滚</button>`;
   cfList.innerHTML = "";
   for (const f of files) {
     const row = el("div", "cf-row");
@@ -1801,7 +1961,7 @@ function renderChangedFiles(
     const name = el("span", "cf-name", slash >= 0 ? f.rel.slice(slash + 1) : f.rel);
     const dir = el("span", "cf-dir", slash >= 0 ? f.rel.slice(0, slash) : "");
     const stat = el("span", "cf-rowstat");
-    stat.innerHTML = `<span class="add">+${f.added}</span> <span class="del">-${f.removed}</span>`;
+    stat.innerHTML = `<span class="add">+${f.added}</span> <span class="del">−${f.removed}</span>`;
     const acc = el("button", "cf-act accept", "✓");
     acc.title = "同意（保留改动）";
     acc.onclick = (e) => {
@@ -2122,6 +2282,7 @@ function handleSlashCommand(payload: QueueItem): boolean {
       messagesEl.innerHTML = "";
       assistantEl = null;
       liveBlock = null;
+      liveThink = null;
       toolCards.clear();
       userMsgCount = 0;
       taskQueue.length = 0;
@@ -2293,6 +2454,9 @@ inputEl.addEventListener("input", () => {
  *  toggle send/stop buttons accordingly. */
 function refreshComposerHint() {
   const hasContent = inputEl.value.trim().length > 0 || pendingImages.length > 0;
+  // A permanently-filled send button next to an empty box is a call to action
+  // with nothing behind it — keep it quiet until there is content.
+  sendBtn.classList.toggle("ready", hasContent);
   if (rateLimited) {
     // Blocked: no send, no queue. Keep the text — the quota will come back.
     sendBtn.classList.add("hidden");
@@ -2319,6 +2483,28 @@ function autoResize() {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
 }
+
+/** Collapse the composer's control row to icon-only (and hide the usage
+ *  readouts) when the full-label row would overflow one line. Measured, not a
+ *  breakpoint, because label widths vary by model name / locale. Hysteresis-
+ *  free: the fit test always runs in the expanded state, so it can't oscillate. */
+const composerTools = document.querySelector(".composer-tools") as HTMLElement | null;
+function refitComposer() {
+  if (!composerTools) return;
+  // Two stages, each re-measured so we only shed what's necessary:
+  //   1) `compact`      — icon-only pickers, usage keeps numbers (no labels)
+  //   2) `compact-more` — also drop the usage readouts entirely
+  composerTools.classList.remove("compact", "compact-more");
+  const overflow = () => composerTools.scrollWidth > composerTools.clientWidth + 1; // +1px sub-pixel slack
+  if (overflow()) {
+    composerTools.classList.add("compact");
+    if (overflow()) composerTools.classList.add("compact-more");
+  }
+}
+if (composerTools && "ResizeObserver" in window) {
+  new ResizeObserver(() => refitComposer()).observe(composerTools);
+}
+refitComposer();
 
 // Paste an image into the composer to attach it.
 inputEl.addEventListener("paste", (e) => {
@@ -2686,11 +2872,14 @@ function closePickers() {
 function buildModeMenu() {
   let html = `<div class="pick-head">模式</div>`;
   for (const m of MODES) {
+    const danger = m.id === "bypassPermissions";
+    // 绕过权限 is not "one more mode" — a separator + warm tint set it apart.
+    if (danger) html += `<div class="pick-sep"></div>`;
     html +=
-      `<button class="pick-row" data-mode="${m.id}">` +
+      `<button class="pick-row${m.id === currentMode ? " on" : ""}${danger ? " danger" : ""}" data-mode="${m.id}">` +
       `<span class="pick-ico">${m.icon}</span>` +
       `<span class="pick-text"><span class="pick-title">${m.title}</span><span class="pick-desc">${m.desc}</span></span>` +
-      `<span class="pick-check">${m.id === currentMode ? "✓" : ""}</span></button>`;
+      `<span class="pick-check">${m.id === currentMode ? ICON.check : ""}</span></button>`;
   }
   modeMenu.innerHTML = html;
 }
@@ -2698,15 +2887,20 @@ function buildModeMenu() {
 function buildModelMenu() {
   let html = `<div class="pick-head">模型</div>`;
   for (const m of MODELS) {
+    const on = m.id === currentModel;
+    // Short id on the right so the list scans without reading the full names;
+    // it yields to the ✓ on the selected row (both would crowd the edge).
+    const tail = on ? `<span class="pick-check">${ICON.check}</span>` : m.id ? `<span class="pick-tag">${m.short}</span>` : "";
     html +=
-      `<button class="pick-row" data-model="${m.id}">` +
+      `<button class="pick-row${on ? " on" : ""}" data-model="${m.id}">` +
       `<span class="pick-text"><span class="pick-title">${m.label}</span>${m.desc ? `<span class="pick-desc">${m.desc}</span>` : ""}</span>` +
-      `<span class="pick-check">${m.id === currentModel ? "✓" : ""}</span></button>`;
+      tail +
+      `</button>`;
   }
-  // Reasoning-effort dots — level names + Claude's /effort wording on hover.
+  // Reasoning effort as filling bars — it's a level on a scale, not a radio set.
   const idx = EFFORTS.findIndex((e) => e.id === currentEffort);
   const curLabel = idx >= 0 ? EFFORTS[idx].label : "默认";
-  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度 (${curLabel})</span><span class="effort-dots">`;
+  html += `<div class="pick-sep"></div><div class="pick-effort"><span>推理强度<span class="eff-cur"> · ${curLabel}</span></span><span class="effort-dots">`;
   EFFORTS.forEach((e, i) => {
     html += `<span class="effort-dot ${idx >= 0 && i <= idx ? "on" : ""}" data-effort="${e.id}" title="${e.label}：${e.desc}"></span>`;
   });
@@ -2714,6 +2908,18 @@ function buildModelMenu() {
   modelMenu.innerHTML = html;
 }
 
+/** Anchor a picker directly above its trigger button (same scheme as the
+ *  usage popover): left edges aligned, clamped inside the composer. */
+function positionPickMenu(menu: HTMLElement, trigger: HTMLElement) {
+  const parent = menu.offsetParent as HTMLElement | null;
+  if (!parent) return;
+  const t = trigger.getBoundingClientRect();
+  const pr = parent.getBoundingClientRect();
+  menu.style.bottom = `${pr.bottom - t.top + 6}px`;
+  // measure AFTER unhide, then keep the right edge inside the panel
+  const w = menu.offsetWidth;
+  menu.style.left = `${Math.max(8, Math.min(t.left - pr.left, pr.width - w - 8))}px`;
+}
 modeTrigger.onclick = (e) => {
   e.stopPropagation();
   const open = !modeMenu.classList.contains("hidden");
@@ -2721,6 +2927,7 @@ modeTrigger.onclick = (e) => {
   if (!open) {
     buildModeMenu();
     modeMenu.classList.remove("hidden");
+    positionPickMenu(modeMenu, modeTrigger);
     pickBackdrop.classList.remove("hidden");
   }
 };
@@ -2731,6 +2938,7 @@ modelTrigger.onclick = (e) => {
   if (!open) {
     buildModelMenu();
     modelMenu.classList.remove("hidden");
+    positionPickMenu(modelMenu, modelTrigger);
     pickBackdrop.classList.remove("hidden");
   }
 };
@@ -2842,7 +3050,7 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
   }
   if (images.length) {
     const grid = el("div", "msg-images");
-    for (const src of images) grid.appendChild(makeThumb(src));
+    for (const src of images) grid.appendChild(makeImageChip(src));
     body.appendChild(grid);
   }
   if (text.trim()) {
@@ -2873,7 +3081,7 @@ function buildReplyActions(aEl: HTMLElement): HTMLElement {
   const acts = el("div", "msg-actions");
   const mk = (icon: string, title: string, fn: (b: HTMLButtonElement) => void) => {
     const b = el("button", "msg-act") as HTMLButtonElement;
-    b.innerHTML = icon;
+    b.innerHTML = `${icon}<span>${title}</span>`;
     b.title = title;
     b.onclick = () => fn(b);
     return b;
@@ -2888,15 +3096,9 @@ function buildReplyActions(aEl: HTMLElement): HTMLElement {
     b.classList.add("done");
     setTimeout(() => b.classList.remove("done"), 1000);
   });
-  const up = mk(ICON.thumbUp, "赞", (b) => {
-    b.classList.toggle("on");
-    down.classList.remove("on");
-  });
-  const down = mk(ICON.thumbDown, "踩", (b) => {
-    b.classList.toggle("on");
-    up.classList.remove("on");
-  });
-  acts.append(regen, copy, up, down);
+  // 赞/踩 were pure decoration — nothing on either side of the wire consumed
+  // the rating, so they were two buttons that did nothing.
+  acts.append(regen, copy);
   return acts;
 }
 
@@ -2944,6 +3146,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   // Reset streaming state and re-append the edited message as the new turn.
   assistantEl = null;
   liveBlock = null;
+  liveThink = null;
   toolCards.clear();
   userMsgCount = messagesEl.querySelectorAll(".msg.user").length;
   appendUser(newText, [], imageUris);
@@ -2961,6 +3164,31 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   refreshComposerHint();
   showWorking();
   send({ type: "editMessage", checkpointId, text: newText, images: images.length ? images : undefined });
+}
+
+/** Compact attachment card for images in USER messages: mini thumbnail +
+ *  name + "W×H · size". The real <img> stays in the DOM, so everything that
+ *  collects `.msg-images img` (regenerate, edit, question bar) keeps working.
+ *  Click opens the lightbox, same as the old full-size thumb. */
+function makeImageChip(src: string): HTMLElement {
+  const chip = el("div", "img-chip");
+  const im = el("img") as HTMLImageElement;
+  im.src = src;
+  im.loading = "lazy";
+  // Pasted images carry no filename — derive a readable one from the mime type.
+  const ext = (/^data:image\/(\w+)/.exec(src)?.[1] || "png").replace("jpeg", "jpg");
+  const info = el("span", "ic-info");
+  const name = el("span", "ic-name", `image.${ext}`);
+  const meta = el("span", "ic-meta");
+  const b64 = src.split(",")[1];
+  const kb = b64 ? (b64.length * 3) / 4 / 1024 : 0;
+  const sizeText = kb >= 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(kb))} KB`;
+  im.onload = () => (meta.textContent = `${im.naturalWidth}×${im.naturalHeight} · ${sizeText}`);
+  if (kb) meta.textContent = sizeText; // shown until dimensions load
+  info.append(name, meta);
+  chip.append(im, info);
+  chip.onclick = () => openLightbox(src);
+  return chip;
 }
 
 /** An image thumbnail that opens the lightbox on click. */
@@ -2988,11 +3216,34 @@ function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
   messagesEl.querySelector(".rate-limit-banner")?.remove(); // never stack banners
 
   const box = el("div", `rate-limit-banner ${exhausted ? "exhausted" : "warning"}`);
+  // One line: what happened, what to do, when it comes back. The old banner
+  // spelled the reset time out in a sentence and filled the panel with red.
   const head = el("div", "rl-head");
-  head.append(
-    el("span", "rl-ico", exhausted ? "⛔" : "⚠"),
-    el("b", "rl-title", exhausted ? `${m.limitLabel}已用尽` : `${m.limitLabel}即将用尽`),
+  const text = el("div", "rl-text");
+  text.append(
+    el("span", "rl-title", exhausted ? `${m.limitLabel}已用尽` : `${m.limitLabel}即将用尽`),
+    el(
+      "span",
+      "rl-body",
+      exhausted
+        ? m.modelScoped
+          ? " · 切换其他模型可立即继续"
+          : " · 暂时无法继续对话"
+        : " · 接近订阅限额",
+    ),
   );
+  head.append(el("span", "rl-ico", "!"), text);
+  const acts = el("div", "rl-acts");
+  const cd = resetCountdownShort(m.resetsAt);
+  const when = m.resetsAt ? new Date(m.resetsAt * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+  if (when || cd) acts.appendChild(el("span", "rl-when", [when, cd].filter(Boolean).join(" · ")));
+  if (m.modelScoped) {
+    // The fix for a per-model limit is one click away — offer it here instead
+    // of describing it and making the user go find the picker.
+    const sw = el("button", "rl-switch", "切换模型");
+    sw.onclick = () => modelTrigger.click();
+    acts.appendChild(sw);
+  }
   if (!blocking) {
     // 非阻断级可关闭：本重置周期内不再提示（宿主记住 resetsAt，周期一过自然恢复）。
     // 全局耗尽是阻断性的，必须一直显示，不给关闭按钮。
@@ -3002,20 +3253,9 @@ function renderRateLimit(m: Extract<ToWebview, { kind: "rate_limit" }>) {
       box.remove();
       send({ type: "dismissRateLimit", limitLabel: m.limitLabel, resetsAt: m.resetsAt });
     };
-    head.appendChild(x);
+    acts.appendChild(x);
   }
-  const cd = resetCountdown(m.resetsAt);
-  const when = m.resetsAt ? new Date(m.resetsAt * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
-  const body = el(
-    "div",
-    "rl-body",
-    exhausted
-      ? m.modelScoped
-        ? `该模型的额度已用尽,切换其他模型可立即继续。${when ? `此模型将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
-        : `已达到订阅限额,暂时无法继续对话。${when ? `将于 ${when} 恢复${cd ? `(${cd})` : ""}。` : ""}`
-      : `接近订阅限额。${when ? `${when} 重置${cd ? `(${cd})` : ""}。` : ""}`,
-  );
-  box.append(head, body);
+  box.append(head, acts);
   messagesEl.appendChild(box);
   scrollToBottom();
 

@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ClaudeCopilot 面板 · 优化后预览</title>
+<!-- Loads the REAL media/main.css. Open in a browser and drag the panel's
+     bottom-right corner from 320px to 960px: one layout, no media queries. -->
+<link rel="stylesheet" href="../media/main.css">
+<style>
+  /* Stand-ins for the variables VS Code injects into a live webview (Dark Modern). */
+  body {
+    --vscode-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    --vscode-font-size: 13px;
+    --vscode-foreground: #cccccc;
+    --vscode-descriptionForeground: #9d9d9d;
+    --vscode-sideBar-background: #181818;
+    --vscode-sideBarSectionHeader-background: #181818;
+    --vscode-editor-background: #1f1f1f;
+    --vscode-editorWidget-background: #202020;
+    --vscode-menu-background: #1f1f1f;
+    --vscode-panel-border: #2b2b2b;
+    --vscode-widget-border: rgba(128,128,128,.18);
+    --vscode-focusBorder: #0078d4;
+    --vscode-button-background: #0078d4;
+    --vscode-button-foreground: #ffffff;
+    --vscode-button-hoverBackground: #026ec1;
+    --vscode-badge-background: #616161;
+    --vscode-badge-foreground: #f8f8f8;
+    --vscode-textLink-foreground: #4daafc;
+    --vscode-textCodeBlock-background: rgba(255,255,255,.06);
+    --vscode-textBlockQuote-background: rgba(255,255,255,.04);
+    --vscode-input-background: #262626;
+    --vscode-input-foreground: #cccccc;
+    --vscode-list-hoverBackground: #2a2d2e;
+    --vscode-toolbar-hoverBackground: rgba(90,93,94,.31);
+    --vscode-errorForeground: #f14c4c;
+    --vscode-testing-iconPassed: #73c991;
+    --vscode-progressBar-background: #0078d4;
+    --vscode-gitDecoration-addedResourceForeground: #81b88b;
+    --vscode-gitDecoration-deletedResourceForeground: #c74e39;
+    background: #0d0d0d;
+    height: auto;
+    padding: 28px;
+  }
+  .stage { display: flex; flex-direction: column; gap: 10px; }
+  .stage h1 { margin: 0; font-size: 15px; font-weight: 600; color: #e8e8e8; }
+  .stage p { margin: 0 0 8px; font-size: 12.5px; color: #8d8d8d; }
+  .panel {
+    width: 520px; min-width: 320px; max-width: 960px; height: 860px;
+    resize: horizontal; overflow: hidden;
+    border: 1px solid #2b2b2b; border-radius: 10px;
+    background: var(--panel-bg);
+  }
+  .panel #app { height: 100%; }
+</style>
+</head>
+<body class="vscode-dark">
+<div class="stage">
+  <h1>ClaudeCopilot 面板 · 优化后</h1>
+  <p>拖右下角把面板从 320px 拉到 960px —— 同一份 <code>media/main.css</code>，正文限宽居中、确认条与控件行整组换行。</p>
+  <div class="panel">
+    <div id="app">
+
+      <div class="question-bar">
+        <span class="qb-thumbs hidden"></span>
+        <span class="qb-text">帮我看看订单回填任务有没有幂等问题，重复执行会不会写重数据</span>
+      </div>
+
+      <div class="messages">
+
+        <div class="msg user">
+          <div class="msg-body">
+            <div class="user-context">
+              <span class="ctx-chip">OrderBackfillJob.java</span>
+              <span class="ctx-chip">SLS</span>
+            </div>
+            <div class="md"><p>帮我看看订单回填任务有没有幂等问题，重复执行会不会写重数据</p></div>
+          </div>
+        </div>
+
+        <div class="msg assistant">
+          <div class="rail">
+            <div class="avatar"><svg viewBox="0 0 24 24" fill="none" stroke-width="2.1" stroke-linecap="round"><line x1="15.6" y1="12" x2="21" y2="12" stroke="#e74c3c"/><line x1="13.8" y1="15.12" x2="16.5" y2="19.79" stroke="#f1c40f"/><line x1="12" y1="15.6" x2="12" y2="21" stroke="#2ecc71"/><line x1="8.88" y1="13.8" x2="4.21" y2="16.5" stroke="#1abc9c"/><line x1="8.4" y1="12" x2="3" y2="12" stroke="#00bcd4"/><line x1="10.2" y1="8.88" x2="7.5" y2="4.21" stroke="#5b6cf0"/><line x1="12" y1="8.4" x2="12" y2="3" stroke="#8e44ad"/><line x1="15.12" y1="10.2" x2="19.79" y2="7.5" stroke="#e84393"/></svg></div>
+          </div>
+          <div class="msg-body">
+            <div class="thread-line"></div>
+
+            <div class="text-seg"><div class="md">
+              <p>我查了订单回填这块，结论先说：<strong>当前实现不是幂等的</strong>，重复执行会写重。</p>
+              <p>关键位置在 <code class="code-ref">OrderBackfillJob.java:22</code>，它直接 <code>INSERT</code>，没有基于 <code>orderNo</code> 的去重。调用链是这样的：</p>
+              <ol>
+                <li><code class="code-ref">JobScheduler.java:41</code> 定时触发</li>
+                <li><code>OrderBackfillJob.run()</code> 拉未回填订单</li>
+                <li><code>OrderRepo.insert()</code> 逐条写入（问题点）</li>
+              </ol>
+              <blockquote><p>如果调度重试或人工重跑，同一个 <code>orderNo</code> 会被插两次。</p></blockquote>
+              <p>修法是给 <code>orderNo</code> 建唯一索引，写库改成 upsert：</p>
+              <div class="code-block" data-lines="5">
+                <div class="code-head">
+                  <span class="code-lang">java</span>
+                  <div class="code-actions">
+                    <button class="code-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.8v8.4l7-4.2z"/></svg> 执行</button>
+                    <button class="code-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/></svg> 复制</button>
+                  </div>
+                </div>
+                <div class="code-body"><pre class="hljs"><code><span class="hljs-comment">// OrderRepo.java</span>
+<span class="hljs-meta">@Insert</span>(<span class="hljs-string">"INSERT INTO member_order(order_no, uid, amount) "</span>
+      + <span class="hljs-string">"VALUES(#{orderNo},#{uid},#{amount}) "</span>
+      + <span class="hljs-string">"ON DUPLICATE KEY UPDATE amount=VALUES(amount)"</span>)
+<span class="hljs-keyword">int</span> <span class="hljs-title function_">upsertByOrderNo</span>(<span class="hljs-type">Order</span> o);</code></pre></div>
+              </div>
+            </div></div>
+
+            <div class="step">
+              <div class="step-dot"></div>
+              <div class="tool-card compact">
+                <div class="tool-head">
+                  <span class="tool-name">Read</span>
+                  <span class="tool-sub"><span class="file-chip">…/job/OrderBackfillJob.java:1-40</span></span>
+                </div>
+                <div class="tool-body"></div>
+              </div>
+            </div>
+
+            <div class="step ok">
+              <div class="step-dot"></div>
+              <div class="tool-card">
+                <div class="tool-head">
+                  <span class="tool-name">Bash</span>
+                  <span class="tool-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.6"/><path d="M5 7l2 1.6-2 1.6"/><path d="M8.6 10.4h2.9"/></svg></span>
+                  <span class="tool-sub">校验唯一索引与回填结果</span>
+                </div>
+                <div class="tool-body">
+                  <div class="tool-actions">
+                    <button class="code-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3.8v8.4l7-4.2z"/></svg></button>
+                    <button class="code-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/></svg></button>
+                  </div>
+                  <div class="tool-input"><pre class="cmd">cd /Users/duodian/project/funny-games
+./mvnw -q flyway:info | tail -n 5
+mysql -N -e "SHOW INDEX FROM member_order WHERE Key_name='uk_order_no'"</pre></div>
+                  <details class="tool-result" open>
+                    <summary><span class="tr-caret"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5 8 10l3.5-3.5"/></svg></span><span class="tr-title">查看结果</span><span class="tr-count">4 行</span></summary>
+                    <pre class="tool-result-body">V32__order_no_unique.sql   Success
+uk_order_no  order_no  Non_unique=0
+Empty set (0.01 sec)</pre>
+                  </details>
+                </div>
+              </div>
+            </div>
+
+            <div class="step needs-approval">
+              <div class="step-dot"></div>
+              <div class="tool-card needs-approval">
+                <div class="tool-head"><span class="tool-name">Bash</span><span class="tool-icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="3" width="11" height="10" rx="1.6"/><path d="M5 7l2 1.6-2 1.6"/><path d="M8.6 10.4h2.9"/></svg></span><span class="tool-sub">删除一次性回填 Job</span></div>
+                <div class="tool-body">
+                  <div class="tool-actions"><button class="code-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/></svg></button></div>
+                  <div class="tool-input"><pre class="cmd">rm src/main/java/com/funny/games/job/MemberOrderNoBackfillJob.java</pre></div>
+                  <div class="perm-bar">
+                    <div class="perm-label">需要确认 · <b>Bash</b></div>
+                    <div class="perm-actions">
+                      <button class="perm-always">总是允许</button>
+                      <button class="perm-deny">拒绝</button>
+                      <button class="perm-allow">允许</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="step ask">
+              <div class="step-dot"></div>
+              <div class="askp"><div class="askp-card">
+                <div class="askp-head">
+                  <span class="askp-q">唯一索引冲突时希望怎么处理？</span>
+                  <button class="askp-x">×</button>
+                </div>
+                <div class="askp-opts">
+                  <button class="askp-opt on">
+                    <span class="askp-n">1</span>
+                    <span class="askp-txt"><span class="askp-lbl">命中即更新（upsert）</span><span class="askp-desc">重跑幂等，金额按最新一次覆盖</span></span>
+                    <span class="askp-check"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.4 6.3 11.2 12.5 5"/></svg></span>
+                  </button>
+                  <button class="askp-opt">
+                    <span class="askp-n">2</span>
+                    <span class="askp-txt"><span class="askp-lbl">跳过重复行（insert ignore）</span><span class="askp-desc">首次写入为准，后续重跑不改动</span></span>
+                    <span class="askp-check"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.5 8.4 6.3 11.2 12.5 5"/></svg></span>
+                  </button>
+                  <div class="askp-opt askp-custom">
+                    <span class="askp-n">3</span>
+                    <input class="askp-input" placeholder="输入自定义答案…">
+                  </div>
+                </div>
+                <div class="askp-foot">
+                  <div class="askp-pager">
+                    <button class="askp-nav"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 4.5 6 8l3.5 3.5"/></svg></button>
+                    <span class="askp-idx">2 / 2</span>
+                    <button class="askp-nav" disabled><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 4.5 10 8l-3.5 3.5"/></svg></button>
+                  </div>
+                  <button class="askp-submit">提交</button>
+                </div>
+              </div></div>
+            </div>
+
+            <div class="text-seg summary-node"><div class="md"><p>唯一索引已生效，重跑不会再写重数据。</p></div></div>
+
+            <div class="msg-actions">
+              <button class="msg-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/></svg><span>重新生成</span></button>
+              <button class="msg-act"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/></svg><span>复制</span></button>
+            </div>
+
+          </div>
+        </div>
+
+        <div class="rate-limit-banner exhausted">
+          <div class="rl-head">
+            <span class="rl-ico">!</span>
+            <div class="rl-text"><span class="rl-title">Fable 每周用量已用尽</span><span class="rl-body"> · 切换其他模型可立即继续</span></div>
+          </div>
+          <div class="rl-acts">
+            <span class="rl-when">8/20 13:44 · 40h</span>
+            <button class="rl-switch">切换模型</button>
+            <button class="rl-close">×</button>
+          </div>
+        </div>
+
+      </div>
+
+      <footer id="composer">
+        <div class="changed-files">
+          <div class="cf-header">
+            <span class="cf-caret"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5 8 10l3.5-3.5"/></svg></span>
+            <span class="cf-title">已更改文件</span>
+            <span class="cf-count">2 个</span>
+            <span class="cf-stat">
+              <span class="cf-total"><span class="add">+5</span> <span class="del">−1</span></span>
+              <span class="cf-sep"></span>
+              <button class="cf-all accept">保留全部</button>
+              <button class="cf-all revert">回滚</button>
+            </span>
+          </div>
+          <div class="cf-list">
+            <div class="cf-row">
+              <span class="cf-badge modified">M</span>
+              <span class="cf-name">OrderRepo.java</span>
+              <span class="cf-dir">src/main/java/com/funny/games/dao</span>
+              <span class="cf-rowstat"><span class="add">+3</span> <span class="del">−1</span></span>
+              <button class="cf-act accept">✓</button><button class="cf-act revert">↩</button>
+            </div>
+            <div class="cf-row">
+              <span class="cf-badge added">A</span>
+              <span class="cf-name">V32__order_no_unique.sql</span>
+              <span class="cf-dir">src/main/resources/db/migration</span>
+              <span class="cf-rowstat"><span class="add">+2</span> <span class="del">−0</span></span>
+              <button class="cf-act accept">✓</button><button class="cf-act revert">↩</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="input-wrap">
+          <textarea id="input" rows="1" placeholder="给 Claude 发消息…"></textarea>
+          <div class="composer-bottom">
+            <div class="composer-tools">
+              <button class="composer-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.6 7.1 6.8 11.9a2.3 2.3 0 0 1-3.25-3.25l5.2-5.2a1.4 1.4 0 0 1 2 2L5.6 10.7a.5.5 0 0 1-.7-.7l4.5-4.5"/></svg></button>
+              <span class="composer-sep"></span>
+              <button class="composer-pick"><span>默认模型</span><span class="pick-caret"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5 8 10l3.5-3.5"/></svg></span></button>
+              <button class="composer-pick"><span class="pick-emoji"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8 13 3.6V7.2c0 3-2 5.2-5 6.2-3-1-5-3.2-5-6.2V3.6z"/></svg></span><span>发送前确认</span><span class="pick-caret"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 6.5 8 10l3.5-3.5"/></svg></span></button>
+              <button class="composer-pick sls-toggle-btn"><span class="sls-dot"></span><span>SLS日志</span></button>
+              <span class="composer-state">
+                <span class="ctx-gauge" style="--pct:47"><span class="cg-ring"><span class="cg-pct">47</span></span></span>
+                <button class="usage-pill">
+                  <span class="up-item"><span class="up-key">会话</span><span class="up-pct">47%</span></span>
+                  <span class="up-item"><span class="up-key">周</span><span class="up-pct">25%</span></span>
+                </button>
+              </span>
+            </div>
+            <button class="composer-send"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5V4M4.6 7.4 8 4l3.4 3.4"/></svg></button>
+          </div>
+        </div>
+        <div class="composer-foot">
+          <span class="foot-keys"><kbd>Enter</kbd>发送<kbd>⇧↵</kbd>换行</span>
+          <span class="foot-spacer"></span>
+          <span class="status-line">Claude Opus 5 · funny-games</span>
+        </div>
+      </footer>
+
+    </div>
+  </div>
+</div>
+
+<div class="stage" style="margin-top:26px;">
+  <h1>弹出菜单</h1>
+  <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:flex-start;">
+    <div class="pick-menu" style="position:static;width:300px;">
+      <div class="pick-head">模型</div>
+      <button class="pick-row on"><span class="pick-text"><span class="pick-title">默认模型</span><span class="pick-desc">使用 CLI 默认模型</span></span><span class="pick-check"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.4 6.3 11.2 12.5 5"/></svg></span></button>
+      <button class="pick-row"><span class="pick-text"><span class="pick-title">Claude Opus 5</span><span class="pick-desc">最强 · 复杂任务</span></span><span class="pick-tag">Opus</span></button>
+      <button class="pick-row"><span class="pick-text"><span class="pick-title">Claude Sonnet 5</span><span class="pick-desc">均衡 · 日常编码</span></span><span class="pick-tag">Sonnet</span></button>
+      <button class="pick-row"><span class="pick-text"><span class="pick-title">Claude Haiku 4.5</span><span class="pick-desc">最快 · 轻量任务</span></span><span class="pick-tag">Haiku</span></button>
+      <div class="pick-sep"></div>
+      <div class="pick-effort"><span>推理强度<span class="eff-cur"> · 默认</span></span><span class="effort-dots"><span class="effort-dot"></span><span class="effort-dot"></span><span class="effort-dot"></span><span class="effort-dot"></span><span class="effort-dot"></span></span></div>
+    </div>
+    <div class="pick-menu" style="position:static;width:300px;">
+      <div class="pick-head">模式</div>
+      <button class="pick-row on"><span class="pick-ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8 13 3.6V7.2c0 3-2 5.2-5 6.2-3-1-5-3.2-5-6.2V3.6z"/></svg></span><span class="pick-text"><span class="pick-title">发送前确认</span><span class="pick-desc">每次编辑前都请求你确认</span></span><span class="pick-check"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.4 6.3 11.2 12.5 5"/></svg></span></button>
+      <button class="pick-row"><span class="pick-ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13l1-3 6.5-6.5 2 2L6 12z"/><path d="M9.5 4l2 2"/></svg></span><span class="pick-text"><span class="pick-title">自动编辑</span><span class="pick-desc">直接改文件，无需逐个确认</span></span></button>
+      <button class="pick-row"><span class="pick-ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="2" width="9" height="12" rx="1"/><path d="M5.8 5.5h4.4M5.8 8h4.4M5.8 10.5h2.6"/></svg></span><span class="pick-text"><span class="pick-title">规划模式</span><span class="pick-desc">先给方案，再开始编辑</span></span></button>
+      <div class="pick-sep"></div>
+      <button class="pick-row danger"><span class="pick-ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8 13 3.6V7.2c0 3-2 5.2-5 6.2-3-1-5-3.2-5-6.2V3.6z"/><path d="M5.4 5.4l5.2 5.2"/></svg></span><span class="pick-text"><span class="pick-title">绕过权限</span><span class="pick-desc">跳过所有权限检查（危险）</span></span></button>
+    </div>
+    <div class="pick-menu usage-menu" style="position:static;width:280px;">
+      <div class="pick-head usage-head">套餐用量</div>
+      <div class="usage-row"><div class="usage-row-top"><span class="usage-name">5 小时限额</span><span class="spacer"></span><span class="usage-reset">19:00 重置</span><span class="usage-pct">47%</span></div><div class="usage-bar"><span style="width:47%"></span></div></div>
+      <div class="usage-row"><div class="usage-row-top"><span class="usage-name">每周 · 全部模型</span><span class="spacer"></span><span class="usage-reset">8月24日 重置</span><span class="usage-pct">25%</span></div><div class="usage-bar"><span style="width:25%"></span></div></div>
+      <div class="usage-row warn-high"><div class="usage-row-top"><span class="usage-name">仅 Fable</span><span class="spacer"></span><span class="usage-pct">92%</span></div><div class="usage-bar"><span style="width:92%"></span></div></div>
+    </div>
+  </div>
+</div>
+<script>
+  // Dev convenience: ?w=960&h=1400 sizes the panel, so a screenshot can capture
+  // a given width (or the whole transcript) without editing this file.
+  const q = new URLSearchParams(location.search);
+  const panel = document.querySelector(".panel");
+  if (q.get("w")) panel.style.width = q.get("w") + "px";
+  if (q.get("h")) panel.style.height = q.get("h") + "px";
+  // ?flat=1 unclips the scroller so the full transcript renders in one shot.
+  if (q.get("flat")) {
+    document.querySelector(".messages").style.overflow = "visible";
+    panel.style.height = "auto";
+    document.querySelector("#app").style.height = "auto";
+  }
+</script>
+</body>
+</html>

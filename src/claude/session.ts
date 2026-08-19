@@ -137,7 +137,9 @@ export class SessionStore {
     if (!file) return [];
     const items: TimelineItem[] = [];
     const toolIndex = new Map<string, number>(); // tool_use_id -> items index
+    let prevTs = 0; // previous record's timestamp — estimates thinking duration
     for (const o of this.readLines(file)) {
+      const ts = typeof o.timestamp === "string" ? Date.parse(o.timestamp) : NaN;
       if (o.type === "user" && Array.isArray(o.message?.content)) {
         const images: string[] = [];
         for (const b of o.message.content) {
@@ -182,8 +184,15 @@ export class SessionStore {
         for (const b of o.message.content) {
           if (b?.type === "text" && b.text?.trim()) {
             items.push({ type: "assistant_text", text: b.text });
-          } else if (b?.type === "thinking" && b.thinking?.trim()) {
-            items.push({ type: "thinking", text: b.thinking });
+          } else if (b?.type === "thinking") {
+            // The CLI persists thinking blocks with EMPTY text (signature only)
+            // — the block's presence is the signal, so no text filter here or
+            // the node never renders (verified: 0/783 blocks had text).
+            // Duration ≈ gap since the previous transcript record (the record
+            // holding the thinking block is written when it finishes). Rough,
+            // but the right order of magnitude — omit when implausible.
+            const secs = prevTs && !isNaN(ts) ? Math.round((ts - prevTs) / 1000) : 0;
+            items.push({ type: "thinking", text: b.thinking || "", secs: secs > 0 && secs < 3600 ? secs : undefined });
           } else if (b?.type === "tool_use") {
             toolIndex.set(b.id, items.length);
             items.push({ type: "tool", toolId: b.id, name: b.name, input: b.input });
@@ -201,6 +210,7 @@ export class SessionStore {
           postTokens: cm.postTokens ?? cm.post_tokens ?? 0,
         });
       }
+      if (!isNaN(ts)) prevTs = ts;
     }
     return items;
   }

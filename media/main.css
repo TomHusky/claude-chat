@@ -49,6 +49,11 @@ body.vscode-light {
 
 * { box-sizing: border-box; }
 
+/* The UA stylesheet pins `code { font-family: monospace }` (Courier on macOS),
+   silently overriding the stack we set on the surrounding <pre> — code blocks
+   rendered thinner/lighter than everything else at the same color. */
+pre code { font-family: inherit; }
+
 /* Code scrollbars: invisible until the pointer is over the block, and slim —
    a fat always-on bar under every command reads as part of the card. */
 pre::-webkit-scrollbar, pre::-webkit-scrollbar-corner { height: 6px; width: 6px; background: transparent; }
@@ -810,6 +815,16 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 .tool-card.compact .tool-head { background: transparent; padding: 1px 0; }
 .tool-card.compact .tool-name { font-weight: 600; color: var(--vscode-foreground); font-size: 12px; }
 .tool-card.compact .tool-body { padding: 0; border: none; background: transparent; position: static; }
+/* a failed compact tool (Skill/Read/…) regains the card frame so the error
+   output reads as a box, not as bare text floating on the timeline */
+.tool-card.compact.error .tool-body {
+  border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.25));
+  border-radius: 6px;
+  background: var(--panel-bg);
+  position: relative;
+  overflow: hidden;
+  margin-top: 5px;
+}
 .tool-card.compact .tool-body:empty,
 .tool-card.compact .tool-body:has(> .tool-actions:empty:only-child) { display: none; }
 
@@ -863,6 +878,11 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 .tool-result[open] .tool-result-body { border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,.18)); }
 /* Headerless error output — collapses to ~3 lines like a long Bash command */
 .tool-result.err-flat .err-body { position: relative; }
+/* Error dumps read one step QUIETER than commands: same mono, dimmed toward
+   the panel — diagnostics to skim, not content to study. */
+.tool-result.err-flat .err-body pre {
+  color: color-mix(in srgb, var(--code-fg) 72%, var(--panel-bg));
+}
 .tool-body > .tool-result.err-flat:not(:first-child) { border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,.18)); }
 .err-flat.collapsed .err-body pre { max-height: calc(3 * 1.6em + 24px); overflow: hidden; }
 .err-flat.collapsed .err-body::after {

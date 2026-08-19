@@ -1014,7 +1014,7 @@ function onTextDelta(text: string) {
 // Tool cards
 // ---------------------------------------------------------------------------
 // File tools render compact (no icon, no inline result/diff); click -> editor.
-const FILE_VIEW_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit"]);
+const FILE_VIEW_TOOLS = new Set(["Read", "Edit", "Write", "MultiEdit", "NotebookEdit", "Skill"]);
 const DIFF_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 function createToolCard(parent: HTMLElement, toolId: string, name: string): HTMLElement {
@@ -1052,6 +1052,15 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
   const sub = card.querySelector(".tool-sub") as HTMLElement;
   const bodyWrap = card.querySelector(".tool-body") as HTMLElement;
   const { subtitle, html } = renderToolInput(name, input);
+  if (name === "Skill") {
+    // 对齐官方：加粗显示技能名本身，右侧灰字 "skill" 标注类型；
+    // 技能正文（加载进上下文的说明文）不进卡片。
+    const nm = card.querySelector(".tool-name") as HTMLElement | null;
+    const skillName = String((input as { skill?: unknown }).skill ?? "") || "Skill";
+    if (nm) nm.textContent = skillName;
+    if (sub) sub.textContent = "skill";
+    return;
+  }
   if (FILE_VIEW_TOOLS.has(name)) {
     // Read/Edit/…: filename on the SAME line as the tool name (in the header), no wrap.
     if (sub) sub.innerHTML = html;

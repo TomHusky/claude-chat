@@ -3080,25 +3080,34 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
     body.appendChild(grid);
   }
   if (text.trim()) {
-    const seg = el("div", "md user-text collapsed");
+    // A long prompt (e.g. a pasted SLS log) dominates the transcript — fold it
+    // to ~4 lines with a fade + "展开全部 N 行", same mechanic as a long Bash
+    // command. Wrapper (not the .md itself) carries the collapse so the text
+    // element's display mode never changes — a -webkit-line-clamp switch to
+    // flex-box rendering was subtly altering the font on expand.
+    const fold = el("div", "user-fold collapsed");
+    const seg = el("div", "md");
     seg.innerHTML = mdFull.render(text);
-    body.appendChild(seg);
-    // A long prompt (e.g. a pasted SLS log) dominates the transcript — clamp it
-    // to 4 lines with a toggle. Measured post-layout so short prompts stay bare.
+    fold.appendChild(seg);
+    body.appendChild(fold);
     requestAnimationFrame(() => {
       // Hidden hosts (folded history) measure 0 — fall back to a newline count.
-      const overflows = seg.scrollHeight === 0 ? text.split("\n").length > 4 : seg.scrollHeight - seg.clientHeight > 4;
+      const lines = text.split("\n").length;
+      const overflows = fold.scrollHeight === 0 ? lines > 4 : seg.scrollHeight - fold.clientHeight > 4;
       if (overflows) {
         const btn = el("button", "user-more") as HTMLButtonElement;
-        const setLabel = () => (btn.textContent = seg.classList.contains("collapsed") ? "展开" : "收起");
+        const setLabel = () =>
+          (btn.innerHTML = `${ICON.chevron}` + (fold.classList.contains("collapsed") ? `展开全部 ${lines} 行` : "收起"));
         btn.onclick = () => {
-          seg.classList.toggle("collapsed");
+          const collapsed = fold.classList.toggle("collapsed");
+          if (collapsed) fold.scrollTop = 0; // re-fold from the top, not mid-scroll
           setLabel();
         };
         setLabel();
-        seg.after(btn);
+        fold.after(btn);
+        fold.classList.add("scrollable"); // expanded state gets a height cap + scroll
       } else {
-        seg.classList.remove("collapsed");
+        fold.classList.remove("collapsed");
       }
     });
   }

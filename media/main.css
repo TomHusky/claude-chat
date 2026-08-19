@@ -115,7 +115,6 @@ html, body {
 .composer-send.stop svg { width: 15px; height: 15px; }
 .tool-icon svg { width: 13px; height: 13px; display: block; }
 .tool-head .tool-icon { color: var(--vscode-descriptionForeground); display: inline-flex; }
-.fa-ico svg { width: 12px; height: 12px; display: block; }
 .cf-caret svg { width: 12px; height: 12px; display: block; }
 .code-expand svg { width: 11px; height: 11px; display: block; }
 .code-act svg { width: 12px; height: 12px; display: block; }
@@ -262,7 +261,9 @@ html, body {
   background: var(--vscode-editor-background, rgba(128,128,128,.1));
   border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.3));
 }
-.msg.assistant .avatar svg { width: 15px; height: 15px; display: block; }
+/* 14px inside the 20px content box (22 − 2×1px border) → integer 3px margins
+   all round; 15px left 2.5px halves and the icon sat visibly off-center. */
+.msg.assistant .avatar svg { width: 14px; height: 14px; display: block; }
 /* Anchored in .msg-body — the SAME containing block as the step dots, using
    the same left arithmetic: dots center at -18.5px, this 1px column covers
    [-19,-18] → center -18.5. Structurally impossible to be off the dots. */
@@ -362,15 +363,15 @@ html, body {
 /* attached files (current editor file + dragged files) */
 #file-chips { display: flex; flex-wrap: wrap; gap: 5px; }
 #file-chips:not(:empty) { margin-bottom: 6px; }
+/* Compact tab-style chip: filename + ×, no icon — reads like an editor tab. */
 .file-attach {
-  display: inline-flex; align-items: center; gap: 4px; max-width: 200px;
-  font-size: 11px;
+  display: inline-flex; align-items: center; gap: 5px; max-width: 200px;
+  font-size: 11.5px;
+  color: var(--vscode-foreground);
   background: var(--vscode-input-background, rgba(128,128,128,.12));
   border: 1px solid var(--vscode-panel-border, rgba(128,128,128,.35));
-  border-radius: 5px; padding: 1px 4px 1px 6px;
+  border-radius: 5px; padding: 2px 5px 2px 9px;
 }
-.file-attach.auto { border-style: dashed; }
-.fa-ico { font-size: 11px; }
 .fa-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .fa-name:hover { color: var(--vscode-textLink-foreground); }
 .fa-x { background: transparent; border: none; color: inherit; cursor: pointer; font-size: 13px; line-height: 1; padding: 0 1px; }
@@ -713,14 +714,12 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   margin: 6px 0 2px; font-size: 12px; font-style: italic;
   color: var(--vscode-descriptionForeground); opacity: .8;
 }
-/* The avatar is the first node — don't draw a dot that overlaps it. The
-   .thread-line div is the body's literal first child now, so "first step" is
-   the one right after it. */
-.msg-body > .thread-line + .step > .step-dot { display: none; }
-/* …and align that first step's title with the avatar's center: a step's title
-   line centers ~9px from its top, the 22px avatar centers at 11px — so 2px of
-   margin, not the usual 12px */
-.msg-body > .thread-line + .step { margin-top: 2px; }
+/* The avatar is the first node — the first content step (marked .first-node in
+   JS, immune to transient live elements) draws no dot of its own… */
+.step.first-node > .step-dot { display: none; }
+/* …and aligns its title with the avatar's center: a step's title line centers
+   ~9px from its top, the 22px avatar centers at 11px — so 2px, not 12px. */
+.msg-body > .step.first-node { margin-top: 2px; }
 .tool-head {
   display: flex; align-items: center; gap: 6px;
   padding: 0 0 7px;
@@ -756,7 +755,6 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   word-break: break-word;
 }
 .tool-input .muted { padding: 10px 14px 0; }
-.tool-input .cmd { white-space: pre; }
 /* code-block inside a tool card: fully flat — no box, no background at all */
 .tool-input .code-block,
 .tool-input .code-block .code-body,
@@ -1202,7 +1200,8 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 #model-label, #mode-label { white-space: nowrap; }
 
 /* SLS 日志开关（输入框底部，仅配置了 SLS 时显示） */
-.sls-toggle-btn { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px 0 8px; }
+/* Ghost by default (border only) — it's an optional toggle, not a filled control */
+.sls-toggle-btn { display: inline-flex; align-items: center; gap: 6px; padding: 0 10px 0 8px; background: transparent; }
 .sls-toggle-btn.on { color: var(--vscode-button-foreground, #fff); background: var(--vscode-button-background); border-color: var(--vscode-button-background); }
 .sls-toggle-btn.on:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
 
@@ -1288,11 +1287,6 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   background: rgba(128,128,128,.14); border-radius: 5px; padding: 2px 6px;
   white-space: nowrap;
 }
-/* a model whose own weekly quota is gone: still listed, visibly unavailable */
-.pick-row.out { cursor: default; }
-.pick-row.out:hover { background: transparent; }
-.pick-row.out .pick-text { opacity: .5; }
-.pick-tag.out { font-family: var(--vscode-font-family); font-size: 10.5px; color: #e08a78; background: rgba(199,78,57,.18); padding: 2px 7px; }
 /* the danger row is separated and coloured — it is not one more mode */
 .pick-row.danger .pick-title { color: #e08a78; }
 .pick-row.danger .pick-ico { background: rgba(199,78,57,.14); color: #e08a78; }

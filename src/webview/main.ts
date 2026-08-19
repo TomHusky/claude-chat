@@ -514,16 +514,7 @@ ctxGauge.addEventListener("click", () => {
 });
 
 const usagePill = $<HTMLButtonElement>("usage-pill");
-/** Format a unix-seconds reset time as a "还剩 Xh Ym" countdown. */
-function resetCountdown(resetAt?: number): string | undefined {
-  if (!resetAt) return undefined;
-  const mins = Math.round((resetAt * 1000 - Date.now()) / 60000);
-  if (mins <= 0) return "即将重置";
-  const h = Math.floor(mins / 60);
-  const m = mins % 60;
-  return h > 0 ? `还剩 ${h} 小时 ${m} 分` : `还剩 ${m} 分`;
-}
-/** Same countdown, compact enough to sit inside the quota banner's pill. */
+/** Reset-time countdown, compact enough to sit inside the quota banner's pill. */
 function resetCountdownShort(resetAt?: number): string | undefined {
   if (!resetAt) return undefined;
   const mins = Math.round((resetAt * 1000 - Date.now()) / 60000);
@@ -797,7 +788,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       startTypewriter();
       break;
     case "thinking_delta":
-      addStreamEst(m.text); // grows the live token estimate
+      addStreamEst(m.text); // not displayed, but grows the live token estimate
       if (liveThink) liveThink.text += m.text; // 收集思考全文，落节点时挂 tooltip
       break;
     case "tokens":
@@ -938,6 +929,17 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
  *  此前直播只给转圈药丸、不落节点，同一会话"直播看没有 Thinking、回放看有"。 */
 let liveThink: { startAt: number; text: string } | null = null;
 
+/** The avatar is the reply's first node — the FIRST content step must not draw
+ *  its own dot. Marked in JS because during a live turn the body also holds
+ *  transient elements (thread-line/active, working pill) that break any
+ *  sibling-based CSS selector. */
+function markIfFirstNode(body: HTMLElement, step: HTMLElement) {
+  const first = Array.from(body.children).find(
+    (c) => c.classList.contains("step") || c.classList.contains("text-seg") || c.classList.contains("msg-images"),
+  );
+  if (first === step) step.classList.add("first-node");
+}
+
 /** 思考块结束（下一个块开始/轮次收尾）时，落一个 "Thinking · Ns" 节点。 */
 function flushThinkNode() {
   if (!liveThink) return;
@@ -948,6 +950,7 @@ function flushThinkNode() {
   if (liveThink.text) node.title = truncateText(liveThink.text, 800);
   step.append(el("div", "step-dot"), node);
   body.appendChild(step);
+  markIfFirstNode(body, step);
   liveThink = null;
   updateActiveLine();
   maybeScroll();
@@ -1032,6 +1035,7 @@ function createToolCard(parent: HTMLElement, toolId: string, name: string): HTML
   const step = el("div", "step" + (DIFF_TOOLS.has(name) ? " edit" : ""));
   step.append(el("div", "step-dot"), card);
   parent.appendChild(step);
+  markIfFirstNode(parent, step);
   toolCards.set(toolId, card);
   updateActiveLine(); // the new dot becomes the active progress start
   maybeScroll();
@@ -1582,6 +1586,7 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
   const step = el("div", "step ask");
   step.append(el("div", "step-dot"), wrap);
   body.append(step);
+  markIfFirstNode(body, step);
   scrollToBottom();
 }
 
@@ -1723,6 +1728,7 @@ function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOr
       if (it.text) node.title = truncateText(it.text, 800);
       step.append(el("div", "step-dot"), node);
       body.appendChild(step);
+      markIfFirstNode(body, step);
     } else if (it.type === "compaction") {
       finalizeTurn();
       messagesEl.appendChild(renderCompactionDivider(it.preTokens, it.postTokens));
@@ -2642,9 +2648,7 @@ function renderFileChips() {
       e.stopPropagation();
       removeFile(f.path);
     };
-    const ico = el("span", "fa-ico");
-    ico.innerHTML = ICON.file;
-    chip.append(ico, name, x);
+    chip.append(name, x);
     fileChips.appendChild(chip);
   }
 }

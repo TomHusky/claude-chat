@@ -26,7 +26,6 @@ export const ICONS: Record<string, string> = {
   trash: _s('<path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/>'),
   play: _s('<path d="M5 3.8v8.4l7-4.2z"/>'),
   update: _s('<path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/>'),
-  database: _s('<ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M3 8c0 1.1 2.24 2 5 2s5-.9 5-2"/>'),
   // Directional/confirm glyphs — the UI used to draw these with text characters
   // ("⌄", "‹", "›", "✓"), which pick up the UI font's own metrics and sit off-centre.
   chevron: _s('<path d="M4.5 6.5 8 10l3.5-3.5"/>'),
@@ -35,6 +34,10 @@ export const ICONS: Record<string, string> = {
   check: _s('<path d="M3.5 8.4 6.3 11.2 12.5 5"/>'),
   // four-point sparkle — the model picker's glyph
   model: _s('<path d="M8 2.2 9.5 6.5 13.8 8 9.5 9.5 8 13.8 6.5 9.5 2.2 8 6.5 6.5z"/>'),
+  // database cylinder + status dot (bottom-right) — the SLS-logs toggle
+  sls: _s(
+    '<ellipse cx="7" cy="4.2" rx="4.4" ry="1.8"/><path d="M2.6 4.2v6.4c0 1 1.97 1.8 4.4 1.8.55 0 1.08-.04 1.57-.12"/><path d="M2.6 7.4c0 1 1.97 1.8 4.4 1.8s4.4-.8 4.4-1.8"/><path d="M11.4 4.2v3.3"/><circle cx="12.3" cy="12.3" r="2" fill="currentColor" stroke="none"/>',
+  ),
 };
 
 /** SLS 连接配置。持久化在 `~/sls-tools/config.json`，供 `sls` CLI 与本面板共用。

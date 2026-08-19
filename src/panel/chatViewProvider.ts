@@ -216,6 +216,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         if (doc.uri.scheme !== "file") return;
         this.postActiveFile(doc.uri.fsPath === this.lastActiveFilePath);
       }),
+      // onDidCloseTextDocument is unreliable for TAB closes (VS Code keeps the
+      // document alive in the background), which left the auto-chip stuck. The
+      // tab list is the truth: when the attached file has no tab left anywhere,
+      // clear or replace the chip.
+      vscode.window.tabGroups.onDidChangeTabs(() => {
+        const p = this.lastActiveFilePath;
+        if (!p) return;
+        const stillOpen = vscode.window.tabGroups.all.some((g) =>
+          g.tabs.some((t) => ((t.input as { uri?: vscode.Uri } | undefined)?.uri?.fsPath ?? "") === p),
+        );
+        if (!stillOpen) this.postActiveFile(true);
+      }),
     );
 
     // 用量随时间流逝（5h 窗口滚动）+ 其他设备的消耗——不主动刷新的话，胶囊上的
@@ -4748,7 +4760,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <span class="composer-sep"></span>
             <button id="model-trigger" class="composer-pick" title="选择模型"><span class="pick-emoji">${ICONS.model}</span><span id="model-label" class="pick-label">默认模型</span><span class="pick-caret">${ICONS.chevron}</span></button>
             <button id="mode-trigger" class="composer-pick" title="选择模式"><span id="mode-icon" class="pick-emoji"></span><span id="mode-label" class="pick-label"></span><span class="pick-caret">${ICONS.chevron}</span></button>
-            <button id="sls-toggle-btn" class="composer-pick sls-toggle-btn hidden" title="打开后，本条消息会带上 SLS 日志工具用法，Claude 可直接查后端日志"><span class="pick-emoji sls-ico">${ICONS.database}</span><span class="pick-label">SLS日志</span></button>
+            <button id="sls-toggle-btn" class="composer-pick sls-toggle-btn hidden" title="打开后，本条消息会带上 SLS 日志工具用法，Claude 可直接查后端日志"><span class="pick-emoji sls-ico">${ICONS.sls}</span><span class="pick-label">SLS日志</span></button>
             <span class="composer-state">
               <span id="ctx-gauge" class="ctx-gauge hidden" title="上下文使用量"><span class="cg-ring"><span class="cg-pct"></span></span></span>
               <button id="usage-pill" class="usage-pill hidden" title="Claude 订阅用量 · 点击查看详情"></button>

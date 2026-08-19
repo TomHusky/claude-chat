@@ -228,7 +228,15 @@ function finalizeTurn() {
     const body = assistantEl.querySelector(".msg-body");
     // If the user manually stopped, mark it at the very end of the reply.
     if (body && userStopped) body.appendChild(el("div", "msg-interrupted", "[Request interrupted by user]"));
-    if (body && body.children.length === 0) {
+    // "Empty" must ignore the thread-line/active scaffolding that now lives in
+    // the body — a contentless turn (e.g. the /compact summarization pass)
+    // otherwise survives as a ghost avatar with an action row.
+    const hasContent =
+      body &&
+      Array.from(body.children).some(
+        (c) => !c.classList.contains("thread-line") && !c.classList.contains("thread-active") && !c.classList.contains("working-pill"),
+      );
+    if (body && !hasContent) {
       assistantEl.remove();
     } else if (body) {
       // Mark the final summary text as the closing timeline node (a dot at its
@@ -3072,9 +3080,27 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
     body.appendChild(grid);
   }
   if (text.trim()) {
-    const seg = el("div", "md");
+    const seg = el("div", "md user-text collapsed");
     seg.innerHTML = mdFull.render(text);
     body.appendChild(seg);
+    // A long prompt (e.g. a pasted SLS log) dominates the transcript — clamp it
+    // to 4 lines with a toggle. Measured post-layout so short prompts stay bare.
+    requestAnimationFrame(() => {
+      // Hidden hosts (folded history) measure 0 — fall back to a newline count.
+      const overflows = seg.scrollHeight === 0 ? text.split("\n").length > 4 : seg.scrollHeight - seg.clientHeight > 4;
+      if (overflows) {
+        const btn = el("button", "user-more") as HTMLButtonElement;
+        const setLabel = () => (btn.textContent = seg.classList.contains("collapsed") ? "展开" : "收起");
+        btn.onclick = () => {
+          seg.classList.toggle("collapsed");
+          setLabel();
+        };
+        setLabel();
+        seg.after(btn);
+      } else {
+        seg.classList.remove("collapsed");
+      }
+    });
   }
   msg.appendChild(body);
   messagesEl.appendChild(msg);

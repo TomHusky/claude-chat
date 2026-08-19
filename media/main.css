@@ -24,10 +24,15 @@
   --hl-attr: #9cdcfe;
   --hl-meta: #c586c0;
   --hl-del: #f14c4c;
-  /* The reading column: one measure wide, centered. This is what makes the
-     panel work at 320px (侧栏) and at 960px (编辑器标签页) with one layout. */
+  /* The composer's reading column (messages flow full-width with a buffer). */
   --col: 660px;
   --pad-x: clamp(10px, 2.5%, 24px);
+  /* Transcript side buffer with a knee: stays tight (12px) until the panel is
+     wider than ~720px, then takes 22% of the surplus per side (content still
+     grows, taking the other 56%), capped at 130px. So narrow = no wasted
+     margin, wide = a calm gutter — not a flat percentage that pads even a
+     sidebar. */
+  --pad-msgs: clamp(12px, (100% - 720px) * 0.22, 130px);
 }
 
 /* Light themes: same roles, Light+ values (code blocks keep a light surface). */
@@ -130,15 +135,15 @@ html, body {
   overflow-y: auto;
   overflow-x: hidden;
   /* 20px of breathing room below the editor tab (the toolbar was removed) */
-  padding: 20px var(--pad-x) 120px;
+  padding: 20px var(--pad-msgs) 120px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 16px;
 }
-/* Every turn is a full-width row capped at one measure — in a narrow sidebar it
-   fills the panel, in a wide editor tab the line length stops growing. */
-.messages > * { width: 100%; max-width: var(--col); }
+/* Turns fill the panel width — the side buffer above is the only cap, so the
+   content grows with the window. (The composer keeps its own 660px column.) */
+.messages > * { width: 100%; }
 /* …except the pills, which should stay their content width. */
 .messages > .history-expand { width: auto; }
 .msg { display: flex; gap: 8px; }
@@ -233,6 +238,19 @@ html, body {
 .msg-act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.16)); color: var(--vscode-foreground); }
 .msg-act.done { color: #3a9d5d; }
 .msg-act svg { width: 14px; height: 14px; display: block; flex: 0 0 auto; }
+
+/* Long user prompts clamp to 4 lines with a 展开/收起 toggle. */
+.msg.user .user-text.collapsed {
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.msg.user .user-more {
+  margin-top: 5px; padding: 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--vscode-button-foreground);
+  opacity: .8; font: inherit; font-size: 11.5px; text-decoration: underline;
+}
+.msg.user .user-more:hover { opacity: 1; }
 
 /* inline edit mode — full width, no accent bubble */
 .msg.user .msg-body.editing {

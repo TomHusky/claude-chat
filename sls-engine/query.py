@@ -138,11 +138,28 @@ def cmd_logstores(cfg, args):
         print(name)
 
 
-def _print_logs(logs, as_json):
+# 单字段截断上限。生产 error 日志一条就是完整 Java 堆栈（100+ 行），20 条原样输出
+# 动辄几万 token——消费方是 LLM 上下文，截断是省 token 的第一现场。
+# 保头保尾：异常链的根因（Caused by）通常在尾部，纯砍尾会把最有用的部分砍掉。
+FIELD_CAP = 700
+
+
+def _cap(text, full):
+    if full:
+        return text
+    t = str(text)
+    # 刚过线就截断省不了几个字符还多出标记行——超出 300+ 才动手
+    if len(t) <= FIELD_CAP + 300:
+        return t
+    return (t[: FIELD_CAP - 180] + f"\n  …(截断 {len(t) - FIELD_CAP} 字符, 加 --full 看全量)… \n"
+            + t[-160:])
+
+
+def _print_logs(logs, as_json, full=False):
     if as_json:
         out = []
         for log in logs:
-            row = dict(log.get_contents())
+            row = {k: _cap(v, full) for k, v in log.get_contents().items()}
             row["__time__"] = log.get_time()
             out.append(row)
         return out  # 交给调用方汇总
@@ -157,11 +174,11 @@ def _print_logs(logs, as_json):
             head += f" {level}"
         print(head)
         if msg:
-            print(f"  {msg}")
+            print(f"  {_cap(msg, full)}")
         for k, v in contents.items():
             if k.startswith("__") and k.endswith("__"):
                 continue
-            print(f"  {k}={v}")
+            print(f"  {k}={_cap(v, full)}")
         print()
     return None
 
@@ -185,16 +202,21 @@ def cmd_query(cfg, args):
                              topic="", query=args.q, line=args.limit,
                              offset=0, reverse=not args.forward)
         logs = client.get_logs(req).get_logs()
+        full = getattr(args, "full", False)
         if args.json:
             json_out.append({
                 "env": env, "project": project, "app": label, "logstore": logstore,
-                "count": len(logs), "logs": _print_logs(logs, True),
+                "count": len(logs), "logs": _print_logs(logs, True, full),
             })
         else:
             hdr = f"# [{env}] {label} (project={project} logstore={logstore}) {tspan} query={args.q!r} -> {len(logs)} 条"
             print(hdr)
             print("-" * min(len(hdr), 100))
-            _print_logs(logs, False)
+            if not logs:
+                # 空结果给出下一步指引而不是留白——避免模型盲目换参数反复全量扫
+                print("(0 条。建议：先扩大时间 --from，或换 --kind both；换关键词前先用 -n 5 小样本试)")
+                print()
+            _print_logs(logs, False, full)
     if args.json:
         print(json.dumps(json_out, ensure_ascii=False, indent=2))
 
@@ -235,7 +257,8 @@ def build_parser():
         sp.add_argument("-p", "--project", help="直接指定 SLS Project（覆盖 --env）")
         sp.add_argument("--from", dest="from_time", help="起始时间，默认 1h")
         sp.add_argument("--to", dest="to_time", help="结束时间，默认现在")
-        sp.add_argument("-n", "--limit", type=int, default=20, help="返回条数，默认 20")
+        sp.add_argument("-n", "--limit", type=int, default=10, help="返回条数，默认 10")
+        sp.add_argument("--full", action="store_true", help="不截断单条日志（默认每字段截断到 700 字符）")
         sp.add_argument("--json", action="store_true", help="输出原始 JSON")
         sp.add_argument("--forward", action="store_true", help="按时间正序(默认倒序，最新在前)")
 

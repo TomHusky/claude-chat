@@ -1219,9 +1219,24 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 }
 
 /* ---- Composer ---- */
+/* The composer FLOATS over the transcript (official-panel style): content
+   scrolls underneath and stays visible beside the 660px column instead of a
+   dead solid band. The container ignores the pointer so clicks in the side
+   gaps reach the messages; each child re-enables itself. */
 #composer {
-  position: relative;
+  position: absolute; left: 0; right: 0; bottom: 0;
   padding: 8px var(--pad-x) 10px;
+  pointer-events: none;
+  z-index: 4;
+}
+#composer > * { pointer-events: auto; position: relative; z-index: 1; }
+/* Scrim: content scrolling under the composer fades into the panel toward the
+   bottom, so the input reads as primary and the side gaps don't compete with
+   it. Sits above the transcript, below the composer's own controls. */
+#composer::before {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; top: -34px;
+  background: linear-gradient(transparent, var(--panel-bg) 58%);
+  pointer-events: none; z-index: 0;
 }
 /* Share the transcript's column so the whole panel reads on one axis: in a
    sidebar this is a no-op, in a wide editor tab the input stops drifting out
@@ -1657,6 +1672,11 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   margin-top: 7px;
   display: flex; align-items: center; gap: 8px;
   font-size: 11px; color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--panel-bg) 72%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-radius: 8px;
+  padding: 3px 8px;
 }
 .composer-foot .foot-keys { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .composer-foot .foot-spacer { flex: 1; }

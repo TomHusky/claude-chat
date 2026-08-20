@@ -185,6 +185,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   ) {
     this.store = new SessionStore(this.cwd());
 
+    // 引擎脚本随插件一起演进，但运行时用的是 ~/sls-tools 里的副本，而副本
+    // 原本只在「保存/测试配置」时刷新——升级插件后老脚本会一直跑下去。
+    // 已经初始化过 SLS 的机器（目录存在）在激活时同步一次最新脚本。
+    try {
+      if (fs.existsSync(path.join(this.slsDir(), "config.json"))) this.provisionSlsFiles();
+    } catch {
+      /* 同步失败不阻塞激活，下次保存配置时仍会重试 */
+    }
+
     // Serve baseline (pre-edit) content so the native diff editor can show
     // "original ⟷ current" for any file Claude changed — checking every open
     // session's checkpoints for the file's pre-edit content.
@@ -999,9 +1008,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       envLine,
       `- 业务项目 --app 可选值：${apps.join("、")}。`,
       "- 日志类型 --kind：`error`=异常/报错日志(默认)，`info`=普通日志，`both`=两者都查。",
-      "- 时间 --from：默认最近 1 小时，可用 `30m`/`2h`/`1d` 或绝对时间；条数 `-n`（默认 20）。加 `--json` 得结构化输出。",
+      "- 时间 --from：默认最近 1 小时，可用 `30m`/`2h`/`1d` 或绝对时间；条数 `-n`（默认 10）。加 `--json` 得结构化输出。单条日志默认按字段截断到 700 字符（保头保尾），确需完整堆栈时对单条加 `--full -n 1`。",
       `- 示例：查 ${defEnv} 环境 game-server 最近 1 小时的报错 → \`${sls} -q "*" --env ${defEnv} --app game-server --kind error --from 1h\`；\`${sls} apps\` 列出全部项目映射。`,
       "当用户要求查看/排查某环境某服务的日志、报错、异常、线上问题时，**主动用这个命令去查真实日志**，不要只翻本地代码或说无法获取。查询语句 -q 用 SLS 语法（如 `level: ERROR`、`* and 关键词`）。",
+      "**省 token 纪律**（生产日志量极大）：先小样本（`-n 5`）确认方向再放大；能用关键词/traceId 过滤就别 `-q \"*\"` 全量拉；查不到时按 1h→6h→1d 逐步扩时间窗，**不要**同时对多个 app/env 撒网全量扫；定位到目标后才用 `--full -n 1` 取完整堆栈。",
     ].join("\n");
   }
 

@@ -798,6 +798,38 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   word-break: break-word;
 }
 .tool-input .muted { padding: 10px 14px 0; }
+/* Unknown-tool param summary: readable key:value rows, not a JSON dump */
+.tool-input .param-list { display: flex; flex-direction: column; gap: 2px; padding: 10px 14px; }
+.tool-input .param-row {
+  font-family: var(--code-font); font-size: 11.5px; line-height: 1.6;
+  color: var(--vscode-descriptionForeground);
+  white-space: pre-wrap; word-break: break-word;
+}
+/* WebSearch/WebFetch results: a clean title + host list, no boxes */
+.search-results { display: flex; flex-direction: column; gap: 12px; padding: 12px 12px 2px; }
+.search-hit {
+  display: flex; flex-direction: column; gap: 2px; text-decoration: none;
+}
+.search-hit .sh-title {
+  font-size: 12.5px; color: var(--vscode-textLink-foreground); line-height: 1.5;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.search-hit:hover .sh-title { text-decoration: underline; }
+.search-hit .sh-url {
+  font-size: 11px; color: var(--vscode-descriptionForeground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.search-hit.hidden { display: none; }
+.search-more {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 2px; padding: 8px 12px;
+  border: none; background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font: inherit; font-size: 11.5px; cursor: pointer;
+}
+.search-more:hover { color: var(--vscode-foreground); }
+.search-more svg { width: 11px; height: 11px; display: block; }
+.search-more.on svg { transform: rotate(180deg); }
 /* code-block inside a tool card: fully flat — no box, no background at all */
 .tool-input .code-block,
 .tool-input .code-block .code-body,

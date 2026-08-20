@@ -472,11 +472,37 @@ let workingFixed = ""; // a fixed phase label (e.g. preparing options) — no ro
 function fmtTokens(n: number): string {
   return n >= 1000 ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k" : String(n);
 }
+// The CLI reports tokens in coarse jumps (≈50 at a time); showing them raw
+// makes the counter lurch. Ease the DISPLAYED value toward the real target on
+// each frame so it climbs smoothly, like the official panel.
+let tokenTarget = 0; // authoritative count
+let tokenShown = 0; // what's on screen (fractional, floored to display)
+let tokenRAF = 0;
+function paintTokens() {
+  const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
+  if (!tk) { tokenRAF = 0; return; }
+  const diff = tokenTarget - tokenShown;
+  // approach ~18%/frame, but always move at least 1 so it can't stall just shy
+  if (Math.abs(diff) < 1) {
+    tokenShown = tokenTarget;
+    tk.textContent = tokenShown > 0 ? `${fmtTokens(Math.round(tokenShown))} tokens` : "";
+    tokenRAF = 0;
+    return;
+  }
+  tokenShown += diff * 0.18 + Math.sign(diff);
+  tk.textContent = tokenShown > 0 ? `${fmtTokens(Math.round(tokenShown))} tokens` : "";
+  tokenRAF = requestAnimationFrame(paintTokens);
+}
 function setPillTokens() {
   // 真实思考 token > 精确输出 token > 字符估算：优先展示 CLI 报的真实数，退回估算。
-  const n = Math.max(turnTokens, turnThinkTokens, Math.round(turnEst));
-  const tk = assistantEl?.querySelector(".working-pill .wk-tokens") as HTMLElement | null;
-  if (tk) tk.textContent = n > 0 ? `${fmtTokens(n)} tokens` : "";
+  tokenTarget = Math.max(turnTokens, turnThinkTokens, Math.round(turnEst));
+  if (!tokenRAF) tokenRAF = requestAnimationFrame(paintTokens);
+}
+/** Reset the eased counter when a new turn's pill appears (no carry-over tween). */
+function resetTokenTween() {
+  tokenTarget = 0;
+  tokenShown = 0;
+  if (tokenRAF) { cancelAnimationFrame(tokenRAF); tokenRAF = 0; }
 }
 function onTokens(output: number) {
   // `output` is cumulative WITHIN one assistant message; a turn with tool loops
@@ -1091,6 +1117,7 @@ function updateToolInput(toolId: string, name: string, input: Record<string, unk
   if (sub) sub.textContent = subtitle;
   // Replace (don't stack) — a permission_request may already have rendered one.
   bodyWrap.querySelector(".tool-input")?.remove();
+  if (!html) return; // header-only tool (WebSearch/Glob/…): nothing to box
   const inputEl2 = el("div", "tool-input");
   inputEl2.innerHTML = html;
   // keep any existing result/permission below
@@ -1166,6 +1193,41 @@ function isInterruptSentinel(content: string): boolean {
   );
 }
 
+/** Pull {title,url} pairs out of a WebSearch/WebFetch result blob. Tolerant:
+ *  the payload is usually `… Links: [{"title":"…","url":"…"}, …]` but may vary,
+ *  so we scan for the JSON array and fall back to a loose regex. */
+function extractSearchLinks(text: string): { title: string; url: string }[] {
+  const out: { title: string; url: string }[] = [];
+  const m = /\[\s*{[\s\S]*}\s*\]/.exec(text);
+  if (m) {
+    try {
+      const arr = JSON.parse(m[0]);
+      if (Array.isArray(arr)) {
+        for (const o of arr) {
+          if (o && typeof o === "object" && (o.url || o.link)) {
+            out.push({ title: String(o.title ?? o.name ?? ""), url: String(o.url ?? o.link) });
+          }
+        }
+      }
+    } catch { /* fall through to regex */ }
+  }
+  if (!out.length) {
+    const re = /"title"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"url"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+    let r: RegExpExecArray | null;
+    while ((r = re.exec(text))) out.push({ title: r[1], url: r[2] });
+  }
+  return out;
+}
+
+/** host of a url for the muted second line (falls back to the raw string). */
+function prettyHost(url: string): string {
+  try {
+    return new URL(url).host.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const card = toolCards.get(toolUseId);
   if (!card) return;
@@ -1205,6 +1267,39 @@ function setToolResult(toolUseId: string, content: string, isError: boolean) {
   const bodyWrap = card.querySelector(".tool-body") as HTMLElement;
   const existing = card.querySelector(".tool-result");
   if (existing) existing.remove();
+  // WebSearch/WebFetch return a JSON-ish blob ("… Links: [{\"title\":…}]") —
+  // pull out the titles+urls and show them as a tidy link list, not raw text.
+  if (!bad && (tn === "WebSearch" || tn === "WebFetch")) {
+    const links = extractSearchLinks(content);
+    if (links.length) {
+      const box = el("div", "tool-result");
+      const list = el("div", "search-results");
+      const SHOW = 3; // 前 3 条常显，多的折叠
+      links.forEach((l, i) => {
+        const a = el("a", "search-hit" + (i >= SHOW ? " extra hidden" : "")) as HTMLAnchorElement;
+        a.href = l.url;
+        a.innerHTML = `<span class="sh-title">${escapeHtml(l.title || l.url)}</span><span class="sh-url">${escapeHtml(prettyHost(l.url))}</span>`;
+        list.appendChild(a);
+      });
+      box.appendChild(list);
+      if (links.length > SHOW) {
+        const more = el("button", "search-more") as HTMLButtonElement;
+        const rest = links.length - SHOW;
+        const setLabel = () =>
+          (more.innerHTML = `${ICON.chevron}` + (more.classList.contains("on") ? "收起" : `其余结果 ${rest} 条`));
+        more.onclick = () => {
+          more.classList.toggle("on");
+          box.querySelectorAll(".search-hit.extra").forEach((e) => e.classList.toggle("hidden"));
+          setLabel();
+        };
+        setLabel();
+        box.appendChild(more);
+      }
+      bodyWrap.appendChild(box);
+      maybeScroll();
+      return;
+    }
+  }
   const shown = truncateText(content, 8000);
   const lines = shown.replace(/\n+$/, "").split("\n").length;
   if (isError) {
@@ -1326,11 +1421,36 @@ function renderToolInput(name: string, input: Record<string, unknown>): { subtit
           `<div class="code-body"><pre>${escapeHtml(prompt)}</pre></div>${expand}</div>`,
       };
     }
-    case "Grep":
+    case "Grep": {
+      // pattern in the header; path/glob as a muted tail. No JSON body.
+      const where = [input.path, input.glob].filter(Boolean).map(String).join(" ");
+      return { subtitle: String(input.pattern ?? ""), html: where ? `<div class="muted">${escapeHtml(where)}</div>` : "" };
+    }
     case "Glob":
-      return { subtitle: String(input.pattern ?? ""), html: codeBlock(JSON.stringify(input, null, 2), "json") };
-    default:
-      return { subtitle: fp || "", html: codeBlock(truncateText(JSON.stringify(input, null, 2), 3000), "json") };
+      return { subtitle: String(input.pattern ?? ""), html: "" };
+    case "WebSearch":
+      return { subtitle: String(input.query ?? ""), html: "" };
+    case "WebFetch": {
+      const url = String(input.url ?? "");
+      const prompt = input.prompt ? String(input.prompt) : "";
+      return { subtitle: url, html: prompt ? `<div class="muted">${escapeHtml(prompt)}</div>` : "" };
+    }
+    default: {
+      // Unknown tool (incl. mcp__* servers): a readable "key: value" summary of
+      // scalar params instead of a raw JSON blob. Objects/arrays are noted by
+      // shape, not dumped. Nothing sensible → fall back to compact JSON.
+      const rows = Object.entries(input)
+        .map(([k, v]) => {
+          if (v == null) return null;
+          if (typeof v === "object") return `${k}: ${Array.isArray(v) ? `[${v.length} 项]` : "{…}"}`;
+          const val = String(v);
+          return `${k}: ${val.length > 140 ? val.slice(0, 140) + "…" : val}`;
+        })
+        .filter(Boolean) as string[];
+      if (!rows.length) return { subtitle: fp || "", html: "" };
+      const body = rows.map((r) => `<div class="param-row">${escapeHtml(r)}</div>`).join("");
+      return { subtitle: fp || "", html: `<div class="param-list">${body}</div>` };
+    }
   }
 }
 
@@ -2342,6 +2462,7 @@ function handleSlashCommand(payload: QueueItem): boolean {
       if (arg) {
         // 与 performSend 保持一致的忙碌态，否则界面不显示停止按钮/思考动画。
         turnTokens = 0; turnEst = 0; turnThinkTokens = 0; msgTokenBase = 0; lastMsgTokens = 0;
+        resetTokenTween();
         isBusy = true;
         setGlow("running");
         refreshComposerHint();
@@ -2389,6 +2510,7 @@ function performSend(p: QueueItem) {
   turnThinkTokens = 0;
   msgTokenBase = 0;
   lastMsgTokens = 0;
+  resetTokenTween();
   isBusy = true;
   refreshComposerHint(); // show the Stop button immediately (don't wait for the busy event)
   showWorking(); // instant feedback (the busy event confirms it a moment later)
@@ -2468,6 +2590,13 @@ stopBtn.onclick = () => {
   isBusy = false;
   refreshComposerHint();
   removeWorking();
+  // Stop the left-rail progress pulse NOW. finalizeTurn also does this, but it
+  // only runs when the host's `result` lands — which can lag seconds behind the
+  // click, leaving the rail animating after "stopped". (bug: rail kept moving.)
+  if (assistantEl) {
+    assistantEl.classList.remove("streaming-turn");
+    assistantEl.querySelector(".thread-active")?.remove();
+  }
 };
 /** True from Stop-click until the next turn starts: render nothing new. */
 let stoppingView = false;
@@ -3226,6 +3355,7 @@ function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
   turnThinkTokens = 0;
   msgTokenBase = 0;
   lastMsgTokens = 0;
+  resetTokenTween();
   isBusy = true;
   // stoppingView stays as-is — see performSend; `setBusy(true)` reopens the gate.
   refreshComposerHint();

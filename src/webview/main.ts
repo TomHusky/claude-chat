@@ -679,9 +679,9 @@ const composerEl = $("composer");
 if (composerEl && "ResizeObserver" in window) {
   new ResizeObserver(() => {
     const wasPinned = pinnedToBottom;
-    // +48：正文最后一条要完全越过渐隐幕布（其上探 34px）再留出呼吸空间，
-    // 否则收尾的操作按钮压在渐变里显得贴着输入框。
-    messagesEl.style.paddingBottom = `${composerEl.offsetHeight + 48}px`;
+    // +114：正文最后一条要完全越过渐隐幕布（其上探 34px）再留出约两行的
+    // 呼吸空间——直播时状态药丸是最后一行，贴着输入框会显得压迫。
+    messagesEl.style.paddingBottom = `${composerEl.offsetHeight + 150}px`;
     if (wasPinned) messagesEl.scrollTop = messagesEl.scrollHeight;
   }).observe(composerEl);
 }

@@ -1229,14 +1229,20 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   pointer-events: none;
   z-index: 4;
 }
-#composer > * { pointer-events: auto; position: relative; z-index: 1; }
+/* pointer-events only — do NOT set position here: an ID-specificity rule would
+   override the popup menus' own `position:absolute`, drop them into normal flow,
+   and inflate #composer's height (the ResizeObserver then padded the transcript
+   by the whole menu). */
+#composer > * { pointer-events: auto; }
 /* Scrim: content scrolling under the composer fades into the panel toward the
    bottom, so the input reads as primary and the side gaps don't compete with
-   it. Sits above the transcript, below the composer's own controls. */
+   it. z-index:-1 keeps it behind ALL composer controls (no need to lift them)
+   while #composer's own z-index:4 still floats the whole thing above the
+   transcript. */
 #composer::before {
   content: ""; position: absolute; left: 0; right: 0; bottom: 0; top: -34px;
   background: linear-gradient(transparent, var(--panel-bg) 58%);
-  pointer-events: none; z-index: 0;
+  pointer-events: none; z-index: -1;
 }
 /* Share the transcript's column so the whole panel reads on one axis: in a
    sidebar this is a no-op, in a wide editor tab the input stops drifting out

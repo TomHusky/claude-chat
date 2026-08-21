@@ -77,11 +77,22 @@ html, body {
   height: 100%;
   margin: 0;
   padding: 0;
+  /* The PAGE itself must never scroll — .messages is the only scroller. Any
+     accidental 1px body overflow summons VS Code's injected webview scrollbar
+     at the window's top-right corner: a rounded thumb we never styled, i.e.
+     the mystery rounded corner floating beside the top bar. */
+  overflow: hidden;
   font-family: var(--vscode-font-family);
   font-size: var(--vscode-font-size, 13px);
   color: var(--vscode-foreground);
   background: var(--panel-bg);
 }
+
+/* Belt & braces: if any scroller in this document still shows a bar we didn't
+   explicitly style, it renders square with a transparent track/corner — no
+   rounded ends anywhere. */
+::-webkit-scrollbar-corner { background: transparent; }
+body ::-webkit-scrollbar-thumb { border-radius: 0; }
 
 #app {
   display: flex;
@@ -149,18 +160,23 @@ html, body {
 .msg { display: flex; gap: 8px; }
 
 /* ---- 顶部问题栏：滚动时悬浮显示当前提问；右侧「我的消息」按钮开消息列表 ---- */
+/* Floating pill on the composer's column — deliberately NOT edge-to-edge, so
+   the host's (VS Code Modern UI) rounded webview corners never clip it. */
 .question-bar {
   position: absolute;
-  top: 0; left: 0; right: 0;
+  top: 0; left: 8px; right: 8px;
   z-index: 4; /* 在消息之上、抽屉遮罩(5)之下 */
   display: flex; align-items: center; gap: 8px;
   height: 36px; box-sizing: border-box; /* 固定高度：带图片的消息不再把栏撑高 */
-  padding: 0 12px 0 14px;
+  padding: 0 8px 0 14px;
   overflow: hidden;
   font-size: 12px;
-  color: var(--vscode-descriptionForeground);
+  color: var(--vscode-foreground);
   background: var(--raised-bg);
-  border-radius: 0; /* 通栏悬浮条，无圆角 */
+  /* 两侧各让出 8px（正好是宿主 webview 容器的圆角宽度）——栏保持直角，
+     但不进入宿主的圆角裁剪区，缺口不出现。 */
+  border: none;
+  border-radius: 0;
   box-shadow: 0 6px 14px -8px rgba(0, 0, 0, .85);
   cursor: pointer;
   user-select: none;
@@ -171,7 +187,7 @@ html, body {
   width: 2px; height: 15px; border-radius: 1px;
   background: var(--vscode-descriptionForeground); opacity: .55;
 }
-.question-bar:hover { color: var(--vscode-foreground); }
+body.vscode-dark .question-bar, body.vscode-high-contrast .question-bar { color: #ffffff; }
 .question-bar .qb-thumbs { display: flex; gap: 4px; flex: 0 0 auto; }
 .question-bar .qb-thumbs img {
   width: 24px; height: 24px; object-fit: cover; border-radius: 0;

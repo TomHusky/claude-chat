@@ -787,6 +787,13 @@ function openMsgNav() {
   buildMsgNav();
   navOpen = true;
   msgNav.classList.remove("hidden");
+  // 横栏现在是限宽居中的悬浮条，弹窗按钮的实际位置随面板宽度变——
+  // 打开时按按钮矩形锚定，右缘对齐按钮右缘。
+  const host = messagesEl.parentElement as HTMLElement;
+  const hr = host.getBoundingClientRect();
+  const br = qbNavBtn.getBoundingClientRect();
+  msgNav.style.top = `${br.bottom - hr.top + 6}px`;
+  msgNav.style.right = `${Math.max(8, hr.right - br.right)}px`;
   qbNavBtn.classList.add("on");
   syncNavActive();
 }

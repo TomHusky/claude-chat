@@ -148,18 +148,19 @@ html, body {
 .messages > .history-expand { width: auto; }
 .msg { display: flex; gap: 8px; }
 
-/* ---- 顶部问题栏：滚动时悬浮显示当前可见回复对应的提问，点击跳回 ---- */
+/* ---- 顶部问题栏：滚动时悬浮显示当前提问；右侧「我的消息」按钮开消息列表 ---- */
 .question-bar {
   position: absolute;
   top: 0; left: 0; right: 0;
   z-index: 4; /* 在消息之上、抽屉遮罩(5)之下 */
   display: flex; align-items: center; gap: 8px;
-  padding: 7px 12px 7px 14px;
+  height: 36px; box-sizing: border-box; /* 固定高度：带图片的消息不再把栏撑高 */
+  padding: 0 12px 0 14px;
+  overflow: hidden;
   font-size: 12px;
   color: var(--vscode-descriptionForeground);
   background: var(--raised-bg);
-  /* A soft drop shadow instead of a hard rule — the bar floats over the
-     transcript, it isn't a section divider. */
+  border-radius: 0; /* 通栏悬浮条，无圆角 */
   box-shadow: 0 6px 14px -8px rgba(0, 0, 0, .85);
   cursor: pointer;
   user-select: none;
@@ -170,26 +171,108 @@ html, body {
   width: 2px; height: 15px; border-radius: 1px;
   background: var(--vscode-descriptionForeground); opacity: .55;
 }
-/* the click affordance, always visible (it used to be invisible until hover) */
-.question-bar::after {
-  content: "↑ 提问"; flex: 0 0 auto;
-  font-size: 11px; line-height: 1.5; white-space: nowrap;
-  padding: 1px 6px; border-radius: 9px;
-  background: rgba(128, 128, 128, .12);
-}
 .question-bar:hover { color: var(--vscode-foreground); }
 .question-bar .qb-thumbs { display: flex; gap: 4px; flex: 0 0 auto; }
 .question-bar .qb-thumbs img {
-  width: 30px; height: 30px; object-fit: cover; border-radius: 5px;
+  width: 24px; height: 24px; object-fit: cover; border-radius: 0;
   border: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, .3));
 }
-/* One line, ellipsized. Two lines made the bar a moving target — its height
-   changed with the question and pushed the transcript around. */
+/* One line, ellipsized. */
 .question-bar .qb-text {
   flex: 1; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   line-height: 1.5;
 }
+/* 右侧「我的消息」按钮（对齐原型 2a navBtnStyle）：默认灰底灰字，展开时转蓝 */
+.question-bar .qb-navbtn {
+  flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
+  height: 20px; padding: 0 7px; border: none; border-radius: 9px;
+  background: rgba(255, 255, 255, .05); color: var(--vscode-descriptionForeground);
+  font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap;
+}
+.question-bar .qb-navbtn:hover { background: rgba(255, 255, 255, .09); color: var(--vscode-foreground); }
+.question-bar .qb-navbtn.on {
+  background: color-mix(in srgb, var(--vscode-textLink-foreground) 16%, transparent);
+  color: var(--vscode-textLink-foreground);
+}
+.question-bar .qb-navbtn .qb-ico { display: inline-flex; }
+.question-bar .qb-navbtn .qb-ico svg { width: 12px; height: 12px; display: block; }
+
+/* The messages scrollbar's default rounded thumb pokes out from behind the
+   floating bar's top-right corner. Give the transcript the same slim,
+   transparent-track scrollbar as everything else so nothing rounds that corner. */
+.messages { scrollbar-width: thin; scrollbar-color: rgba(128, 128, 128, .32) transparent; }
+.messages::-webkit-scrollbar { width: 10px; background: transparent; }
+.messages::-webkit-scrollbar-track { background: transparent; }
+/* SQUARE thumb: a rounded end emerging from behind the floating top bar reads
+   as a stray rounded corner on the bar itself. */
+.messages::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, .32); border-radius: 0;
+  border: 3px solid transparent; background-clip: padding-box;
+}
+.messages::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, .5); background-clip: padding-box; }
+
+.msgnav.hidden { display: none; }
+/* the dropdown (对齐原型 2a navStyle) */
+.msgnav {
+  position: absolute; top: 38px; right: var(--pad-msgs); z-index: 5;
+  width: min(244px, calc(100% - 2 * var(--pad-msgs)));
+  max-height: min(60vh, 360px); display: flex; flex-direction: column;
+  background: var(--vscode-menu-background, var(--raised-bg));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, rgba(128,128,128,.3)));
+  border-radius: 6px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .55);
+  padding: 5px;
+  transform-origin: top right;
+  animation: navpop .16s cubic-bezier(.2, .75, .3, 1);
+}
+@keyframes navpop {
+  from { opacity: 0; transform: translateY(-6px) scale(.97); }
+  to { opacity: 1; transform: none; }
+}
+.msgnav-head {
+  display: flex; align-items: center; gap: 7px;
+  padding: 5px 8px 6px; flex: 0 0 auto;
+}
+.msgnav-head .mn-title { font-size: 10.5px; letter-spacing: .5px; color: var(--vscode-descriptionForeground); }
+.msgnav-head .mn-count {
+  margin-left: auto; font-family: var(--code-font); font-size: 10px;
+  color: var(--vscode-descriptionForeground); opacity: .8; font-variant-numeric: tabular-nums;
+}
+.msgnav-list {
+  display: flex; flex-direction: column; gap: 1px; overflow-y: auto;
+  scrollbar-width: thin; scrollbar-color: rgba(128, 128, 128, .35) transparent;
+}
+.msgnav-list::-webkit-scrollbar { width: 8px; background: transparent; }
+.msgnav-list::-webkit-scrollbar-track { background: transparent; }
+.msgnav-list::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, .35); border-radius: 4px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+.msgnav-list::-webkit-scrollbar-thumb:hover { background: rgba(128, 128, 128, .5); background-clip: padding-box; }
+/* Each row carries a left accent bar — blue on the current message, gray
+   otherwise (2a); the highlight is the bar, not a full-width block. */
+.msgnav-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 9px 6px 7px; border-radius: 5px; cursor: pointer;
+}
+.msgnav-item:hover { background: rgba(255, 255, 255, .045); }
+.msgnav-item.on { background: rgba(255, 255, 255, .055); }
+.msgnav-item .mn-bar {
+  flex: 0 0 auto; width: 2px; height: 13px; border-radius: 1px;
+  background: var(--vscode-panel-border, rgba(128, 128, 128, .35));
+}
+.msgnav-item.on .mn-bar { background: var(--vscode-textLink-foreground, #4daafc); }
+.msgnav-item .mn-idx {
+  flex: 0 0 auto; font-family: var(--code-font); font-size: 9.5px;
+  color: var(--vscode-descriptionForeground); opacity: .7; font-variant-numeric: tabular-nums;
+}
+.msgnav-item.on .mn-idx { opacity: 1; }
+.msgnav-item .mn-text {
+  flex: 1; min-width: 0; font-size: 11.5px; line-height: 1.5; color: var(--vscode-descriptionForeground);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.msgnav-item.on .mn-text { color: var(--vscode-foreground); }
 
 /* Empty/new-session placeholder */
 .empty-state {

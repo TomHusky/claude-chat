@@ -722,16 +722,79 @@ messagesEl.addEventListener("scroll", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 顶部问题栏：滚动阅读长回复时固定显示它对应的是哪条提问，点击跳回该提问
-// （参考官方 Claude 客户端；提问本身可见时不显示）
+// 顶部「我的消息」导航：悬浮栏点开后列出本会话所有用户消息，点某条跳到对应
+// 位置；滚动阅读时弹窗里的高亮项跟随当前所在的那条提问。
 // ---------------------------------------------------------------------------
 const questionBar = el("div", "question-bar hidden");
 const qbThumbsEl = el("span", "qb-thumbs");
 const qbTextEl = el("span", "qb-text");
-questionBar.append(qbThumbsEl, qbTextEl);
+const qbNavBtn = el("button", "qb-navbtn") as HTMLButtonElement; // 右侧「我的消息」按钮
+qbNavBtn.innerHTML = `<span class="qb-ico"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.4h10M3 8h7M3 11.6h4.5"/></svg></span>我的消息`;
+questionBar.append(qbThumbsEl, qbTextEl, qbNavBtn);
 messagesEl.parentElement!.insertBefore(questionBar, messagesEl);
-let qbTarget: HTMLElement | null = null;
+// 点横栏本体：跳回当前提问（保持原行为）；点「我的消息」按钮：开消息列表弹窗。
 questionBar.addEventListener("click", () => qbTarget?.scrollIntoView({ behavior: "smooth", block: "start" }));
+qbNavBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  navOpen ? closeMsgNav() : openMsgNav();
+});
+
+const msgNav = el("div", "msgnav hidden");
+messagesEl.parentElement!.appendChild(msgNav);
+
+let navOpen = false;
+let qbTarget: HTMLElement | null = null; // 当前视口所属的用户消息
+
+/** 可见的用户消息（排除折叠历史里 display:none 的）。 */
+function visibleUserMsgs(): HTMLElement[] {
+  return Array.from(messagesEl.querySelectorAll<HTMLElement>(".msg.user")).filter((u) => u.offsetParent !== null);
+}
+
+function buildMsgNav() {
+  const msgs = visibleUserMsgs();
+  msgNav.innerHTML = "";
+  const head = el("div", "msgnav-head");
+  head.append(el("span", "mn-title", "跳到我发的消息"), el("span", "mn-count", String(msgs.length)));
+  msgNav.appendChild(head);
+  const list = el("div", "msgnav-list");
+  msgs.forEach((u, i) => {
+    const raw = (u.dataset.rawText || "").trim();
+    const imgs = u.querySelectorAll(".msg-images img").length;
+    const label = raw.replace(/\s+/g, " ") || (imgs ? `[图片 ${imgs}]` : "(空消息)");
+    const row = el("div", "msgnav-item" + (u === qbTarget ? " on" : ""));
+    row.dataset.idx = String(i);
+    row.append(el("span", "mn-bar"), el("span", "mn-idx", String(i + 1).padStart(2, "0")), el("span", "mn-text", label));
+    row.onclick = () => {
+      u.scrollIntoView({ behavior: "smooth", block: "start" });
+      closeMsgNav();
+    };
+    list.appendChild(row);
+  });
+  msgNav.appendChild(list);
+}
+
+/** 高亮弹窗里对应当前提问的那一项，并把它滚到弹窗可视区内。 */
+function syncNavActive() {
+  if (!navOpen) return;
+  const msgs = visibleUserMsgs();
+  const idx = qbTarget ? msgs.indexOf(qbTarget) : -1;
+  const rows = Array.from(msgNav.querySelectorAll<HTMLElement>(".msgnav-item"));
+  rows.forEach((r, i) => r.classList.toggle("on", i === idx));
+  if (idx >= 0 && rows[idx]) rows[idx].scrollIntoView({ block: "nearest" });
+}
+
+function openMsgNav() {
+  buildMsgNav();
+  navOpen = true;
+  msgNav.classList.remove("hidden");
+  qbNavBtn.classList.add("on");
+  syncNavActive();
+}
+function closeMsgNav() {
+  navOpen = false;
+  msgNav.classList.add("hidden");
+  qbNavBtn.classList.remove("on");
+}
 
 let qbRAF = 0;
 function updateQuestionBar() {
@@ -741,7 +804,7 @@ function updateQuestionBar() {
     // 已完全滚出可视区顶部的最后一条用户消息，就是当前可见回复所属的提问。
     const topEdge = messagesEl.getBoundingClientRect().top + (questionBar.offsetHeight || 34) + 4;
     let cur: HTMLElement | null = null;
-    for (const u of Array.from(messagesEl.querySelectorAll<HTMLElement>(".msg.user"))) {
+    for (const u of visibleUserMsgs()) {
       if (u.getBoundingClientRect().bottom < topEdge) cur = u;
       else break;
     }
@@ -749,6 +812,7 @@ function updateQuestionBar() {
     const imgs = cur ? Array.from(cur.querySelectorAll<HTMLImageElement>(".msg-images img")) : [];
     if (!cur || (!text && !imgs.length)) {
       qbTarget = null;
+      if (navOpen) closeMsgNav();
       questionBar.classList.add("hidden");
       return;
     }
@@ -765,6 +829,7 @@ function updateQuestionBar() {
       qbThumbsEl.classList.toggle("hidden", !imgs.length);
     }
     questionBar.classList.remove("hidden");
+    syncNavActive();
   });
 }
 
@@ -1830,11 +1895,18 @@ function renderHistory(showAll: boolean) {
 function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<number, { id: string }>) {
   if (!historyState) return;
   const items = historyState.items;
+  // The viewport must not MOVE: whatever the user was looking at stays put and
+  // the older turns materialize above it. Capture the anchor's on-screen Y
+  // BEFORE any DOM change, then correct scrollTop by the drift — and repeat on
+  // the next frames, because the freshly rendered old messages fold themselves
+  // (user-fold, code collapse) a frame later and shift heights again. A single
+  // scrollIntoView here was exactly the "expand jumps somewhere else" bug.
+  const anchorEl = banner.nextElementSibling as HTMLElement | null;
+  const keepY = anchorEl ? anchorEl.getBoundingClientRect().top : 0;
   banner.remove();
   const savedAssistant = assistantEl, savedLive = liveBlock, savedLastUser = lastUserEl;
   const tail = document.createDocumentFragment();
   while (messagesEl.firstChild) tail.appendChild(messagesEl.firstChild);
-  const anchor = tail.firstElementChild; // first previously-visible node — keep the viewport on it
   assistantEl = null;
   liveBlock = null;
   liveThink = null;
@@ -1846,7 +1918,19 @@ function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<num
   lastUserEl = savedLastUser;
   messagesEl.appendChild(tail);
   userMsgCount = messagesEl.querySelectorAll(".msg.user").length;
-  anchor?.scrollIntoView({ block: "start" });
+  if (anchorEl) {
+    pinnedToBottom = false; // expanding is an upward read — nothing may snap to bottom
+    const fix = () => {
+      const d = anchorEl.getBoundingClientRect().top - keepY;
+      if (d !== 0) messagesEl.scrollTop += d;
+    };
+    fix();
+    requestAnimationFrame(() => {
+      fix();
+      requestAnimationFrame(fix);
+    });
+    setTimeout(fix, 140); // late reflows: image loads, rail observers
+  }
 }
 
 /** Append items[from..to) to messagesEl. Checkpoint ordinals stay correct for

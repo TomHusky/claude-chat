@@ -164,7 +164,7 @@ body ::-webkit-scrollbar-thumb { border-radius: 0; }
    the host's (VS Code Modern UI) rounded webview corners never clip it. */
 .question-bar {
   position: absolute;
-  top: 0; left: 8px; right: 8px;
+  top: 0; left: var(--pad-msgs); right: var(--pad-msgs);
   z-index: 4; /* 在消息之上、抽屉遮罩(5)之下 */
   display: flex; align-items: center; gap: 8px;
   height: 36px; box-sizing: border-box; /* 固定高度：带图片的消息不再把栏撑高 */
@@ -173,10 +173,10 @@ body ::-webkit-scrollbar-thumb { border-radius: 0; }
   font-size: 12px;
   color: var(--vscode-foreground);
   background: var(--raised-bg);
-  /* 两侧各让出 8px（正好是宿主 webview 容器的圆角宽度）——栏保持直角，
-     但不进入宿主的圆角裁剪区，缺口不出现。 */
+  /* 两侧对齐聊天记录的留白（--pad-msgs ≥ 12px，同时天然避开宿主 8px
+     圆角裁剪区）——栏和正文同一条列，宽度随面板一起伸缩。 */
   border: none;
-  border-radius: 0;
+  border-radius: 6px;
   box-shadow: 0 6px 14px -8px rgba(0, 0, 0, .85);
   cursor: pointer;
   user-select: none;
@@ -202,7 +202,7 @@ body.vscode-dark .question-bar, body.vscode-high-contrast .question-bar { color:
 /* 右侧「我的消息」按钮（对齐原型 2a navBtnStyle）：默认灰底灰字，展开时转蓝 */
 .question-bar .qb-navbtn {
   flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px;
-  height: 20px; padding: 0 7px; border: none; border-radius: 9px;
+  height: 20px; padding: 0 7px; border: none; border-radius: 6px; /* 与外层栏一致 */
   background: rgba(255, 255, 255, .05); color: var(--vscode-descriptionForeground);
   font: inherit; font-size: 11px; cursor: pointer; white-space: nowrap;
 }

@@ -341,6 +341,9 @@ body.vscode-dark .question-bar, body.vscode-high-contrast .question-bar { color:
 /* Long user prompts fold to ~4 lines with a fade + "展开全部 N 行" — same
    mechanic as a long Bash command, but tinted to the accent bubble. The .md
    inside keeps display:block in both states, so the font never shifts. */
+/* User messages render as literal text (no markdown styling) — preserve the
+   line breaks & whitespace the user typed/pasted. */
+.msg.user .user-plain { white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.user .user-fold { position: relative; }
 .msg.user .user-fold.collapsed {
   max-height: calc(4 * 1.7em); overflow: hidden;

@@ -313,6 +313,35 @@ export class SessionStore {
     return userTurns;
   }
 
+  /** 截断点之后的第一条真人提问原文——用于校验还原点是否与当前 transcript 对齐。
+   *  返回 undefined 表示截断点之后没有提问（无从校验，交由调用方放行）。 */
+  firstUserTextAfter(sessionId: string, afterLines: number): string | undefined {
+    const file = this.findFile(sessionId);
+    if (!file) return undefined;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return undefined;
+    }
+    let seen = 0;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      seen++;
+      if (seen <= afterLines) continue;
+      let o: any;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (o?.type === "user" && this.isRealUserText(o)) {
+        return splitAttachedContext(this.userText(o)).text || this.userText(o);
+      }
+    }
+    return undefined;
+  }
+
   findFile(sessionId: string): string | undefined {
     for (const dir of this.projectDirs()) {
       const f = path.join(dir, `${sessionId}.jsonl`);

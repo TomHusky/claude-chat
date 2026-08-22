@@ -48,11 +48,54 @@ def load_config(path):
     if not os.path.exists(path):
         die(f"找不到配置文件 {path}")
     with open(path, encoding="utf-8") as f:
-        cfg = json.load(f)
+        return json.load(f)
+
+
+def _accounts(cfg):
+    """归一成账号列表。新格式有 cfg['accounts']；旧的平铺格式把整个 cfg 当单账号。"""
+    accts = cfg.get("accounts")
+    if isinstance(accts, list) and accts:
+        return accts
+    return [cfg]
+
+
+def _acct_label(a):
+    return a.get("name") or "(未命名)"
+
+
+def resolve_account(cfg, args):
+    """挑出要用的账号 dict：--account 显式指定 > 按 --app 自动路由 > 第一个。"""
+    accts = _accounts(cfg)
+    name = getattr(args, "account", None)
+    if name:
+        for a in accts:
+            if str(a.get("name", "")).strip().lower() == name.strip().lower():
+                return _validate_account(a)
+        die(f"未找到账号 {name!r}（已配置：{'、'.join(_acct_label(a) for a in accts)}）")
+    if len(accts) > 1:
+        app = getattr(args, "app", None)
+        if app:
+            owners = [a for a in accts if app in (a.get("logs") or {})]
+            if len(owners) == 1:
+                return _validate_account(owners[0])
+            if len(owners) > 1:
+                die(f"app {app!r} 在多个账号里都有，请加 --account 指定：{'、'.join(_acct_label(a) for a in owners)}")
+        # 没传 --app（直接 --project / -l 查）：按 project 名归属路由，别默默落到第一个账号
+        proj = getattr(args, "project", None)
+        if proj:
+            owners = [a for a in accts if proj in (a.get("projects") or {}).values()]
+            if len(owners) == 1:
+                return _validate_account(owners[0])
+        if app or proj:
+            die(f"无法判断 {app or proj!r} 属于哪个账号，请加 --account 指定（已配置：{'、'.join(_acct_label(a) for a in accts)}）")
+    return _validate_account(accts[0])
+
+
+def _validate_account(a):
     for k in ("endpoint", "accessKeyId", "accessKeySecret"):
-        if not cfg.get(k) or "REPLACE_ME" in str(cfg.get(k)):
-            die(f"配置未填写完整: {k}。请编辑 {path}")
-    return cfg
+        if not a.get(k) or "REPLACE_ME" in str(a.get(k)):
+            die(f"账号 {_acct_label(a)} 未填写完整: {k}")
+    return a
 
 
 def resolve_project(cfg, args):
@@ -104,20 +147,17 @@ def get_client(cfg):
 
 
 def cmd_projects(cfg, args):
-    client = get_client(cfg)
+    acct = resolve_account(cfg, args)
+    client = get_client(acct)
     resp = client.list_project()
     for p in resp.get_projects():
         print(f"{p.get('projectName')}\t{p.get('description', '')}")
 
 
-def cmd_apps(cfg, args):
-    logs = cfg.get("logs", {})
-    projects = cfg.get("projects", {})
-    # 环境可自由增删——按配置里实际存在的逐个列出，别再假设只有 dev/pro。
-    if projects:
-        envs = "  ".join(f"{env}={proj or '(未配置)'}" for env, proj in projects.items())
-    else:
-        envs = "(未配置)"
+def _print_one_account_apps(a):
+    logs = a.get("logs", {})
+    projects = a.get("projects", {})
+    envs = "  ".join(f"{env}={proj or '(未配置)'}" for env, proj in projects.items()) if projects else "(未配置)"
     print(f"# 环境: {envs}")
     if not logs:
         print("(logs 映射为空)")
@@ -126,9 +166,23 @@ def cmd_apps(cfg, args):
         print(f"{app}\tinfo={entry.get('info', '-')}\terror={entry.get('error', '-')}")
 
 
+def cmd_apps(cfg, args):
+    accts = _accounts(cfg)
+    if len(accts) <= 1:
+        _print_one_account_apps(accts[0] if accts else cfg)
+        return
+    # 多账号：分组列出，模型据此按 --app 自动路由（app 名唯一时无需 --account）
+    for i, a in enumerate(accts):
+        if i:
+            print()
+        print(f"## 账号: {_acct_label(a)}")
+        _print_one_account_apps(a)
+
+
 def cmd_logstores(cfg, args):
-    client = get_client(cfg)
-    project, _ = resolve_project(cfg, args)
+    acct = resolve_account(cfg, args)
+    client = get_client(acct)
+    project, _ = resolve_project(acct, args)
     resp = client.list_logstore(project)
     stores = resp.get_logstores()
     if getattr(args, "json", False):
@@ -185,9 +239,10 @@ def _print_logs(logs, as_json, full=False):
 
 def cmd_query(cfg, args):
     from aliyun.log import GetLogsRequest
-    client = get_client(cfg)
-    project, env = resolve_project(cfg, args)
-    targets = resolve_logstores(cfg, args)
+    acct = resolve_account(cfg, args)
+    client = get_client(acct)
+    project, env = resolve_project(acct, args)
+    targets = resolve_logstores(acct, args)
 
     from_ts = parse_time(args.from_time or "1h")
     to_ts = parse_time(args.to_time)
@@ -246,6 +301,7 @@ def parse_time(val, default_now=True):
 def build_parser():
     p = argparse.ArgumentParser(description="阿里云 SLS 日志查询")
     p.add_argument("--config", help="配置文件路径(默认同目录 config.json)")
+    p.add_argument("--account", help="多账号时指定账号名（不传则按 --app 自动路由，或用第一个）")
     sub = p.add_subparsers(dest="cmd")
 
     def add_query_args(sp):
@@ -263,16 +319,16 @@ def build_parser():
         sp.add_argument("--forward", action="store_true", help="按时间正序(默认倒序，最新在前)")
 
     add_query_args(p)
-    sub.add_parser("projects", help="列出所有 SLS Project").add_argument("--config")
+    _p_proj = sub.add_parser("projects", help="列出所有 SLS Project"); _p_proj.add_argument("--config"); _p_proj.add_argument("--account")
     sub.add_parser("apps", help="列出已配置的业务项目及其 info/error logstore").add_argument("--config")
     sp_ls = sub.add_parser("logstores", help="列出某环境 Project 下所有 logstore")
     sp_ls.add_argument("--env")
     sp_ls.add_argument("-p", "--project")
     sp_ls.add_argument("--json", action="store_true")
-    sp_ls.add_argument("--config")
+    sp_ls.add_argument("--config"); sp_ls.add_argument("--account")
     sp_q = sub.add_parser("query", help="查询日志")
     add_query_args(sp_q)
-    sp_q.add_argument("--config")
+    sp_q.add_argument("--config"); sp_q.add_argument("--account")
     return p
 
 

@@ -1835,9 +1835,9 @@ function resolvePermission(requestId: string, behavior: "allow" | "deny") {
 // History / sessions / checkpoints
 // ---------------------------------------------------------------------------
 const HISTORY_TURN_LIMIT = 3; // only the last N turns render by default; older folds behind a banner
-let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: string }[] } | null = null;
+let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: string; userText?: string }[] } | null = null;
 
-function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string }[], sessionId?: string) {
+function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
   historyState = { items, checkpoints: checkpoints || [] };
   if (sessionId) vscode.setState({ sessionId });
   renderHistory(false);
@@ -1857,15 +1857,41 @@ function renderHistory(showAll: boolean) {
   userMsgCount = 0;
   ctxGauge.classList.add("hidden"); // refreshes from the next turn's usage
 
-  // Align checkpoints to the trailing user messages (tracking may start
-  // mid-session, and after a rewind there may be MORE checkpoints than turns —
-  // then the oldest checkpoints must drop, not shift onto the wrong messages).
-  const userTotal = items.filter((i) => i.type === "user").length;
-  const cpByOrdinal = new Map<number, { id: string }>();
-  checkpoints.forEach((c, j) => {
-    const ordinal = userTotal - checkpoints.length + j;
-    if (ordinal >= 0) cpByOrdinal.set(ordinal, c);
+  // Align checkpoints to the user turns they actually belong to.
+  //
+  // 这里以前是**猜**的：假设「N 个还原点 == 最后 N 条提问」（ordinal =
+  // userTotal - checkpoints.length + j）。跨天的长会话里还原点多是早期的
+  // （老的被 MAX_CHECKPOINTS 裁掉、或中途才开始记录），这个假设一旦不成立，
+  // 靠后的「还原到此处」就挂到了早期还原点上——点下去按它的 truncateLine 把
+  // 几千行 transcript 截成几行，整段上下文（连同官方插件里的记录）当场报废。
+  // 实测数据：某 5260 行会话的第 2 个还原点 truncateLine=8。
+  //
+  // 改为按身份匹配：还原点存了发起它的那条提问原文（userText），顺序扫描用户
+  // 消息找同文本的那条。匹配不上的还原点宁可不画分割线，也绝不错位。
+  const userIdx: number[] = []; // items 下标 -> 第几条用户消息
+  const userTexts: string[] = [];
+  items.forEach((it, i) => {
+    if (it.type === "user") {
+      userIdx.push(i);
+      userTexts.push((it.text || "").trim());
+    }
   });
+  const userTotal = userTexts.length;
+  const cpByOrdinal = new Map<number, { id: string }>();
+  {
+    let from = 0; // 单调向前扫，保证还原点之间的相对顺序不被打乱
+    for (const c of checkpoints) {
+      const want = (c.userText || "").trim();
+      if (!want) continue;
+      let hit = -1;
+      for (let k = from; k < userTotal; k++) {
+        if (userTexts[k] === want) { hit = k; break; }
+      }
+      if (hit < 0) continue; // 对不上就不画，避免错位还原
+      cpByOrdinal.set(hit, c);
+      from = hit + 1;
+    }
+  }
 
   // Long transcripts: render ONLY the last HISTORY_TURN_LIMIT turns now; older
   // items render lazily when the banner is clicked. Rendering everything up
@@ -3320,8 +3346,10 @@ function appendUser(text: string, contextLabels: string[] = [], images: string[]
     // element's display mode never changes — a -webkit-line-clamp switch to
     // flex-box rendering was subtly altering the font on expand.
     const fold = el("div", "user-fold collapsed");
-    const seg = el("div", "md");
-    seg.innerHTML = mdFull.render(text);
+    // 用户发的内容按纯文本显示：粘贴带 markdown/HTML 记号的内容（日志里的
+    // **、#、反引号等）不应被当成样式渲染。只保留换行与空白。
+    const seg = el("div", "md user-plain");
+    seg.textContent = text;
     fold.appendChild(seg);
     body.appendChild(fold);
     requestAnimationFrame(() => {

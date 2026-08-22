@@ -56,6 +56,8 @@ export interface QQConfig {
 }
 
 export interface SlsConfig {
+  /** 账号显示名（多账号时用于区分与 --account 路由；单账号可空）。 */
+  name?: string;
   endpoint: string;
   accessKeyId: string;
   accessKeySecret: string;
@@ -129,9 +131,9 @@ export type ToWebview =
   | { kind: "changed_files"; files: ChangedFile[]; totalAdded: number; totalRemoved: number }
   // ---- SLS 日志配置面板 ----
   /** 打开配置抽屉并回填当前配置；enginePresent 表示查询引擎(venv)是否已就绪。 */
-  | { kind: "sls_open"; config: SlsConfig; enginePresent: boolean }
+  | { kind: "sls_open"; accounts: SlsConfig[]; enginePresent: boolean }
   /** slsLoad 的应答，仅回填表单不弹开抽屉。 */
-  | { kind: "sls_config"; config: SlsConfig; enginePresent: boolean }
+  | { kind: "sls_config"; accounts: SlsConfig[]; enginePresent: boolean }
   | { kind: "qq_config"; config: QQConfig; hasSecret: boolean }
   // ---- 推送通知配置面板 ----
   | { kind: "notify_config"; webhook: string; minSec: number }
@@ -278,7 +280,8 @@ export type FromWebview =
   | { type: "notifySave"; webhook: string; minSec: number }
   /** 用表单里的（可能未保存的）地址发一条测试消息。 */
   | { type: "notifyTest"; webhook: string }
-  | { type: "slsSave"; config: SlsConfig }
+  | { type: "slsSave"; accounts: SlsConfig[] }
   | { type: "slsTest"; config: SlsConfig }
   /** 让 Claude 扫描工作区 Spring Boot 配置生成日志映射（预填 prompt 到聊天）。 */
-  | { type: "slsGenerate" };
+  | { type: "slsGenerate" }
+  | { type: "openSlsConfig" };

@@ -162,6 +162,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** QQ 配置的独立 webview 面板——与侧边栏零耦合，坏也只坏它自己。 */
   private qqPanel?: vscode.WebviewPanel;
   private notifyPanel?: vscode.WebviewPanel;
+  private slsPanel?: vscode.WebviewPanel;
   /** 当前正在处理的 QQ 消息（收集回复用）。机器人一次只处理一条，避免串台。 */
   private qqTurn?: { target: QQIncoming; text: string; done: boolean; blockStart?: number };
   private readonly qqQueue: QQIncoming[] = [];
@@ -513,11 +514,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.slsWatching = true;
     const file = path.join(this.slsDir(), "config.json");
     fs.watchFile(file, { interval: 2000 }, () => {
-      this.view?.webview.postMessage({
+      // 外部改动（Claude 自己写映射、或手动改）→ 刷新已打开的配置面板 + 组合器开关。
+      this.slsPanel?.webview.postMessage({
         kind: "sls_config",
-        config: this.readSlsConfig(),
+        accounts: this.readSlsAccounts(),
         enginePresent: this.slsEngineReady(),
       } satisfies ToWebview);
+      this.activeCtx && this.post(this.activeCtx, { kind: "config", permissionMode: "", model: "", effort: "", slsConfigured: this.slsConfigured() } as ToWebview);
     });
     this.context.subscriptions.push({ dispose: () => fs.unwatchFile(file) });
   }
@@ -838,45 +841,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return out;
   }
 
-  /** 读取已保存的配置；文件不存在时返回空表单（种子 dev/pro 两个空环境）。 */
-  private readSlsConfig(): SlsConfig {
-    const seed = (): Record<string, string> => ({ dev: "", pro: "" });
-    try {
-      const raw = fs.readFileSync(path.join(this.slsDir(), "config.json"), "utf8");
-      const j = JSON.parse(raw) as Record<string, unknown>;
+  /** 空账号模板（种子 dev/pro 两个空环境）。 */
+  private emptySlsAccount(name = ""): SlsConfig {
+    return { name, endpoint: "", accessKeyId: "", accessKeySecret: "", projects: { dev: "", pro: "" }, logs: {} };
+  }
+
+  /** 读取全部账号。新格式 { accounts:[...] }；旧的平铺单账号自动包成一个「默认」账号；
+   *  文件不存在时给一个空账号。 */
+  private readSlsAccounts(): SlsConfig[] {
+    const one = (j: Record<string, unknown>, name: string): SlsConfig => {
       const projects = this.normalizeProjects(j.projects);
       return {
+        name: (j.name as string) || name,
         endpoint: (j.endpoint as string) || "",
         accessKeyId: (j.accessKeyId as string) || "",
         accessKeySecret: (j.accessKeySecret as string) || "",
-        // 完全没有任何环境时，回填 dev/pro 两个空行方便填写。
-        projects: Object.keys(projects).length ? projects : seed(),
+        projects: Object.keys(projects).length ? projects : { dev: "", pro: "" },
         logs: (j.logs as SlsConfig["logs"]) || {},
       };
+    };
+    try {
+      const raw = fs.readFileSync(path.join(this.slsDir(), "config.json"), "utf8");
+      const j = JSON.parse(raw) as Record<string, unknown>;
+      if (Array.isArray(j.accounts) && j.accounts.length) {
+        return (j.accounts as Record<string, unknown>[]).map((a, i) => one(a, `账号${i + 1}`));
+      }
+      // 旧平铺格式：整个对象就是单账号
+      if (j.endpoint || j.logs) return [one(j, "默认")];
     } catch {
-      return { endpoint: "", accessKeyId: "", accessKeySecret: "", projects: seed(), logs: {} };
+      /* 落到空账号 */
     }
+    return [this.emptySlsAccount("默认")];
   }
 
-  /** 把 UI 配置写回 config.json，权限 600。环境名/Project 都去空白，丢掉环境名为空的行。 */
-  private writeSlsConfig(cfg: SlsConfig): void {
-    const projects: Record<string, string> = {};
-    for (const [env, proj] of Object.entries(cfg.projects || {})) {
-      const name = (env || "").trim();
-      if (name) projects[name] = (proj || "").trim();
-    }
-    const out = {
-      endpoint: cfg.endpoint.trim(),
-      accessKeyId: cfg.accessKeyId.trim(),
-      accessKeySecret: cfg.accessKeySecret.trim(),
-      projects,
-      logs: cfg.logs || {},
-    };
+  /** 写回全部账号为 { accounts:[...] }，权限 600。环境名/Project 去空白。 */
+  private writeSlsAccounts(accounts: SlsConfig[]): void {
+    const clean = (accounts.length ? accounts : [this.emptySlsAccount("默认")]).map((a, i) => {
+      const projects: Record<string, string> = {};
+      for (const [env, proj] of Object.entries(a.projects || {})) {
+        const name = (env || "").trim();
+        if (name) projects[name] = (proj || "").trim();
+      }
+      return {
+        name: (a.name || "").trim() || `账号${i + 1}`,
+        endpoint: (a.endpoint || "").trim(),
+        accessKeyId: (a.accessKeyId || "").trim(),
+        accessKeySecret: (a.accessKeySecret || "").trim(),
+        projects,
+        logs: a.logs || {},
+      };
+    });
     const dir = this.slsDir();
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, "config.json");
-    fs.writeFileSync(file, JSON.stringify(out, null, 2) + "\n", { mode: 0o600 });
-    fs.chmodSync(file, 0o600); // 确保已存在的文件也收紧权限
+    fs.writeFileSync(file, JSON.stringify({ accounts: clean }, null, 2) + "\n", { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
   }
 
   /** 把扩展自带的引擎脚本铺到 ~/sls-tools（同事首次用也能一键就绪）。 */
@@ -983,33 +1002,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** SLS 是否已配置到可用（有 endpoint 且有至少一个项目映射）——决定输入框是否显示开关。 */
   private slsConfigured(): boolean {
-    const c = this.readSlsConfig();
-    return !!(c.endpoint && Object.keys(c.logs || {}).length);
+    return this.readSlsAccounts().some((c) => !!(c.endpoint && Object.keys(c.logs || {}).length));
   }
 
   /** 若 SLS 已配置好，生成一段系统提示，告诉每个会话「有 sls 工具、怎么用、dev=测试环境」。
    *  没配 logs 就返回 ""，不干扰普通会话。 */
   private slsSystemPromptSnippet(): string {
-    const cfg = this.readSlsConfig();
-    const apps = Object.keys(cfg.logs || {});
-    if (!cfg.endpoint || !apps.length) return "";
     const sls = "~/sls-tools/sls";
-    // 环境说明按实际配置动态生成：dev/pro 给出「测试/生产」语义，其余自定义环境
-    // 原样列出让模型按名字理解。默认环境优先取 pro，没有 pro 就取第一个。
-    const envNames = Object.entries(cfg.projects || {}).filter(([, p]) => (p || "").trim()).map(([e]) => e.trim());
-    const defEnv = envNames.includes("pro") ? "pro" : (envNames[0] || "pro");
+    // 只保留配好的账号（有 endpoint 且有 logs 映射）。
+    const ready = this.readSlsAccounts().filter((a) => a.endpoint && Object.keys(a.logs || {}).length);
+    if (!ready.length) return "";
     const hint = (e: string) => (e === "dev" ? "（测试/开发环境）" : e === "pro" ? "（生产/线上环境）" : "");
-    const envLine = envNames.length
-      ? `- 环境 --env 可选值：${envNames.map((e) => `\`${e}\`${hint(e)}`).join("、")}；不传默认 \`${defEnv}\`。用户说“测试环境/开发环境”用 \`dev\`，说“线上/生产/正式”用 \`pro\`。`
-      : "- 环境 --env：`dev` = 测试/开发环境，`pro` = 生产/线上环境（不传默认 pro）。";
-    return [
+    const envLineOf = (a: SlsConfig): string => {
+      const envNames = Object.entries(a.projects || {}).filter(([, p]) => (p || "").trim()).map(([e]) => e.trim());
+      const defEnv = envNames.includes("pro") ? "pro" : (envNames[0] || "pro");
+      return envNames.length
+        ? `环境 --env 可选：${envNames.map((e) => `\`${e}\`${hint(e)}`).join("、")}（默认 \`${defEnv}\`）`
+        : "环境 --env：`dev`=测试、`pro`=生产（默认 pro）";
+    };
+    const head = [
       "## 阿里云 SLS 后端日志查询",
-      `你可以直接查询后端服务的线上日志：运行本机命令 \`${sls}\`（已配置好凭证，可直接用 Bash 调）。`,
-      envLine,
-      `- 业务项目 --app 可选值：${apps.join("、")}。`,
+      `你可以直接查询后端服务的线上日志：运行本机命令 \`${sls}\`（已配置好凭证，可直接用 Bash 调，\`${sls} apps\` 列出全部项目映射）。`,
+    ];
+    let appsBlock: string[];
+    if (ready.length === 1) {
+      const a = ready[0];
+      appsBlock = [
+        `- ${envLineOf(a)}`,
+        `- 业务项目 --app 可选值：${Object.keys(a.logs || {}).join("、")}。`,
+      ];
+    } else {
+      // 多账号：分别列出各账号的 app；--app 名唯一时 CLI 自动路由到对应账号，
+      // 只有同名 app 撞车才需要 --account。
+      appsBlock = ["- **有多个阿里云账号**，按 `--app` 自动路由到对应账号（app 名唯一时无需 `--account`；撞名才加 `--account <账号名>`）："];
+      for (const a of ready) {
+        appsBlock.push(`  · 账号 \`${a.name || "(未命名)"}\`（${envLineOf(a)}）：${Object.keys(a.logs || {}).join("、")}`);
+      }
+    }
+    return [
+      ...head,
+      ...appsBlock,
       "- 日志类型 --kind：`error`=异常/报错日志(默认)，`info`=普通日志，`both`=两者都查。",
       "- 时间 --from：默认最近 1 小时，可用 `30m`/`2h`/`1d` 或绝对时间；条数 `-n`（默认 10）。加 `--json` 得结构化输出。单条日志默认按字段截断到 700 字符（保头保尾），确需完整堆栈时对单条加 `--full -n 1`。",
-      `- 示例：查 ${defEnv} 环境 game-server 最近 1 小时的报错 → \`${sls} -q "*" --env ${defEnv} --app game-server --kind error --from 1h\`；\`${sls} apps\` 列出全部项目映射。`,
       "当用户要求查看/排查某环境某服务的日志、报错、异常、线上问题时，**主动用这个命令去查真实日志**，不要只翻本地代码或说无法获取。查询语句 -q 用 SLS 语法（如 `level: ERROR`、`* and 关键词`）。",
       "**省 token 纪律**（生产日志量极大）：先小样本（`-n 5`）确认方向再放大；能用关键词/traceId 过滤就别 `-q \"*\"` 全量拉；查不到时按 1h→6h→1d 逐步扩时间窗，**不要**同时对多个 app/env 撒网全量扫；定位到目标后才用 `--full -n 1` 取完整堆栈。",
     ].join("\n");
@@ -1039,20 +1073,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     else ctx.pendingPrefill = prompt;
   }
 
-  /** 标题栏「日志配置」按钮：显示侧边栏并弹开配置抽屉，回填当前配置。 */
+  /** 标题栏「日志配置」按钮：打开独立的 SLS 多账号配置面板（照「任务完成推送」模式）。 */
   showSlsConfig(): void {
-    this.view?.show?.(true);
-    this.view?.webview.postMessage({
-      kind: "sls_open",
-      config: this.readSlsConfig(),
-      enginePresent: this.slsEngineReady(),
-    } satisfies ToWebview);
+    this.watchSlsConfig();
+    if (this.slsPanel) {
+      this.slsPanel.reveal();
+      this.slsPanel.webview.postMessage({ kind: "sls_config", accounts: this.readSlsAccounts(), enginePresent: this.slsEngineReady() } satisfies ToWebview);
+      return;
+    }
+    const panel = vscode.window.createWebviewPanel(
+      "claude-chat.sls",
+      "SLS 日志配置",
+      { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+      { enableScripts: true, retainContextWhenHidden: true },
+    );
+    this.slsPanel = panel;
+    panel.webview.html = this.slsHtml();
+    panel.webview.onDidReceiveMessage(async (m: FromWebview) => {
+      try {
+        if (m.type === "webviewError") {
+          this.output.appendLine(`[${new Date().toISOString()}] [webview] SLS 面板脚本错误: ${m.message}`);
+          return;
+        }
+        if (m.type === "slsGenerate") {
+          await this.generateSlsMapping();
+          return;
+        }
+        await this.handleSlsMessage(m, (e) => panel.webview.postMessage(e));
+      } catch (err) {
+        this.output.appendLine(`[sls] 面板消息处理失败(${(m as { type?: string }).type}): ${String(err)}`);
+      }
+    });
+    panel.onDidDispose(() => {
+      if (this.slsPanel === panel) this.slsPanel = undefined;
+    });
   }
 
   /** slsLoad / slsSave / slsTest 的共用处理，`reply` 决定回哪个 webview。 */
   private async handleSlsMessage(m: FromWebview, reply: (e: ToWebview) => void): Promise<boolean> {
     if (m.type === "slsLoad") {
-      reply({ kind: "sls_config", config: this.readSlsConfig(), enginePresent: this.slsEngineReady() });
+      reply({ kind: "sls_config", accounts: this.readSlsAccounts(), enginePresent: this.slsEngineReady() });
       return true;
     }
     if (m.type === "slsTest") {
@@ -1066,9 +1126,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (m.type === "slsSave") {
       try {
-        this.writeSlsConfig(m.config);
+        this.writeSlsAccounts(m.accounts);
         await this.ensureSlsEngine();
-        reply({ kind: "sls_result", action: "save", ok: true, message: `已保存到 ${path.join(this.slsDir(), "config.json")}` });
+        reply({ kind: "sls_result", action: "save", ok: true, message: `已保存 ${m.accounts.length} 个账号到 ${path.join(this.slsDir(), "config.json")}` });
+        this.activeCtx && this.post(this.activeCtx, { kind: "config", permissionMode: "", model: "", effort: "", slsConfigured: this.slsConfigured() } as ToWebview);
       } catch (err) {
         reply({ kind: "sls_result", action: "save", ok: false, message: `保存或初始化失败：${String((err as Error)?.message ?? err)}` });
       }
@@ -1167,6 +1228,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "slsGenerate":
           await this.generateSlsMapping();
+          break;
+        case "openSlsConfig":
+          this.showSlsConfig();
           break;
         case "webviewError":
           this.output.appendLine(`[${new Date().toISOString()}] [webview] 侧边栏脚本错误: ${m.message}`);
@@ -1804,6 +1868,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // 安全闸：还原点记录的 truncateLine 是「发起该轮时的行数」。若它与当前
+    // transcript 严重不符（例如跨天长会话里的陈旧还原点，指向几千行文件的第 8
+    // 行），照它截断会把整段上下文连同官方插件里的记录一起报废。校验：截断点
+    // 处的那条用户消息，文本必须和还原点记录的提问对得上；对不上就中止。
+    if (ctx.sessionId && result.truncateLine > 0 && result.userText) {
+      const nextUser = this.store.firstUserTextAfter(ctx.sessionId, result.truncateLine);
+      const norm = (t: string) => t.replace(/\s+/g, " ").trim().slice(0, 80);
+      if (nextUser !== undefined && norm(nextUser) !== norm(result.userText)) {
+        this.output.appendLine(
+          `[restore] 中止：还原点与 transcript 对不上 truncateLine=${result.truncateLine} ` +
+            `期望提问=${JSON.stringify(norm(result.userText))} 实际=${JSON.stringify(norm(nextUser))}`,
+        );
+        this.post(ctx, {
+          kind: "error",
+          message: "这个还原点与当前对话对不上（可能来自更早的会话状态），已中止还原以免误删上下文。",
+        });
+        return;
+      }
+    }
+
     // 1) Stop the live process AND wait for it to exit — a dying CLI can still
     //    flush transcript lines after our truncation, undoing the rewind.
     const proc = ctx.proc;
@@ -1818,8 +1902,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       remainingTurns = this.store.truncateToLines(ctx.sessionId, result.truncateLine);
     }
 
-    // 3) If nothing remains, this becomes a brand-new conversation.
-    if (remainingTurns === 0) {
+    // 3) 只有真的回到「第一条消息之前」（truncateLine=0，文件里什么都没留）才
+    //    算全新对话。绝不能用 remainingTurns==0 判断——它数的是 isRealUserText
+    //    认可的「真人提问」，而斜杠命令、<local-command-*>/中断标记开头的消息
+    //    都不算数；一旦保留区里恰好没有合格提问（但仍有大量对话内容），旧逻辑
+    //    会把 sessionId 直接丢掉 + 清空还原点，整段上下文当场蒸发且不可恢复。
+    const rewoundToStart = result.truncateLine <= 0;
+    this.output.appendLine(
+      `[restore] session=${(ctx.sessionId ?? "-").slice(0, 8)} truncateLine=${result.truncateLine} ` +
+        `剩余真人提问=${remainingTurns} 文件剩余行=${ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0} ` +
+        `还原文件=${result.restoredFiles} ${rewoundToStart ? "→ 回到开头，转为新对话" : "→ 保留会话并 --resume"}`,
+    );
+    if (rewoundToStart) {
       ctx.sessionId = undefined;
       ctx.checkpoints.clear();
       this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
@@ -2463,6 +2557,267 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     vscode.postMessage({ type: "notifyTest", webhook: $("webhook").value });
   });
   vscode.postMessage({ type: "notifyLoad" });
+</script>
+</body>
+</html>`;
+  }
+
+
+  /** 独立的 SLS 多账号配置面板：卡片列表 → 详情编辑两级结构。 */
+  private slsHtml(): string {
+    const nonce = randomUUID().replace(/-/g, "");
+    return /* html */ `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'" />
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 0; display: flex; justify-content: center; }
+  .wrap { width: 100%; max-width: 620px; padding: 22px 20px 48px; box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; }
+  h2 { margin: 0; font-size: 16px; }
+  h3 { margin: 0; font-size: 14px; }
+  .hint { font-size: 12px; opacity: .75; line-height: 1.7; margin: -4px 0 2px; }
+  .hidden { display: none !important; }
+  /* 两个视图都是纵向堆叠、统一间距 */
+  #view-list, #view-detail { display: flex; flex-direction: column; gap: 14px; }
+  /* ---- 列表视图 ---- */
+  .sec-h { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; }
+  .sec-h .t { font-size: 12px; font-weight: 600; opacity: .85; }
+  .sec-h .c { font-size: 11px; opacity: .55; }
+  .cards { display: flex; flex-direction: column; gap: 10px; }
+  .card { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.28)); border-radius: 10px; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.06)); cursor: pointer; transition: border-color .12s, background .12s, transform .12s; }
+  .card:hover { border-color: var(--vscode-focusBorder, #3794ff); background: var(--vscode-list-hoverBackground, rgba(127,127,127,.12)); }
+  .card .ic { flex: 0 0 auto; width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; background: rgba(127,127,127,.12); color: var(--vscode-foreground); }
+  .card .ic svg { width: 20px; height: 20px; opacity: .85; }
+  .card .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+  .card .nm { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .meta { font-size: 11.5px; opacity: .65; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .right { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+  .card .pill { font-size: 10.5px; padding: 3px 9px; border-radius: 9px; white-space: nowrap; }
+  .card .pill.ok { color: #3fb950; background: rgba(63,185,80,.14); }
+  .card .pill.no { color: var(--vscode-descriptionForeground, #999); background: rgba(127,127,127,.14); }
+  .card .del { width: 26px; height: 26px; padding: 0; border: none; border-radius: 6px; background: none; color: var(--vscode-descriptionForeground, #999); cursor: pointer; font-size: 16px; line-height: 1; opacity: .6; }
+  .card:hover .del { opacity: 1; }
+  .card .del:hover { color: var(--vscode-errorForeground, #e5534b); background: rgba(127,127,127,.15); }
+  .card .chev { color: var(--vscode-descriptionForeground, #999); opacity: .5; font-size: 14px; }
+  .add-card { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; box-sizing: border-box; padding: 14px; border: 1px dashed var(--vscode-panel-border, rgba(127,127,127,.45)); border-radius: 10px; background: none; color: var(--vscode-foreground); cursor: pointer; font: inherit; font-size: 12.5px; opacity: .85; }
+  .add-card:hover { opacity: 1; border-color: var(--vscode-focusBorder, #3794ff); background: var(--vscode-list-hoverBackground, rgba(127,127,127,.08)); }
+  /* ---- 详情视图 ---- */
+  .detail-head { display: flex; align-items: center; gap: 10px; }
+  .back { flex: 0 0 auto; font: inherit; font-size: 12.5px; cursor: pointer; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 6px; background: none; color: var(--vscode-foreground); padding: 5px 11px; }
+  .back:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.15)); }
+  label.f, .f { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+  label.f > span, .f > span { font-weight: 600; opacity: .85; }
+  input[type=text], input[type=password], textarea { width: 100%; box-sizing: border-box; background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, rgba(127,127,127,.35)); border-radius: 6px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+  input:focus, textarea:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
+  textarea { min-height: 120px; resize: vertical; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); line-height: 1.5; }
+  textarea.bad { border-color: var(--vscode-errorForeground, #e5534b); }
+  .pw { display: flex; gap: 6px; }
+  .pw input { flex: 1; }
+  .eye { flex: 0 0 auto; width: 36px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--vscode-input-border, rgba(127,127,127,.35)); border-radius: 6px; background: none; color: var(--vscode-descriptionForeground, #999); cursor: pointer; }
+  .eye:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.15)); }
+  .lsh { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .lsh > span:first-child { font-weight: 600; opacity: .85; font-size: 12px; }
+  .lsh .btns { display: flex; gap: 6px; }
+  .mini { font: inherit; font-size: 12px; cursor: pointer; border-radius: 6px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); background: none; color: var(--vscode-foreground); padding: 5px 10px; }
+  .mini:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.15)); }
+  .envs { display: flex; flex-direction: column; gap: 6px; }
+  .env-row { display: flex; gap: 6px; align-items: center; }
+  .env-row input { flex: 1; }
+  .env-row .del { flex: 0 0 auto; width: 28px; padding: 0; height: 30px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 6px; background: none; color: var(--vscode-errorForeground, #e5534b); cursor: pointer; }
+  .env-add { align-self: flex-start; font: inherit; font-size: 12px; cursor: pointer; border: 1px dashed var(--vscode-panel-border, rgba(127,127,127,.4)); border-radius: 6px; background: none; color: var(--vscode-foreground); padding: 5px 10px; }
+  .sub { font-size: 11px; opacity: .65; line-height: 1.7; }
+  .sub code { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.14)); padding: 1px 5px; border-radius: 4px; }
+  .status { font-size: 12px; line-height: 1.6; padding: 7px 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.12)); }
+  .status.hidden { display: none; }
+  .status.ok { color: #3fb950; }
+  .status.err { color: var(--vscode-errorForeground, #e5534b); }
+  .status.wait { opacity: .8; }
+  .imp { font-size: 11px; opacity: .7; line-height: 1.6; }
+  .imp:empty { display: none; }
+  .acts { display: flex; gap: 10px; margin-top: 2px; }
+  button.btn { flex: 1; padding: 8px 0; font: inherit; font-size: 12.5px; cursor: pointer; border-radius: 6px; border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); background: none; color: var(--vscode-foreground); }
+  button.btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
+  button.btn.danger { color: var(--vscode-errorForeground, #e5534b); border-color: rgba(229,83,75,.4); flex: 0 0 auto; padding: 8px 14px; }
+  button.btn:hover { filter: brightness(1.1); }
+  button.btn:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>SLS 日志配置</h2>
+
+  <div id="view-list">
+    <p class="hint">配置后 Claude 可直接查询阿里云 SLS 后端日志。<b>不同阿里云账号各建一个配置</b>，查询时按业务项目名自动路由到对应账号。建议用只读子账号 AccessKey，仅存本机（权限 600）。</p>
+    <div class="sec-h"><span class="t">账号</span><span id="cnt" class="c"></span></div>
+    <div id="cards" class="cards"></div>
+    <button id="add" class="add-card">＋ 新增账号配置</button>
+  </div>
+
+  <div id="view-detail" class="hidden">
+    <div class="detail-head">
+      <button id="back" class="back">← 返回</button>
+      <h3 id="detail-title">编辑账号</h3>
+    </div>
+    <label class="f"><span>账号名</span><input id="acct-name" type="text" placeholder="如 gameserver（用于区分与自动路由）" spellcheck="false" /></label>
+    <label class="f"><span>Endpoint（地域）</span><input id="endpoint" type="text" placeholder="cn-hangzhou.log.aliyuncs.com" spellcheck="false" /></label>
+    <label class="f"><span>AccessKey ID</span><input id="ak-id" type="text" placeholder="LTAI…" spellcheck="false" autocomplete="off" /></label>
+    <div class="f"><span>AccessKey Secret</span>
+      <div class="pw"><input id="ak-secret" type="password" placeholder="仅存本机" spellcheck="false" autocomplete="off" /><button id="ak-eye" class="eye" type="button" title="显示/隐藏"></button></div>
+    </div>
+    <div class="f">
+      <div class="lsh"><span>环境 → SLS Project</span></div>
+      <div id="envs" class="envs"></div>
+      <div class="sub"><code>dev</code>=测试/开发、<code>pro</code>=生产/线上；也可自定义环境名。留空的行保存时自动忽略。</div>
+    </div>
+    <div class="f">
+      <div class="lsh"><span>项目日志映射（JSON）</span>
+        <div class="btns"><button id="gen" class="mini" title="让 Claude 扫描工作区 Spring Boot 配置自动生成，需先填好连接信息并保存">AI 生成配置</button>
+          <button id="tpl" class="mini" title="测试连接后可根据实际 logstore 生成模板">生成模板</button></div></div>
+      <textarea id="logs" spellcheck="false" placeholder='{&#10;  "order": { "info": "order-info", "error": "order-error" },&#10;  "user":  { "info": "user-info",  "error": "user-error" }&#10;}'></textarea>
+      <div class="sub">每个业务项目 → info / 异常两个 logstore，各环境共用此映射。查询示例：<code>sls -q "*" --env pro --app order</code>（默认查 error，加 <code>--kind info</code> 查 info）。</div>
+    </div>
+    <div id="status" class="status hidden"></div>
+    <div id="imp" class="imp"></div>
+    <div class="acts">
+      <button id="test" class="btn">测试连接</button>
+      <button id="save" class="btn primary">保存</button>
+      <button id="del-detail" class="btn danger">删除</button>
+    </div>
+  </div>
+</div>
+<script nonce="${nonce}">
+  const vscode = acquireVsCodeApi();
+  window.addEventListener("error", (e) => { try { vscode.postMessage({ type: "webviewError", message: String(e.message || e) }); } catch {} });
+  const $ = (id) => document.getElementById(id);
+  const EYE = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;display:block"><path d="M1.8 8s2.3-4.2 6.2-4.2S14.2 8 14.2 8s-2.3 4.2-6.2 4.2S1.8 8 1.8 8z"/><circle cx="8" cy="8" r="2"/></svg>';
+  const EYE_OFF = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;display:block"><path d="M1.8 8s2.3-4.2 6.2-4.2S14.2 8 14.2 8s-2.3 4.2-6.2 4.2S1.8 8 1.8 8z"/><circle cx="8" cy="8" r="2"/><path d="M2.5 2.5l11 11"/></svg>';
+  let accounts = [], editing = -1, lastStores = [];
+
+  function seed() { return { name: "", endpoint: "", accessKeyId: "", accessKeySecret: "", projects: { dev: "", pro: "" }, logs: {} }; }
+  function configured(a) { return !!(a.endpoint && a.logs && Object.keys(a.logs).length); }
+
+  // ---- 视图切换 ----
+  function showList() { editing = -1; $("view-detail").classList.add("hidden"); $("view-list").classList.remove("hidden"); renderCards(); }
+  function showDetail(i) { editing = i; fillForm(accounts[i]); $("detail-title").textContent = accounts[i].name ? ("编辑 · " + accounts[i].name) : "新账号"; $("view-list").classList.add("hidden"); $("view-detail").classList.remove("hidden"); $("del-detail").classList.toggle("hidden", accounts.length <= 1); }
+
+  // ---- 列表卡片 ----
+  function renderCards() {
+    const box = $("cards"); box.innerHTML = "";
+    accounts.forEach((a, i) => {
+      const card = document.createElement("div"); card.className = "card";
+      const ic = document.createElement("div"); ic.className = "ic";
+      ic.innerHTML = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="8" cy="4" rx="5" ry="2"/><path d="M3 4v8c0 1.1 2.24 2 5 2s5-.9 5-2V4"/><path d="M3 8c0 1.1 2.24 2 5 2s5-.9 5-2"/></svg>';
+      const body = document.createElement("div"); body.className = "body";
+      const nm = document.createElement("div"); nm.className = "nm"; nm.textContent = a.name || ("账号" + (i + 1));
+      const meta = document.createElement("div"); meta.className = "meta";
+      const napp = a.logs ? Object.keys(a.logs).length : 0;
+      meta.textContent = a.endpoint ? (a.endpoint + " · " + napp + " 个项目") : "未配置";
+      body.append(nm, meta);
+      const pill = document.createElement("span"); const ok = configured(a);
+      pill.className = "pill " + (ok ? "ok" : "no"); pill.textContent = ok ? "已配置" : "未完成";
+      const del = document.createElement("button"); del.className = "del"; del.title = "删除此账号"; del.textContent = "×";
+      del.addEventListener("click", (e) => { e.stopPropagation(); if (accounts.length <= 1) { accounts = [seed()]; } else { accounts.splice(i, 1); } persist(); renderCards(); });
+      const chev = document.createElement("span"); chev.className = "chev"; chev.textContent = "›";
+      const right = document.createElement("div"); right.className = "right"; right.append(pill, del, chev);
+      card.append(ic, body, right);
+      card.addEventListener("click", () => showDetail(i));
+      box.appendChild(card);
+    });
+    $("cnt").textContent = accounts.length + " 个";
+  }
+
+  // ---- 环境行 ----
+  function envRow(env, project) {
+    const row = document.createElement("div"); row.className = "env-row";
+    const a = document.createElement("input"); a.type = "text"; a.className = "env"; a.placeholder = "环境名"; a.spellcheck = false; a.value = env || "";
+    const b = document.createElement("input"); b.type = "text"; b.className = "proj"; b.placeholder = "SLS Project 名"; b.spellcheck = false; b.value = project || "";
+    const d = document.createElement("button"); d.type = "button"; d.className = "del"; d.title = "删除此环境"; d.textContent = "×";
+    d.addEventListener("click", () => row.remove());
+    row.append(a, b, d); return row;
+  }
+  function renderEnvs(projects) {
+    const box = $("envs"); box.innerHTML = "";
+    const entries = Object.entries(projects || {});
+    (entries.length ? entries : [["dev", ""], ["pro", ""]]).forEach(([e, p]) => box.appendChild(envRow(e, p)));
+    const add = document.createElement("button"); add.type = "button"; add.className = "env-add"; add.textContent = "+ 新增环境";
+    add.addEventListener("click", () => { const r = envRow("", ""); box.insertBefore(r, add); r.querySelector(".env").focus(); });
+    box.appendChild(add);
+  }
+  function collectEnvs() {
+    const out = {};
+    for (const row of $("envs").querySelectorAll(".env-row")) { const e = row.querySelector(".env").value.trim(); if (e) out[e] = row.querySelector(".proj").value.trim(); }
+    return out;
+  }
+
+  // ---- 表单 <-> 账号 ----
+  function fillForm(a) {
+    a = a || seed();
+    $("acct-name").value = a.name || "";
+    $("endpoint").value = a.endpoint || "";
+    $("ak-id").value = a.accessKeyId || "";
+    $("ak-secret").value = a.accessKeySecret || ""; $("ak-secret").type = "password"; $("ak-eye").innerHTML = EYE;
+    renderEnvs(a.projects || {});
+    const logs = a.logs || {};
+    $("logs").value = Object.keys(logs).length ? JSON.stringify(logs, null, 2) : "";
+    $("logs").classList.remove("bad");
+    status(""); showStores([]);
+  }
+  function parseLogs() {
+    const raw = $("logs").value.trim();
+    if (!raw) return { ok: true, logs: {} };
+    try { const o = JSON.parse(raw); if (typeof o !== "object" || Array.isArray(o)) return { ok: false, error: "最外层必须是对象 { 项目: {...} }" }; return { ok: true, logs: o }; }
+    catch (e) { return { ok: false, error: "JSON 格式错误：" + (e && e.message ? e.message : e) }; }
+  }
+  function collectForm() {
+    const r = parseLogs();
+    return { name: $("acct-name").value.trim(), endpoint: $("endpoint").value.trim(), accessKeyId: $("ak-id").value.trim(),
+      accessKeySecret: $("ak-secret").value.trim(), projects: collectEnvs(), logs: r.ok ? r.logs : (accounts[editing] && accounts[editing].logs) || {} };
+  }
+  function saveEditingIntoState() { if (editing >= 0) accounts[editing] = collectForm(); }
+  function persist() { vscode.postMessage({ type: "slsSave", accounts }); }
+
+  function loadAccounts(list) {
+    accounts = (list && list.length ? list : [seed()]).map((a) => Object.assign(seed(), a));
+    if (editing >= 0 && editing < accounts.length) { fillForm(accounts[editing]); } else { showList(); }
+  }
+
+  // ---- 事件 ----
+  $("add").addEventListener("click", () => { accounts.push(seed()); showDetail(accounts.length - 1); $("acct-name").focus(); });
+  $("back").addEventListener("click", () => { saveEditingIntoState(); showList(); });
+  $("del-detail").addEventListener("click", () => { if (accounts.length <= 1) { accounts = [seed()]; } else { accounts.splice(editing, 1); } persist(); showList(); });
+  $("acct-name").addEventListener("input", () => { $("detail-title").textContent = $("acct-name").value ? ("编辑 · " + $("acct-name").value) : "新账号"; });
+  $("ak-eye").addEventListener("click", () => { const el = $("ak-secret"); const show = el.type === "password"; el.type = show ? "text" : "password"; $("ak-eye").innerHTML = show ? EYE_OFF : EYE; });
+  $("gen").addEventListener("click", () => { vscode.postMessage({ type: "slsGenerate" }); status("已在聊天里预填生成指令，回车即可让 Claude 扫描工作区并写入映射；写完这里会自动刷新。", "wait"); });
+  $("tpl").addEventListener("click", () => {
+    if (!lastStores.length) { status("请先“测试连接”，拉到实际 logstore 后再生成模板", "wait"); return; }
+    const cur = parseLogs(); const base = cur.ok ? cur.logs : {};
+    lastStores.forEach((sname) => {
+      const low = sname.toLowerCase(); let kind = /error|err|exception|异常|warn/.test(low) ? "error" : /info|stdout|std/.test(low) ? "info" : null;
+      let app = sname.replace(/[-_](info|error|err|warn|stdout|std)$/i, "");
+      if (!base[app]) base[app] = {}; if (kind) base[app][kind] = sname; else { base[app].info = base[app].info || sname; base[app].error = base[app].error || sname; }
+    });
+    $("logs").value = JSON.stringify(base, null, 2); $("logs").classList.remove("bad");
+    status("已按 logstore 名生成映射模板，请核对 info/error 是否对应正确", "ok");
+  });
+  $("test").addEventListener("click", () => { setBusy(true); status("正在测试连接…（首次会自动安装查询引擎，稍等十几秒）", "wait"); vscode.postMessage({ type: "slsTest", config: collectForm() }); });
+  $("save").addEventListener("click", () => {
+    const r = parseLogs();
+    if (!r.ok) { $("logs").classList.add("bad"); status(r.error, "err"); return; }
+    $("logs").classList.remove("bad"); saveEditingIntoState(); setBusy(true); status("正在保存…", "wait"); persist();
+  });
+
+  function status(text, kind) { const el = $("status"); el.textContent = text || ""; el.className = "status" + (text ? "" : " hidden") + (kind ? " " + kind : ""); }
+  function setBusy(b) { $("test").disabled = b; $("save").disabled = b; }
+  function showStores(stores) { $("imp").textContent = (stores && stores.length) ? ("共 " + stores.length + " 个 logstore：" + stores.join("、")) : ""; }
+
+  window.addEventListener("message", (ev) => {
+    const m = ev.data; if (!m) return;
+    if (m.kind === "sls_config" || m.kind === "sls_open") { loadAccounts(m.accounts); }
+    else if (m.kind === "sls_result") { setBusy(false); status(m.message, m.ok ? "ok" : "err"); lastStores = (m.ok && m.action === "test" && m.stores) ? m.stores : []; showStores(lastStores); if (m.ok && m.action === "save" && editing >= 0) showList(); }
+  });
+  vscode.postMessage({ type: "slsLoad" });
 </script>
 </body>
 </html>`;
@@ -4361,34 +4716,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <button id="new" class="new">${ICONS.add}<span>新建会话</span></button>
   <div id="list" class="list"><div class="empty">暂无会话</div></div>
 
-  <div id="sls-sec" class="sls-sec">
-    <button id="sls-toggle" class="sls-toggle" title="配置阿里云 SLS 日志，让 Claude 直接查后端日志"><span class="sls-caret">▸</span><span>SLS 日志配置</span></button>
-    <div id="sls-form" class="sls-form hidden">
-      <p class="sls-hint">配置后 Claude 可直接查询阿里云 SLS 后端日志，不用再手动复制粘贴。建议用只读子账号 AccessKey，仅存本机（权限 600）。</p>
-      <label class="sls-f"><span>Endpoint（地域）</span><input id="sls-endpoint" type="text" placeholder="cn-hangzhou.log.aliyuncs.com" spellcheck="false" /></label>
-      <label class="sls-f"><span>AccessKey ID</span><input id="sls-ak-id" type="text" placeholder="LTAI…" spellcheck="false" autocomplete="off" /></label>
-      <div class="sls-f"><span>AccessKey Secret</span>
-        <div class="sls-pw"><input id="sls-ak-secret" type="password" placeholder="仅存本机" spellcheck="false" autocomplete="off" /><button id="sls-ak-eye" class="sls-eye" type="button" title="显示/隐藏"></button></div></div>
-      <div class="sls-f">
-        <div class="sls-lsh"><span>环境 SLS Project</span>
-          <span><button id="sls-env-edit" class="sls-mini" type="button" title="编辑环境（增删 / 改名）">编辑环境</button></span></div>
-        <div id="sls-envs" class="sls-envs view"></div>
-        <div class="sls-sub"><code>dev</code>=测试/开发、<code>pro</code>=生产/线上；也可自定义环境名。点“编辑环境”增删，改完点“保存”一起提交，留空的行自动忽略。</div>
-      </div>
-      <div class="sls-f">
-        <div class="sls-lsh"><span>项目日志映射（JSON）</span>
-          <span><button id="sls-tpl" class="sls-mini" title="测试连接后可根据实际 logstore 生成模板">生成模板</button>
-          <button id="sls-gen" class="sls-mini" title="让 Claude 扫描工作区 Spring Boot 配置自动生成，需先填好连接信息并保存">AI 生成配置</button></span></div>
-        <textarea id="sls-logs" class="sls-json" spellcheck="false" placeholder='{&#10;  "order": { "info": "order-info", "error": "order-error" },&#10;  "user":  { "info": "user-info",  "error": "user-error" }&#10;}'></textarea>
-        <div class="sls-sub">每个业务项目 → info / 异常两个 logstore，各环境共用此映射。查询示例：<code>sls -q "*" --env pro --app order</code>（默认查 error，加 <code>--kind info</code> 查 info）。</div>
-      </div>
-      <div id="sls-status" class="sls-status hidden"></div>
-      <div class="sls-acts">
-        <button id="sls-test" class="sls-btn">测试连接</button>
-        <button id="sls-save" class="sls-btn primary">保存</button>
-      </div>
-    </div>
-  </div>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     // 侧边栏脚本一旦抛错整个面板就会"点了没反应"且无迹可循——错误上报给 host 记日志。
@@ -4505,193 +4832,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       } else if (m && m.kind === "update_available") {
         if (m.version) { $("upd-ver").textContent = "v" + m.version; $("upd-banner").classList.remove("hidden"); }
         else $("upd-banner").classList.add("hidden");
-      } else if (m && m.kind === "sls_open") {
-        slsFill(m.config); slsExpand();
-      } else if (m && m.kind === "sls_config") {
-        slsFill(m.config);
-      } else if (m && m.kind === "sls_result") {
-        slsSetBusy(false);
-        slsStatus(m.message, m.ok ? "ok" : "err");
-        slsLastStores = (m.ok && m.action === "test" && m.stores) ? m.stores : [];
-        slsShowStores(slsLastStores);
       }
-    });
-
-    // ---- SLS 日志配置 ----
-    let slsBusy = false, slsLastStores = [], slsEnvEditing = false;
-    // 已提交的环境数据（数组保留顺序，允许编辑时出现空行）。查看态从这里渲染。
-    let slsEnvEntries = [];
-    // 造一行 [环境名][Project 名][删除]；readonly 由当前是否编辑态决定。
-    function slsMakeEnvRow(env, project) {
-      const row = document.createElement("div");
-      row.className = "sls-env-row";
-      const envIn = document.createElement("input");
-      envIn.type = "text"; envIn.className = "env"; envIn.placeholder = "环境名"; envIn.spellcheck = false;
-      envIn.value = env || ""; envIn.readOnly = !slsEnvEditing;
-      const projIn = document.createElement("input");
-      projIn.type = "text"; projIn.className = "proj"; projIn.placeholder = "SLS Project 名"; projIn.spellcheck = false;
-      projIn.value = project || ""; projIn.readOnly = !slsEnvEditing;
-      const del = document.createElement("button");
-      del.type = "button"; del.className = "del"; del.title = "删除此环境"; del.textContent = "×";
-      del.addEventListener("click", () => row.remove());
-      row.append(envIn, projIn, del);
-      return row;
-    }
-    // 按当前 slsEnvEditing 重绘环境区：查看态只读弱化、无新增；编辑态可改可删 + 末尾「新增环境」。
-    function slsRenderEnvs() {
-      const box = $("sls-envs");
-      box.innerHTML = "";
-      box.classList.toggle("view", !slsEnvEditing);
-      const entries = slsEnvEntries.length ? slsEnvEntries : [{ env: "dev", project: "" }, { env: "pro", project: "" }];
-      for (const e of entries) box.appendChild(slsMakeEnvRow(e.env, e.project));
-      if (slsEnvEditing) {
-        const add = document.createElement("button");
-        add.type = "button"; add.className = "sls-env-add-btn"; add.textContent = "+ 新增环境";
-        add.addEventListener("click", () => {
-          const row = slsMakeEnvRow("", "");
-          box.insertBefore(row, add);
-          row.querySelector(".env").focus();
-        });
-        box.appendChild(add);
-      }
-      const btn = $("sls-env-edit");
-      btn.textContent = slsEnvEditing ? "保存" : "编辑环境";
-      btn.title = slsEnvEditing ? "保存环境改动" : "编辑环境（增删 / 改名）";
-      btn.classList.toggle("primary", slsEnvEditing);
-    }
-    function slsFillEnvs(projects) {
-      slsEnvEntries = Object.entries(projects || {}).map(([env, project]) => ({ env, project }));
-      slsEnvEditing = false; // 外部刷新/回填一律回到查看态
-      slsRenderEnvs();
-    }
-    function slsFill(cfg) {
-      cfg = cfg || {};
-      $("sls-endpoint").value = cfg.endpoint || "";
-      $("sls-ak-id").value = cfg.accessKeyId || "";
-      $("sls-ak-secret").value = cfg.accessKeySecret || "";
-      $("sls-ak-secret").type = "password"; $("sls-ak-eye").innerHTML = EYE; // 回填后回到隐藏态
-      slsFillEnvs(cfg.projects || {});
-      const logs = cfg.logs || {};
-      $("sls-logs").value = Object.keys(logs).length ? JSON.stringify(logs, null, 2) : "";
-      $("sls-logs").classList.remove("bad");
-      slsStatus(""); slsShowStores([]);
-    }
-    // 解析 JSON 文本框 -> {ok, logs, error}
-    function slsParseLogs() {
-      const raw = $("sls-logs").value.trim();
-      if (!raw) return { ok: true, logs: {} };
-      try {
-        const obj = JSON.parse(raw);
-        if (typeof obj !== "object" || Array.isArray(obj)) return { ok: false, error: "最外层必须是对象 { 项目: {...} }" };
-        return { ok: true, logs: obj };
-      } catch (e) { return { ok: false, error: "JSON 格式错误：" + (e && e.message ? e.message : e) }; }
-    }
-    // 从环境行收集 { 环境名: project }；环境名为空的行丢弃，重名后者覆盖前者。
-    function slsCollectEnvs() {
-      const projects = {};
-      for (const row of $("sls-envs").querySelectorAll(".sls-env-row")) {
-        const env = row.querySelector(".env").value.trim();
-        if (env) projects[env] = row.querySelector(".proj").value.trim();
-      }
-      return projects;
-    }
-    function slsCollect(logs) {
-      return {
-        endpoint: $("sls-endpoint").value.trim(),
-        accessKeyId: $("sls-ak-id").value.trim(),
-        accessKeySecret: $("sls-ak-secret").value.trim(),
-        projects: slsCollectEnvs(),
-        logs: logs || {},
-      };
-    }
-    function slsStatus(text, kind) {
-      const el = $("sls-status");
-      el.textContent = text || "";
-      el.className = "sls-status" + (text ? "" : " hidden") + (kind ? " " + kind : "");
-    }
-    function slsSetBusy(b) { slsBusy = b; $("sls-test").disabled = b; $("sls-save").disabled = b; }
-    function slsExpand() { $("sls-sec").classList.add("open"); $("sls-form").classList.remove("hidden"); $("sls-sec").scrollIntoView({ block: "nearest" }); }
-    // 测试成功后把拉到的 logstore 名列出来，供参考/生成模板
-    function slsShowStores(stores) {
-      const old = $("sls-imp"); if (old) old.remove();
-      if (!stores || !stores.length) return;
-      const wrap = document.createElement("div"); wrap.id = "sls-imp"; wrap.className = "sls-imp";
-      const span = document.createElement("span"); span.textContent = "共 " + stores.length + " 个 logstore：" + stores.join("、");
-      wrap.append(span); $("sls-status").after(wrap);
-    }
-    // 根据 logstore 名启发式生成 项目->{info,error} 映射模板
-    function slsGuessTemplate(stores) {
-      const tpl = {};
-      (stores || []).forEach((s) => {
-        const low = s.toLowerCase();
-        let kind = null;
-        if (/error|err|exception|异常/.test(low)) kind = "error";
-        else if (/info|stdout|std/.test(low)) kind = "info";
-        let app = s;
-        if (kind) app = s.replace(/[-_.]?(error|err|exception|info|stdout|std|异常)$/i, "").replace(/[-_.]+$/, "") || s;
-        if (!tpl[app]) tpl[app] = {};
-        if (kind) tpl[app][kind] = s; else if (!tpl[app].info) tpl[app].info = s;
-      });
-      return tpl;
-    }
-    $("sls-toggle").addEventListener("click", () => {
-      const open = $("sls-sec").classList.toggle("open");
-      $("sls-form").classList.toggle("hidden", !open);
-    });
-    $("sls-ak-eye").innerHTML = EYE;
-    $("sls-ak-eye").addEventListener("click", () => {
-      const inp = $("sls-ak-secret"), show = inp.type === "password";
-      inp.type = show ? "text" : "password";
-      $("sls-ak-eye").innerHTML = show ? EYE_OFF : EYE;
-    });
-    // 头部按钮：查看态 → 进入编辑；编辑态 → 校验并一起保存整份配置、回到查看态。
-    $("sls-env-edit").addEventListener("click", () => {
-      if (slsBusy) return;
-      if (!slsEnvEditing) { slsEnvEditing = true; slsRenderEnvs(); return; }
-      const r = slsParseLogs();
-      if (!r.ok) { $("sls-logs").classList.add("bad"); slsStatus(r.error, "err"); return; }
-      $("sls-logs").classList.remove("bad");
-      // 收集编辑态的环境行为已提交数据（丢弃环境名为空的行），再退出编辑态。
-      slsEnvEntries = [];
-      for (const row of $("sls-envs").querySelectorAll(".sls-env-row")) {
-        const env = row.querySelector(".env").value.trim();
-        if (env) slsEnvEntries.push({ env, project: row.querySelector(".proj").value.trim() });
-      }
-      slsEnvEditing = false;
-      slsRenderEnvs();
-      slsSetBusy(true); slsStatus("正在保存…", "wait");
-      vscode.postMessage({ type: "slsSave", config: slsCollect(r.logs) });
-    });
-    $("sls-gen").addEventListener("click", () => {
-      vscode.postMessage({ type: "slsGenerate" });
-      slsStatus("已在聊天里预填生成指令，回车即可让 Claude 扫描工作区并写入映射；写完这里会自动刷新。", "wait");
-    });
-    $("sls-tpl").addEventListener("click", () => {
-      if (!slsLastStores.length) { slsStatus("请先“测试连接”，拉到实际 logstore 后再生成模板", "wait"); return; }
-      const cur = slsParseLogs();
-      const base = cur.ok ? cur.logs : {};
-      const tpl = slsGuessTemplate(slsLastStores);
-      for (const app in tpl) base[app] = Object.assign({}, tpl[app], base[app]);
-      $("sls-logs").value = JSON.stringify(base, null, 2);
-      $("sls-logs").classList.remove("bad");
-      slsStatus("已按 logstore 名生成映射模板，请核对 info/error 是否对应正确", "ok");
-    });
-    $("sls-test").addEventListener("click", () => {
-      if (slsBusy) return;
-      slsSetBusy(true); slsStatus("正在测试连接…（首次会自动安装查询引擎，稍等十几秒）", "wait");
-      vscode.postMessage({ type: "slsTest", config: slsCollect({}) });
-    });
-    $("sls-save").addEventListener("click", () => {
-      if (slsBusy) return;
-      const r = slsParseLogs();
-      if (!r.ok) { $("sls-logs").classList.add("bad"); slsStatus(r.error, "err"); return; }
-      $("sls-logs").classList.remove("bad");
-      slsSetBusy(true); slsStatus("正在保存…", "wait");
-      vscode.postMessage({ type: "slsSave", config: slsCollect(r.logs) });
     });
 
     vscode.postMessage({ type: "listSessions" });
-    vscode.postMessage({ type: "slsLoad" });
   </script>
 </body>
 </html>`;

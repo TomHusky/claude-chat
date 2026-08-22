@@ -1920,6 +1920,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     } else {
       const items = this.store.load(ctx.sessionId!);
       this.post(ctx, { kind: "load_history", items, sessionId: ctx.sessionId, checkpoints: ctx.checkpoints.list() });
+      // load_history 会清空上下文环（等下一轮用量再刷新），但还原后进程已被杀、
+      // 也不走"打开会话"，环会一直空到用户发下一条消息才回来。截断后的用量可以
+      // 直接从 transcript 估出来——立刻补一次，环随即显示回退后的真实占用。
+      this.postSessionContext(ctx, ctx.sessionId!);
     }
 
     const skippedNote = result.skipped.length
@@ -4643,66 +4647,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .del:hover { opacity: 1; color: var(--vscode-errorForeground, #e55); }
   .row .edit svg, .row .del svg { width: 14px; height: 14px; }
   body.multi .row .edit, body.multi .row .del { display: none; }
-  /* ---- SLS 日志配置（会话列表下方）---- */
-  .sls-sec { border-top: 1px solid var(--vscode-panel-border, rgba(127,127,127,.25)); flex: 0 0 auto; display: flex; flex-direction: column; min-height: 0; background: var(--vscode-sideBar-background); }
-  .sls-toggle { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 10px 12px; font-size: 12px; font-weight: 600; opacity: .85; }
-  .sls-toggle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.14)); opacity: 1; }
-  .sls-caret { display: inline-block; transition: transform .15s; font-size: 10px; opacity: .7; }
-  .sls-sec.open .sls-caret { transform: rotate(90deg); }
-  .sls-form { padding: 2px 12px 16px; display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow-y: auto; }
-  .sls-form.hidden { display: none; }
-  .sls-f { display: flex; flex-direction: column; gap: 4px; }
-  .sls-f > span { font-size: 11px; font-weight: 600; opacity: .8; }
-  .sls-form input { width: 100%; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 6px 8px; font: inherit; font-size: 12px; }
-  .sls-form input:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
-  .sls-pw { position: relative; }
-  .sls-pw input { padding-right: 30px; }
-  .sls-eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 0; background: none; border: none; cursor: pointer; color: var(--vscode-descriptionForeground); opacity: .75; border-radius: 4px; }
-  .sls-eye:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
-  .sls-eye svg { width: 15px; height: 15px; }
-  .sls-lsh { display: flex; align-items: center; justify-content: space-between; }
-  .sls-lsh > span { font-size: 11px; font-weight: 600; opacity: .8; }
-  .sls-mini { font-size: 11px; cursor: pointer; background: none; color: var(--vscode-button-background); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.35)); border-radius: 5px; padding: 2px 8px; }
-  .sls-mini:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.16)); }
-  /* 用系统内置滚动条；resize:none 去掉右下角那个丑陋的缩放手柄方块。 */
-  .sls-json { width: 100%; min-height: 120px; resize: none; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; padding: 7px 8px; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); font-size: 11.5px; line-height: 1.5; }
-  .sls-json:focus { outline: none; border-color: var(--vscode-focusBorder, #3794ff); }
-  .sls-json.bad { border-color: var(--vscode-errorForeground, #e55); }
-  /* 可增删的环境行：[环境名][Project 名][删除] */
-  .sls-envs { display: flex; flex-direction: column; gap: 6px; }
-  .sls-env-row { display: flex; align-items: center; gap: 6px; }
-  .sls-env-row .env { flex: 0 0 33%; min-width: 0; }
-  .sls-env-row .proj { flex: 1 1 auto; min-width: 0; }
-  .sls-env-row .del { flex: 0 0 auto; width: 26px; height: 30px; line-height: 1; font-size: 15px; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; padding: 0; background: none;
-    color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.35))); border-radius: 6px; }
-  .sls-env-row .del:hover { color: var(--vscode-errorForeground, #e55); border-color: var(--vscode-errorForeground, #e55); }
-  /* 查看态：只读、隐藏删除按钮、视觉弱化，一眼能看出不可编辑。 */
-  .sls-envs.view .sls-env-row .del { display: none; }
-  .sls-envs.view .sls-env-row input { cursor: default; opacity: .7; border-style: dashed; background: transparent; }
-  /* 编辑态末尾的「新增环境」按钮：整行虚线框。 */
-  .sls-env-add-btn { width: 100%; padding: 6px; margin-top: 2px; font: inherit; font-size: 12px; cursor: pointer;
-    background: none; color: var(--vscode-descriptionForeground);
-    border: 1px dashed var(--vscode-input-border, var(--vscode-panel-border, rgba(127,127,127,.4))); border-radius: 6px; }
-  .sls-env-add-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder, #3794ff); }
-  /* 头部小按钮进入「保存」态时高亮成主按钮色。 */
-  .sls-mini.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; }
-  .sls-mini.primary:hover { background: var(--vscode-button-hoverBackground, var(--vscode-button-background)); }
-  .sls-lsh > span:last-child { display: inline-flex; gap: 6px; }
-  .sls-sub { font-size: 10.5px; opacity: .6; line-height: 1.5; }
-  .sls-sub code, .sls-hint code { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.18)); padding: 0 4px; border-radius: 3px; }
-  .sls-hint { font-size: 11px; opacity: .7; line-height: 1.5; margin: 0; }
-  .sls-status { font-size: 11.5px; line-height: 1.5; padding: 7px 9px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
-  .sls-status.hidden { display: none; }
-  .sls-status.ok { background: rgba(63,185,80,.16); color: #3fb950; }
-  .sls-status.err { background: rgba(229,85,85,.14); color: var(--vscode-errorForeground, #e55); }
-  .sls-status.wait { background: var(--vscode-textCodeBlock-background, rgba(127,127,127,.14)); opacity: .85; }
-  .sls-imp { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; opacity: .85; }
-  .sls-acts { display: flex; gap: 8px; }
-  .sls-btn { flex: 1; cursor: pointer; font-size: 12.5px; padding: 7px 10px; border-radius: 6px; background: var(--vscode-button-secondaryBackground, rgba(127,127,127,.22)); color: var(--vscode-button-secondaryForeground, var(--vscode-foreground)); border: 1px solid var(--vscode-panel-border, rgba(127,127,127,.3)); }
-  .sls-btn.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: var(--vscode-button-background); }
-  .sls-btn:hover:not(:disabled) { opacity: .9; }
-  .sls-btn:disabled { opacity: .5; cursor: default; }
 </style>
 </head>
 <body>

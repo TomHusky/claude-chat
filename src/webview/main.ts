@@ -1868,14 +1868,8 @@ function renderHistory(showAll: boolean) {
   //
   // 改为按身份匹配：还原点存了发起它的那条提问原文（userText），顺序扫描用户
   // 消息找同文本的那条。匹配不上的还原点宁可不画分割线，也绝不错位。
-  const userIdx: number[] = []; // items 下标 -> 第几条用户消息
   const userTexts: string[] = [];
-  items.forEach((it, i) => {
-    if (it.type === "user") {
-      userIdx.push(i);
-      userTexts.push((it.text || "").trim());
-    }
-  });
+  for (const it of items) if (it.type === "user") userTexts.push((it.text || "").trim());
   const userTotal = userTexts.length;
   const cpByOrdinal = new Map<number, { id: string }>();
   {

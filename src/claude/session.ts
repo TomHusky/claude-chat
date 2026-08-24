@@ -313,6 +313,46 @@ export class SessionStore {
     return userTurns;
   }
 
+  /**
+   * 从 `keepLines`（非空行数，与 truncateToLines 同一套切片语义）处派生一个新会话：
+   * 把截断点之前的对话前缀复制成 `newId` 的 transcript（各记录的 sessionId 字段
+   * 重写为新 id，防止官方索引串台），原会话文件分毫不动。
+   * 返回新会话里的真人提问轮数（0 = 没有可用内容，调用方应放弃派生）。
+   */
+  forkAt(sessionId: string, keepLines: number, newId: string): number {
+    const file = this.findFile(sessionId);
+    if (!file) return 0;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      return 0;
+    }
+    const out: string[] = [];
+    let kept = 0;
+    let userTurns = 0;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      if (kept >= keepLines) break;
+      try {
+        const o = JSON.parse(line);
+        if (o && typeof o === "object" && "sessionId" in o) o.sessionId = newId;
+        if (o.type === "user" && this.isRealUserText(o)) userTurns++;
+        out.push(JSON.stringify(o));
+      } catch {
+        out.push(line); // 非 JSON 行原样保留
+      }
+      kept++;
+    }
+    if (!userTurns) return 0;
+    try {
+      fs.writeFileSync(path.join(path.dirname(file), `${newId}.jsonl`), out.join("\n") + "\n", "utf8");
+    } catch {
+      return 0;
+    }
+    return userTurns;
+  }
+
   /** 截断点之后的第一条真人提问原文——用于校验还原点是否与当前 transcript 对齐。
    *  返回 undefined 表示截断点之后没有提问（无从校验，交由调用方放行）。 */
   firstUserTextAfter(sessionId: string, afterLines: number): string | undefined {

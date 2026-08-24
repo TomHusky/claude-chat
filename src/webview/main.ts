@@ -2389,11 +2389,20 @@ function renderCheckpointDivider(checkpointId: string): HTMLElement {
   // A single, always-present control — hovering only restyles it (no extra
   // element appears), so the row never reflows / flickers.
   const btn = el("button", "cp-restore");
-  btn.append(el("span", "cp-icon", "⑂"), document.createTextNode(" 还原到此处"));
+  btn.textContent = "还原到此处";
   btn.title = "还原到此检查点（恢复改动前）";
   // Confirmation is shown by the extension (native modal); we just request it.
   btn.onclick = () => send({ type: "restoreCheckpoint", checkpointId });
-  d.append(btn);
+  // 从此处派生新会话（对齐官方 "Fork conversation from here"）：复制该点之前
+  // 的对话开新标签页，当前会话不动——想「两条路都试试」时用它而不是还原。
+  const fork = el("button", "cp-fork") as HTMLButtonElement;
+  fork.innerHTML = ICON.fork;
+  fork.title = "从此处派生新会话（新标签页打开，当前会话不受影响）";
+  fork.onclick = (e) => {
+    e.stopPropagation();
+    send({ type: "forkCheckpoint", checkpointId });
+  };
+  d.append(btn, fork);
   return d;
 }
 

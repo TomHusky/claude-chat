@@ -1358,6 +1358,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "restoreCheckpoint":
           await this.restoreCheckpoint(ctx, m.checkpointId);
           break;
+        case "forkCheckpoint":
+          await this.forkCheckpoint(ctx, m.checkpointId);
+          break;
         case "setPermissionMode":
           await this.setPermissionMode(ctx, m.mode);
           break;
@@ -1850,6 +1853,42 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     files.sort((a, b) => a.rel.localeCompare(b.rel));
     return { files, totalAdded, totalRemoved };
+  }
+
+  /** 从还原点派生新会话：复制截断点之前的对话为新 sessionId，新编辑器标签页打开。
+   *  与「还原」不同——不回滚文件、不截断当前会话，两边此后各聊各的。 */
+  private async forkCheckpoint(ctx: SessionCtx, checkpointId: string): Promise<void> {
+    const cut = ctx.checkpoints.cutLineOf(checkpointId);
+    if (cut === undefined || !ctx.sessionId) {
+      this.post(ctx, { kind: "error", message: "找不到该还原点，无法派生。" });
+      return;
+    }
+    if (cut <= 0) {
+      this.post(ctx, { kind: "notice", message: "该点之前没有对话内容，无法派生新会话。" });
+      return;
+    }
+    const preview = ctx.checkpoints.preview(checkpointId);
+    const confirm = await vscode.window.showWarningMessage(
+      "从此处派生新会话？",
+      {
+        modal: true,
+        detail:
+          (preview ? `消息：${preview.userText}\n\n` : "") +
+          "将复制这条消息之前的对话开一个新会话（新标签页打开）。当前会话不受影响，两边此后各自独立。",
+      },
+      "派生",
+    );
+    if (confirm !== "派生") return;
+    const newId = randomUUID();
+    const turns = this.store.forkAt(ctx.sessionId, cut, newId);
+    if (turns <= 0) {
+      this.post(ctx, { kind: "error", message: "派生失败：该点之前没有可用对话。" });
+      return;
+    }
+    // 分支带走截断点之前的还原点，派生出的会话同样能继续往回还原。
+    CheckpointManager.copyPrefixFor(this.storageDir(), ctx.sessionId, newId, cut);
+    await this.openSession(newId);
+    vscode.window.showInformationMessage(`已从该点派生新会话（保留 ${turns} 轮对话），与原会话互不影响。`);
   }
 
   private async restoreCheckpoint(ctx: SessionCtx, checkpointId: string): Promise<void> {

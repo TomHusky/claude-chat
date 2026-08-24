@@ -32,6 +32,8 @@ export const ICONS: Record<string, string> = {
   chevronLeft: _s('<path d="M9.5 4.5 6 8l3.5 3.5"/>'),
   chevronRight: _s('<path d="M6.5 4.5 10 8l-3.5 3.5"/>'),
   check: _s('<path d="M3.5 8.4 6.3 11.2 12.5 5"/>'),
+  // git-fork：从一点派生分支（还原点分割线上的「派生新会话」）
+  fork: _s('<circle cx="4.5" cy="3.9" r="1.7"/><circle cx="11.5" cy="3.9" r="1.7"/><circle cx="8" cy="12.1" r="1.7"/><path d="M4.5 5.6v.3a2.7 2.7 0 0 0 2.7 2.7h1.6a2.7 2.7 0 0 0 2.7-2.7v-.3"/><path d="M8 8.6v1.8"/>'),
   // four-point sparkle — the model picker's glyph
   model: _s('<path d="M8 2.2 9.5 6.5 13.8 8 9.5 9.5 8 13.8 6.5 9.5 2.2 8 6.5 6.5z"/>'),
   // database cylinder + status dot (bottom-right) — the SLS-logs toggle
@@ -247,6 +249,8 @@ export type FromWebview =
   | { type: "renameSession"; sessionId: string; title: string }
   | { type: "deleteSessions"; sessionIds: string[] }
   | { type: "restoreCheckpoint"; checkpointId: string }
+  /** 从该还原点派生一个新会话（复制截断点之前的对话到新 sessionId，新标签页打开；当前会话不动）。 */
+  | { type: "forkCheckpoint"; checkpointId: string }
   | { type: "setPermissionMode"; mode: string }
   | { type: "setModel"; model: string }
   | { type: "setEffort"; effort: string }

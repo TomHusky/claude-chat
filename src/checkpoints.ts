@@ -127,6 +127,25 @@ export class CheckpointManager {
     return this.checkpoints.length > 0;
   }
 
+  /** 该还原点记录的截断行数（派生分支用），找不到返回 undefined。 */
+  cutLineOf(checkpointId: string): number | undefined {
+    return this.checkpoints.find((x) => x.id === checkpointId)?.truncateLine;
+  }
+
+  /** 派生会话时把「截断点之前」的还原点复制给新会话——分支里同样能继续往回还原。
+   *  baseline 一并带上（其中可能存有早期快照被裁剪后的兜底原文）。 */
+  static copyPrefixFor(storageDir: string, srcSessionId: string, destSessionId: string, maxTruncateLine: number): void {
+    try {
+      const raw = fs.readFileSync(path.join(storageDir, `checkpoints-${srcSessionId}.json`), "utf8");
+      const j = JSON.parse(raw) as { checkpoints?: Checkpoint[]; baseline?: unknown; baselineSkipped?: unknown };
+      const kept = (j.checkpoints ?? []).filter((c) => typeof c.truncateLine === "number" && c.truncateLine < maxTruncateLine);
+      const payload = { checkpoints: kept, baseline: j.baseline ?? [], baselineSkipped: j.baselineSkipped ?? [] };
+      fs.writeFileSync(path.join(storageDir, `checkpoints-${destSessionId}.json`), JSON.stringify(payload), { mode: 0o600 });
+    } catch {
+      /* 分支缺还原点不致命——新会话从第一轮重新积累 */
+    }
+  }
+
   preview(checkpointId: string): { userText: string } | undefined {
     const c = this.checkpoints.find((x) => x.id === checkpointId);
     return c ? { userText: c.label } : undefined;

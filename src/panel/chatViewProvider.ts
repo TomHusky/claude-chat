@@ -1199,7 +1199,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.fetchUsage();
           break;
         case "checkUpdate":
-          await this.checkForUpdate();
+          // 只有点横幅才弹"下载并安装"确认；手动「检查更新」只点亮横幅，
+          // 但仍给出结果反馈（已最新/失败），不然点了像没反应。
+          await this.checkForUpdate(!m.fromBanner, false);
           break;
         case "refreshUsage":
           this.fetchUsage(true);
@@ -1288,7 +1290,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.fetchUsage();
           break;
         case "checkUpdate":
-          await this.checkForUpdate();
+          // 只有点横幅才弹"下载并安装"确认；手动「检查更新」只点亮横幅，
+          // 但仍给出结果反馈（已最新/失败），不然点了像没反应。
+          await this.checkForUpdate(!m.fromBanner, false);
           break;
         case "refreshUsage":
           this.fetchUsage(true);
@@ -4036,23 +4040,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Check GitHub for a newer packaged build; if found, download + install it.
    *  In `silent` mode (auto-check on startup) it stays quiet unless a newer
    *  version exists — no "already latest" / error popups. */
-  async checkForUpdate(silent = false): Promise<void> {
+  async checkForUpdate(silent = false, quiet = silent): Promise<void> {
     const local = (this.context.extension.packageJSON.version as string) || "0.0.0";
     let remote = "";
     try {
       const pkg = await this.fetchRepoFile("package.json");
       remote = JSON.parse(pkg.toString("utf8")).version || "";
     } catch (err) {
-      if (!silent) vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
+      if (!quiet) vscode.window.showErrorMessage(`检查更新失败：${String((err as Error)?.message ?? err)}`);
       return;
     }
     if (!remote) {
-      if (!silent) vscode.window.showErrorMessage("检查更新失败：无法读取远程版本号");
+      if (!quiet) vscode.window.showErrorMessage("检查更新失败：无法读取远程版本号");
       return;
     }
     if (cmpVersion(remote, local) <= 0) {
       this.installedPending = undefined; // running version caught up — clear any pending-reload flag
-      if (!silent) vscode.window.showInformationMessage(`已是最新版本 v${local}`);
+      if (!quiet) vscode.window.showInformationMessage(`已是最新版本 v${local}`);
       return;
     }
     // Newer version available.
@@ -4061,7 +4065,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // and don't re-light the badge for a version that's already on disk.
     if (this.installedPending && cmpVersion(remote, this.installedPending) <= 0) {
       this.postUpdateDot();
-      if (!silent) {
+      if (!quiet) {
         const reload = await vscode.window.showInformationMessage(
           `v${remote} 已安装，需重新加载窗口后生效。`,
           "重新加载",
@@ -4755,7 +4759,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       render();
     });
     $("delsel").addEventListener("click", () => confirmDel([...sel]));
-    $("upd-banner").addEventListener("click", () => vscode.postMessage({ type: "checkUpdate" }));
+    $("upd-banner").addEventListener("click", () => vscode.postMessage({ type: "checkUpdate", fromBanner: true }));
 
     window.addEventListener("message", (ev) => {
       const m = ev.data;

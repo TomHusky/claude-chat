@@ -74,7 +74,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.stop", () => provider.stop()),
     vscode.commands.registerCommand("claude-chat.focusInput", () => provider.focusInput()),
     vscode.commands.registerCommand("claude-chat.addSelectionToChat", () => provider.addSelection()),
-    vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate()),
+    // 手动检查：只点亮侧边栏横幅（不直接弹安装确认），但保留结果反馈。
+    // 真正的"下载并安装"确认统一由点击横幅触发，避免同时冒出两个入口。
+    vscode.commands.registerCommand("claude-chat.checkUpdate", () => provider.checkForUpdate(true, false)),
     vscode.commands.registerCommand("claude-chat.slsConfig", () => provider.showSlsConfig()),
     vscode.commands.registerCommand("claude-chat.qqConfig", () => provider.showQQConfig()),
     vscode.commands.registerCommand("claude-chat.notifyConfig", () => provider.showNotifyConfig()),
@@ -90,9 +92,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claude-chat.open", () => provider.newSession()),
   );
 
-  // Auto-check for updates once on startup (silent — only prompts if newer).
+  // Auto-check for updates: once shortly after startup, then every 3 hours —
+  // a window left open for days would otherwise never see a new build (the
+  // startup check was the only trigger). Silent: only speaks up if newer.
   const updateTimer = setTimeout(() => void provider.checkForUpdate(true), 4000);
-  context.subscriptions.push({ dispose: () => clearTimeout(updateTimer) });
+  const UPDATE_POLL_MS = 3 * 60 * 60 * 1000;
+  const updatePoll = setInterval(() => void provider.checkForUpdate(true), UPDATE_POLL_MS);
+  context.subscriptions.push({
+    dispose: () => {
+      clearTimeout(updateTimer);
+      clearInterval(updatePoll);
+    },
+  });
 
 }
 

@@ -13,8 +13,6 @@ export const ICONS: Record<string, string> = {
   send: _s('<path d="M8 12.5V4M4.6 7.4 8 4l3.4 3.4"/>'),
   stop: _s('<rect x="4.5" y="4.5" width="7" height="7" rx="1.5"/>', true),
   attach: _s('<path d="M11.6 7.1 6.8 11.9a2.3 2.3 0 0 1-3.25-3.25l5.2-5.2a1.4 1.4 0 0 1 2 2L5.6 10.7a.5.5 0 0 1-.7-.7l4.5-4.5"/>'),
-  sessions: _s('<path d="M3.5 4.5h9M3.5 8h9M3.5 11.5h6"/>'),
-  newChat: _s('<path d="M8 3.5v9M3.5 8h9"/>'),
   terminal: _s('<rect x="2.5" y="3" width="11" height="10" rx="1.6"/><path d="M5 7l2 1.6-2 1.6"/><path d="M8.6 10.4h2.9"/>'),
   search: _s('<circle cx="7" cy="7" r="3.8"/><path d="M9.9 9.9 13 13"/>'),
   web: _s('<circle cx="8" cy="8" r="5.5"/><path d="M2.5 8h11"/><path d="M8 2.5c2.3 2.2 2.3 8.8 0 11"/><path d="M8 2.5c-2.3 2.2-2.3 8.8 0 11"/>'),
@@ -22,8 +20,6 @@ export const ICONS: Record<string, string> = {
   tool: _s('<rect x="3.5" y="3.5" width="9" height="9" rx="2.2"/>'),
   file: _s('<path d="M4 2.5h4.5L12 6v7.5H4z"/><path d="M8.5 2.5V6H12"/>'),
   copy: _s('<rect x="5.4" y="5.4" width="7.1" height="7.1" rx="1.6"/><path d="M3.5 10.4V4a.5.5 0 0 1 .5-.5h6.4"/>'),
-  edit: _s('<path d="M8.5 3.2H3.6a1 1 0 0 0-1 1v7.2a1 1 0 0 0 1 1h7.2a1 1 0 0 0 1-1V7.5"/><path d="M11 2.6a1.1 1.1 0 0 1 1.6 1.6L7.8 9 5.6 9.6 6.2 7.4z"/>'),
-  trash: _s('<path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/>'),
   play: _s('<path d="M5 3.8v8.4l7-4.2z"/>'),
   update: _s('<path d="M12.7 8a4.7 4.7 0 1 1-1.4-3.35"/><path d="M12.9 2.8v2.4h-2.4"/>'),
   // Directional/confirm glyphs — the UI used to draw these with text characters
@@ -101,8 +97,9 @@ export type ToWebview =
   /** 看门狗心跳：webview 必须立即回 pong。通道半死（页面活着但消息不通）时
    *  宿主据此发现并重建 webview——否则表现为"永远转圈/按钮全聋"。 */
   | { kind: "ping"; id: number }
-  /** 重建 webview 后回填输入框草稿（宿主侧持有，整页重载不丢）。 */
-  | { kind: "draft"; text: string }
+  /** 重建 webview 后回填输入框草稿（宿主侧持有，整页重载不丢）；
+   *  还原到此处时随草稿带回该轮消息的图片附件。 */
+  | { kind: "draft"; text: string; images?: { mediaType: string; data: string }[] }
   | { kind: "update_available"; version: string }
   | { kind: "context"; used: number; total: number }
   | { kind: "refs_validated"; invalid: string[] }
@@ -121,7 +118,7 @@ export type ToWebview =
   | { kind: "error"; message: string }
   | { kind: "notice"; message: string }
   // Full conversation replacement (switching/restoring sessions)
-  | { kind: "load_history"; items: TimelineItem[]; sessionId?: string; title?: string; checkpoints?: CheckpointSummary[] }
+  | { kind: "load_history"; items: TimelineItem[]; sessionId?: string; checkpoints?: CheckpointSummary[] }
   | { kind: "sessions"; list: SessionSummary[]; activeId?: string; runningIds?: string[] }
   | { kind: "running"; sessionIds: string[] }
   // A restore point was created for the turn just sent (live).
@@ -240,12 +237,9 @@ export type FromWebview =
   | { type: "newContext"; text?: string; context?: string; images?: { mediaType: string; data: string }[]; files?: string[]; sls?: boolean }
   | { type: "permission"; requestId: string; behavior: "allow" | "deny"; suggestionId?: string }
   | { type: "answerQuestion"; requestId: string; answers: Record<string, string | string[]> }
-  | { type: "newSession" }
   | { type: "listSessions" }
-  | { type: "switchSession"; sessionId: string }
   | { type: "openSession"; sessionId: string }
   | { type: "newInEditor" }
-  | { type: "deleteSession"; sessionId: string }
   | { type: "renameSession"; sessionId: string; title: string }
   | { type: "deleteSessions"; sessionIds: string[] }
   | { type: "restoreCheckpoint"; checkpointId: string }

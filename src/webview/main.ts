@@ -137,9 +137,6 @@ const modelLabel = $("model-label");
 const modelMenu = $("model-menu");
 const pickBackdrop = $("pick-backdrop");
 const contextChips = $("context-chips");
-const sessionsPanel = $("panel-sessions");
-const sessionsList = $("sessions-list");
-const overlay = $("overlay");
 const changedFiles = $("changed-files");
 const cfList = $("cf-list");
 const cfStat = $("cf-stat");
@@ -871,6 +868,15 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
         inputEl.value = m.text;
         autoResize();
       }
+      // 还原带回的图片附件回填成可删的图片 chip；已有待发图片时不叠加。
+      if (m.images?.length && !pendingImages.length) {
+        for (const im of m.images) {
+          const uri = `data:${im.mediaType};base64,${im.data}`;
+          pendingImages.push({ mediaType: im.mediaType, data: im.data, uri });
+          addImagePreview(uri);
+        }
+      }
+      refreshComposerHint();
       return;
     case "session":
       statusLine.textContent = `模型 ${m.model} · ${m.cwd}`;
@@ -1008,17 +1014,9 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       inputEl.dispatchEvent(new Event("input"));
       break;
     case "load_history":
-      loadHistory(m.items, m.title, m.checkpoints, m.sessionId);
+      loadHistory(m.items, m.checkpoints, m.sessionId);
       updateQuestionBar(); // 短历史不触发滚动事件，主动对一次
 
-      break;
-    case "sessions":
-      if (m.runningIds !== undefined) runningSessionIds = new Set(m.runningIds);
-      renderSessions(m.list, m.activeId);
-      break;
-    case "running":
-      runningSessionIds = new Set(m.sessionIds);
-      renderSessions(lastSessions, lastActiveId);
       break;
     case "checkpoint_marker":
       onCheckpointMarker(m.checkpointId);
@@ -1446,7 +1444,6 @@ function renderToolInput(name: string, input: Record<string, unknown>): { subtit
         : "",
     };
   }
-  const filechip = fp ? `<a class="file-chip" data-action="open" data-path="${escapeHtml(fp)}">${escapeHtml(rel)}</a>` : "";
   switch (name) {
     case "TodoWrite": {
       // 渲染成勾选清单（对齐官方样式）：完成 = 勾选+删除线，进行中 = 高亮，待办 = 空框。
@@ -1837,7 +1834,7 @@ function resolvePermission(requestId: string, behavior: "allow" | "deny") {
 const HISTORY_TURN_LIMIT = 3; // only the last N turns render by default; older folds behind a banner
 let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: string; userText?: string }[] } | null = null;
 
-function loadHistory(items: TimelineItem[], title?: string, checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
+function loadHistory(items: TimelineItem[], checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
   historyState = { items, checkpoints: checkpoints || [] };
   if (sessionId) vscode.setState({ sessionId });
   renderHistory(false);
@@ -2217,6 +2214,9 @@ function renderChangedFiles(
     cfList.innerHTML = "";
     return;
   }
+  // 从「无改动」到「有改动」的首次出现按默认折叠展示（点开与否由用户决定，
+  // 本轮内的后续刷新不再动它）。
+  if (changedFiles.classList.contains("hidden")) changedFiles.classList.add("collapsed");
   changedFiles.classList.remove("hidden");
   // Header totals: the panel knew the numbers all along but only ever showed
   // the two bulk buttons, so "how big is this change" meant expanding the list.
@@ -2253,132 +2253,6 @@ function renderChangedFiles(
     cfList.appendChild(row);
   }
 }
-
-type SessionItem = { id: string; title: string; updatedAt: number; messageCount: number };
-let lastSessions: SessionItem[] = [];
-let lastActiveId: string | undefined;
-let runningSessionIds = new Set<string>(); // sessions whose turn is currently streaming
-let multiSelect = false;
-const selectedSessions = new Set<string>();
-
-function renderSessions(list: SessionItem[], activeId?: string) {
-  lastSessions = list;
-  lastActiveId = activeId;
-  // drop selections for sessions that no longer exist
-  const ids = new Set(list.map((s) => s.id));
-  for (const id of [...selectedSessions]) if (!ids.has(id)) selectedSessions.delete(id);
-
-  sessionsList.innerHTML = "";
-  if (!list.length) {
-    sessionsList.appendChild(el("div", "empty", "还没有历史会话"));
-  }
-  for (const s of list) {
-    const row = el("div", "list-row" + (s.id === activeId ? " active" : "") + (selectedSessions.has(s.id) ? " selected" : ""));
-    if (multiSelect) {
-      const cb = el("span", "list-check" + (selectedSessions.has(s.id) ? " on" : ""));
-      row.appendChild(cb);
-    }
-    const main = el("div", "list-main");
-    const titleRow = el("div", "list-titlerow");
-    if (runningSessionIds.has(s.id)) {
-      const dot = el("span", "run-dot");
-      dot.title = "正在回复中";
-      titleRow.appendChild(dot);
-    }
-    const titleEl = el("div", "list-title", s.title);
-    titleRow.appendChild(titleEl);
-    main.append(titleRow, el("div", "list-meta", `${new Date(s.updatedAt).toLocaleString()} · ${s.messageCount} 条`));
-    row.appendChild(main);
-    // Inline actions: edit (left) then delete (right). No right-click menu.
-    const actions = el("div", "list-actions");
-    const editBtn = el("button", "list-act");
-    editBtn.title = "重命名";
-    editBtn.innerHTML = ICON.edit;
-    editBtn.onclick = (e) => { e.stopPropagation(); startRenameSession(titleEl, s.id, s.title); };
-    const delBtn = el("button", "list-act danger");
-    delBtn.title = "删除";
-    delBtn.innerHTML = ICON.trash;
-    delBtn.onclick = (e) => { e.stopPropagation(); send({ type: "deleteSession", sessionId: s.id }); };
-    actions.append(editBtn, delBtn);
-    row.appendChild(actions);
-    row.onclick = () => {
-      if (multiSelect) {
-        if (selectedSessions.has(s.id)) selectedSessions.delete(s.id);
-        else selectedSessions.add(s.id);
-        renderSessions(lastSessions, lastActiveId);
-      } else {
-        send({ type: "switchSession", sessionId: s.id });
-        closeDrawers();
-      }
-    };
-    sessionsList.appendChild(row);
-  }
-  updateSessionTools();
-}
-
-/** Inline-edit a session title: swap the title div for an input. Enter / blur
- *  commits (empty reverts to the auto title); Esc cancels. */
-function startRenameSession(titleEl: HTMLElement, id: string, current: string) {
-  const input = el("input", "rename-input") as HTMLInputElement;
-  input.value = current;
-  titleEl.replaceWith(input);
-  input.focus();
-  input.select();
-  let done = false;
-  const commit = (save: boolean) => {
-    if (done) return;
-    done = true;
-    if (save) send({ type: "renameSession", sessionId: id, title: input.value.trim() });
-    renderSessions(lastSessions, lastActiveId); // restore/refresh (server echo re-renders on save)
-  };
-  input.onclick = (e) => e.stopPropagation();
-  input.onkeydown = (e) => {
-    e.stopPropagation();
-    if (e.key === "Enter") { e.preventDefault(); commit(true); }
-    else if (e.key === "Escape") { e.preventDefault(); commit(false); }
-  };
-  input.onblur = () => commit(true);
-}
-
-function updateSessionTools() {
-  const multiBtn = $("sessions-multi");
-  const delBtn = $("sessions-del-sel") as HTMLButtonElement;
-  multiBtn.textContent = multiSelect ? "取消多选" : "多选";
-  multiBtn.classList.toggle("on", multiSelect);
-  delBtn.textContent = `删除所选 (${selectedSessions.size})`;
-  delBtn.classList.toggle("hidden", !multiSelect || selectedSessions.size === 0);
-}
-
-$("sessions-multi").onclick = () => {
-  multiSelect = !multiSelect;
-  if (!multiSelect) selectedSessions.clear();
-  renderSessions(lastSessions, lastActiveId);
-};
-$("sessions-del-sel").onclick = () => {
-  if (selectedSessions.size) send({ type: "deleteSessions", sessionIds: [...selectedSessions] });
-};
-
-// ---- lightweight right-click menu ----
-const ctxMenu = $("ctx-menu");
-function showCtxMenu(x: number, y: number, items: { label: string; danger?: boolean; run: () => void }[]) {
-  ctxMenu.innerHTML = "";
-  for (const it of items) {
-    const b = el("button", "ctx-item" + (it.danger ? " danger" : ""), it.label);
-    b.onclick = () => {
-      hideCtxMenu();
-      it.run();
-    };
-    ctxMenu.appendChild(b);
-  }
-  ctxMenu.style.left = Math.min(x, window.innerWidth - 160) + "px";
-  ctxMenu.style.top = Math.min(y, window.innerHeight - 60) + "px";
-  ctxMenu.classList.remove("hidden");
-}
-function hideCtxMenu() {
-  ctxMenu.classList.add("hidden");
-}
-document.addEventListener("click", hideCtxMenu);
-document.addEventListener("scroll", hideCtxMenu, true);
 
 // ---------------------------------------------------------------------------
 // Inline restore points (checkpoint dividers in the conversation stream)
@@ -3272,11 +3146,6 @@ cfHeader.onclick = (e) => {
   changedFiles.classList.toggle("collapsed");
 };
 
-// New-session / history are now driven from the editor title bar + sidebar;
-// the in-panel toolbar was removed.
-overlay.onclick = closeDrawers;
-document.querySelectorAll("[data-close]").forEach((b) => ((b as HTMLElement).onclick = closeDrawers));
-
 // Event delegation: copy buttons & file links inside the message stream.
 messagesEl.addEventListener("click", (e) => {
   const t = e.target as HTMLElement;
@@ -3670,6 +3539,9 @@ function setBusy(busy: boolean) {
   // fires on all of them and would otherwise erase the red/green rim instantly.
   if (busy && glowState !== "waiting") setGlow("running");
   if (busy) stoppingView = false; // a new turn is live — resume rendering
+  // 新一轮开始就把「已更改文件」收回折叠态——上一轮手动展开过的话，本轮执行中
+  // 陆续进来的文件会顶着展开列表刷存在感；默认折叠必须对每一轮成立。
+  if (busy) changedFiles.classList.add("collapsed");
   refreshComposerHint(); // toggles send/stop + the "加入等待队列" hint
   if (busy) {
     showWorking();
@@ -3718,32 +3590,14 @@ function removeWorking() {
   workingFixed = "";
 }
 
-function openDrawer(panel: HTMLElement) {
-  closeDrawers();
-  panel.classList.remove("hidden");
-  overlay.classList.remove("hidden");
-}
-function closeDrawers() {
-  sessionsPanel.classList.add("hidden");
-  overlay.classList.add("hidden");
-}
-
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text?: string): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
   if (text != null) e.textContent = text;
   return e;
 }
-function withHtml<T extends HTMLElement>(e: T, html: string): T {
-  e.innerHTML = html;
-  return e;
-}
 function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
-}
-function firstLine(s: string): string {
-  const i = s.indexOf("\n");
-  return i < 0 ? s : s.slice(0, i) + "…";
 }
 function truncateText(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + `\n… (已截断 ${s.length - n} 字符)` : s;

@@ -353,9 +353,15 @@ export class SessionStore {
     return userTurns;
   }
 
-  /** 截断点之后的第一条真人提问原文——用于校验还原点是否与当前 transcript 对齐。
-   *  返回 undefined 表示截断点之后没有提问（无从校验，交由调用方放行）。 */
-  firstUserTextAfter(sessionId: string, afterLines: number): string | undefined {
+  /** 截断点之后的第一条真人消息（提问文本 + 随附图片）——还原时既做对齐校验，
+   *  也把图片趁截断前取出来带回输入框（截断后 transcript 里就没有这条消息了）。
+   *  纯图片消息正文为空、过不了 isRealUserText，这里单独认；isMeta / 非 human
+   *  注入照旧跳过，别把 IDE 注入或工具回执里的图片当成用户消息。
+   *  返回 undefined 表示截断点之后没有真人消息（无从校验，交由调用方放行）。 */
+  firstUserTurnAfter(
+    sessionId: string,
+    afterLines: number,
+  ): { text: string; images: { mediaType: string; data: string }[] } | undefined {
     const file = this.findFile(sessionId);
     if (!file) return undefined;
     let raw: string;
@@ -375,9 +381,23 @@ export class SessionStore {
       } catch {
         continue;
       }
-      if (o?.type === "user" && this.isRealUserText(o)) {
-        return splitAttachedContext(this.userText(o)).text || this.userText(o);
+      if (o?.type !== "user") continue;
+      if (o.isMeta === true || o.isCompactSummary === true) continue;
+      const originKind = o?.origin?.kind;
+      if (typeof originKind === "string" && originKind !== "human") continue;
+      const content = o.message?.content;
+      const images: { mediaType: string; data: string }[] = [];
+      if (Array.isArray(content)) {
+        if (content.some((b: any) => b?.type === "tool_result")) continue;
+        for (const b of content) {
+          if (b?.type === "image" && b.source?.type === "base64" && b.source.data) {
+            images.push({ mediaType: b.source.media_type || "image/png", data: b.source.data });
+          }
+        }
       }
+      if (!this.isRealUserText(o) && !images.length) continue;
+      const t = this.userText(o);
+      return { text: splitAttachedContext(t).text || t, images };
     }
     return undefined;
   }

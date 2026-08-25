@@ -66,6 +66,8 @@ interface SessionCtx {
   /** 输入框草稿（webview 每次变化都同步过来）。通道看门狗重建 webview 是整页
    *  重载，不存宿主侧的话用户打了一半的长消息会瞬间消失。 */
   draft?: string;
+  /** 还原时随草稿一起回填的图片附件（发送/清空草稿后作废）。 */
+  draftImages?: { mediaType: string; data: string }[];
 }
 
 /** 预热时间戳台账，落盘在 ~/.claude-chat/prewarm.json，所有窗口共用。
@@ -309,7 +311,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.output.appendLine(`[${new Date().toISOString()}] [watchdog] 侧边栏通道无响应 30s，重建 webview`);
           this.sidebarMissedPings = 0;
           try {
-            this.view.webview.html = this.sidebarHtml(this.view.webview);
+            this.view.webview.html = this.sidebarHtml();
           } catch (err) {
             this.output.appendLine(`[watchdog] 侧边栏重建失败: ${String(err)}`);
           }
@@ -482,7 +484,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [vscode.Uri.joinPath(this.context.extensionUri, "media")],
     };
     // The left sidebar is a session manager only — chat lives in the editor panel.
-    view.webview.html = this.sidebarHtml(view.webview);
+    view.webview.html = this.sidebarHtml();
     view.webview.onDidReceiveMessage((m: FromWebview) => this.onSidebarMessage(m));
     this.postUpdateDot(); // restore the badge if an update was already detected
     view.onDidChangeVisibility(() => {
@@ -541,24 +543,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  /** Broadcast the session list to the sidebar manager and EVERY chat panel,
+  /** Broadcast the session list to the sidebar manager,
    *  and set each panel's tab title to its own session's title. */
   private refreshSessions(): void {
     const list = this.store.list();
-    const e: ToWebview = {
-      kind: "sessions",
-      list,
-      activeId: this.activeCtx?.sessionId,
-      runningIds: this.runningIds(),
-    };
     try {
-      this.view?.webview.postMessage(e);
+      this.view?.webview.postMessage({
+        kind: "sessions",
+        list,
+        activeId: this.activeCtx?.sessionId,
+        runningIds: this.runningIds(),
+      } satisfies ToWebview);
     } catch {
       /* view disposed（移动侧边栏位置会短暂出现死引用） */
     }
     for (const ctx of this.sessions) {
       try {
-        ctx.panel.webview.postMessage(e);
         this.setPanelTitle(ctx, list);
       } catch {
         /* panel disposed */
@@ -1206,16 +1206,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case "refreshUsage":
           this.fetchUsage(true);
           break;
-        case "switchSession":
         case "openSession":
           await this.openSession(m.sessionId);
           break;
         case "newInEditor":
-        case "newSession":
           await this.openSession(undefined);
-          break;
-        case "deleteSession":
-          await this.deleteSessions([m.sessionId]);
           break;
         case "deleteSessions":
           await this.deleteSessions(m.sessionIds);
@@ -1252,6 +1247,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break; // 心跳，无需处理
         case "draft":
           ctx.draft = m.text; // 宿主侧留底，webview 被看门狗重建时回填
+          if (!m.text) ctx.draftImages = undefined; // 发送/清空后，还原带回的图片留底一并作废
           break;
         case "dismissRateLimit": {
           // 记到 resetsAt（秒→毫秒）；事件没带就兜底 6 小时，别永久闭嘴。
@@ -1333,27 +1329,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           ctx.pendingPerm = undefined;
           if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
           ctx.proc?.answerQuestion(m.requestId, m.answers);
-          break;
-        case "newSession":
-          await this.openSession(undefined);
-          break;
-        // 面板内会话抽屉的四种操作此前没有 handler（点了没反应的哑弹）——
-        // 与侧边栏同款路由。
-        case "switchSession":
-          await this.openSession(m.sessionId);
-          break;
-        case "deleteSession":
-          await this.deleteSessions([m.sessionId]);
-          break;
-        case "deleteSessions":
-          await this.deleteSessions(m.sessionIds);
-          break;
-        case "renameSession":
-          this.renameSession(m.sessionId, m.title);
-          break;
-        case "listSessions":
-          this.refreshSessions();
-          this.postUpdateDot();
           break;
         case "restoreCheckpoint":
           await this.restoreCheckpoint(ctx, m.checkpointId);
@@ -1455,13 +1430,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** On a chat panel's webview load, render its session (or last/blank). */
   private loadCtxSession(ctx: SessionCtx): void {
-    if (ctx.draft) this.post(ctx, { kind: "draft", text: ctx.draft }); // 重建后回填草稿
+    if (ctx.draft || ctx.draftImages?.length)
+      this.post(ctx, { kind: "draft", text: ctx.draft ?? "", images: ctx.draftImages }); // 重建后回填草稿
     if (ctx.sessionId) {
       this.loadSessionInto(ctx, ctx.sessionId);
       return;
     }
     if (ctx.blank) {
-      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      this.post(ctx, { kind: "load_history", items: [], checkpoints: [] });
       this.refreshChangedFiles(ctx);
       return;
     }
@@ -1482,7 +1458,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       ctx.checkpoints.setSession(sid);
       this.loadSessionInto(ctx, sid);
     } else {
-      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      this.post(ctx, { kind: "load_history", items: [], checkpoints: [] });
       this.refreshChangedFiles(ctx);
     }
   }
@@ -1490,8 +1466,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** Push a session's full transcript/checkpoints/busy state into a chat panel. */
   private loadSessionInto(ctx: SessionCtx, sid: string): void {
     const items = this.store.load(sid);
-    const title = this.store.list().find((s) => s.id === sid)?.title;
-    this.post(ctx, { kind: "load_history", items, sessionId: sid, title, checkpoints: ctx.checkpoints.list() });
+    this.post(ctx, { kind: "load_history", items, sessionId: sid, checkpoints: ctx.checkpoints.list() });
     this.postSessionContext(ctx, sid);
     // 打开会话就后台起进程 + --resume：把本地重读上下文的耗时提前，跟用户读历史/打字重叠，
     // 而不是全压在按下发送那一刻（这是"发消息才卡十几秒"的主因之一）。
@@ -1529,7 +1504,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctx.checkpoints.flush();
     ctx.checkpoints = new CheckpointManager(this.storageDir());
     this.output.appendLine(`[${new Date().toISOString()}] [clear] ${old?.slice(0, 8) ?? "空"} → 新上下文`);
-    this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+    this.post(ctx, { kind: "load_history", items: [], checkpoints: [] });
     this.refreshChangedFiles(ctx);
     this.refreshSessions();
     if (m.text || m.images?.length) {
@@ -1915,13 +1890,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // transcript 严重不符（例如跨天长会话里的陈旧还原点，指向几千行文件的第 8
     // 行），照它截断会把整段上下文连同官方插件里的记录一起报废。校验：截断点
     // 处的那条用户消息，文本必须和还原点记录的提问对得上；对不上就中止。
-    if (ctx.sessionId && result.truncateLine > 0 && result.userText) {
-      const nextUser = this.store.firstUserTextAfter(ctx.sessionId, result.truncateLine);
+    // 顺带取回该消息随附的图片——截断后 transcript 里这条消息就没了，必须趁
+    // 截断前拿到，稍后随草稿一起回填输入框。
+    const nextTurn =
+      ctx.sessionId && result.truncateLine > 0
+        ? this.store.firstUserTurnAfter(ctx.sessionId, result.truncateLine)
+        : undefined;
+    if (ctx.sessionId && result.truncateLine > 0 && result.userText && nextTurn !== undefined) {
       const norm = (t: string) => t.replace(/\s+/g, " ").trim().slice(0, 80);
-      if (nextUser !== undefined && norm(nextUser) !== norm(result.userText)) {
+      // 纯图片轮次 beginTurn 存的是占位符「(图片)」，正文无从比对——改验「该轮
+      // 确实是纯图片消息」；此前拿占位符硬比后面某轮的文本，纯图片还原必被误拦。
+      const aligned =
+        result.userText === "(图片)"
+          ? nextTurn.images.length > 0 && !norm(nextTurn.text)
+          : norm(nextTurn.text) === norm(result.userText);
+      if (!aligned) {
         this.output.appendLine(
           `[restore] 中止：还原点与 transcript 对不上 truncateLine=${result.truncateLine} ` +
-            `期望提问=${JSON.stringify(norm(result.userText))} 实际=${JSON.stringify(norm(nextUser))}`,
+            `期望提问=${JSON.stringify(norm(result.userText))} 实际=${JSON.stringify(norm(nextTurn.text))} ` +
+            `图片=${nextTurn.images.length}`,
         );
         this.post(ctx, {
           kind: "error",
@@ -1959,7 +1946,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (rewoundToStart) {
       ctx.sessionId = undefined;
       ctx.checkpoints.clear();
-      this.post(ctx, { kind: "load_history", items: [], title: "新对话", checkpoints: [] });
+      this.post(ctx, { kind: "load_history", items: [], checkpoints: [] });
     } else {
       const items = this.store.load(ctx.sessionId!);
       this.post(ctx, { kind: "load_history", items, sessionId: ctx.sessionId, checkpoints: ctx.checkpoints.list() });
@@ -1976,11 +1963,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       kind: "notice",
       message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。${skippedNote}下一条消息将从这里继续。`,
     });
-    // 被回退掉的那轮提问自动带回输入框，方便改完重发（webview 侧输入框非空
-    // 时不覆盖）；同步宿主侧留底，看门狗重建 webview 后也不丢。
-    if (result.userText) {
-      ctx.draft = result.userText;
-      this.post(ctx, { kind: "draft", text: result.userText });
+    // 被回退掉的那轮提问自动带回输入框（含随附图片），方便改完重发（webview
+    // 侧输入框非空时不覆盖）；同步宿主侧留底，看门狗重建 webview 后也不丢。
+    // 纯图片轮次存的占位符「(图片)」不是用户打的字，不塞进输入框。
+    const draftText = result.userText === "(图片)" ? "" : result.userText;
+    const draftImages = nextTurn?.images.length ? nextTurn.images : undefined;
+    if (draftText || draftImages) {
+      ctx.draft = draftText;
+      ctx.draftImages = draftImages;
+      this.post(ctx, { kind: "draft", text: draftText, images: draftImages });
     }
     this.refreshChangedFiles(ctx);
   }
@@ -3839,24 +3830,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     return ids;
   }
 
-  /** Tell every webview which sessions are currently streaming, so the list can
-   *  show live "active" dots — even after a chat tab is closed or switched. */
+  /** Tell the sidebar manager which sessions are currently streaming, so the
+   *  list can show live "active" dots — even after a chat tab is closed. */
   private broadcastRunning(): void {
     // 这条会从进程事件（busy/close）进入，没有外层 try/catch 保护——侧边栏
     // 被移动位置/收起时 view 是已 dispose 的死引用，postMessage 直接抛
-    // "Webview is disposed"，异常会中断当轮事件处理。逐个吞掉。
-    const e: ToWebview = { kind: "running", sessionIds: this.runningIds() };
+    // "Webview is disposed"，异常会中断当轮事件处理。吞掉。
     try {
-      this.view?.webview.postMessage(e);
+      this.view?.webview.postMessage({ kind: "running", sessionIds: this.runningIds() } satisfies ToWebview);
     } catch {
       /* view disposed */
-    }
-    for (const ctx of this.sessions) {
-      try {
-        ctx.panel.webview.postMessage(e);
-      } catch {
-        /* panel disposed */
-      }
     }
   }
 
@@ -4242,7 +4225,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private lspMisses = 0;
   /** 连续"整轮重试都查不到任何东西"的次数——判定索引不可用的另一条出口。 */
   private lspEmptyCycles = 0;
-  private readonly bootAt = Date.now();
 
   /** 校验一批符号引用，返回无效项的 id。策略：LSP 工作区符号索引（快、准）。
    *  保护：整批一个都查不到时不下结论——可能是语言服务还没热身（窗口刚开时索引
@@ -4624,7 +4606,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** The left sidebar: a session manager only. Chat itself lives in the editor
    *  panel (opened via "new chat" or by clicking a session). */
-  private sidebarHtml(webview: vscode.Webview): string {
+  private sidebarHtml(): string {
     const nonce = randomUUID().replace(/-/g, "");
     const csp = [
       `default-src 'none'`,
@@ -4856,7 +4838,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div id="app">
-    <div id="overlay" class="overlay hidden"></div>
     <div id="lightbox" class="lightbox hidden">
       <div class="lightbox-actions">
         <button id="lb-copy" title="复制图片到剪贴板">${ICONS.copy} 复制</button>
@@ -4866,20 +4847,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <img id="lightbox-img" alt="预览" />
     </div>
     <div id="messages" class="messages"></div>
-
-    <div id="panel-sessions" class="drawer hidden">
-      <div class="drawer-head">
-        <span>历史会话</span>
-        <span class="drawer-spacer"></span>
-        <button id="sessions-multi" class="drawer-act" title="多选">多选</button>
-        <button id="sessions-del-sel" class="drawer-act danger hidden">删除所选</button>
-        <button class="drawer-close" data-close>×</button>
-      </div>
-      <div id="sessions-list" class="drawer-body"></div>
-    </div>
-    <div id="ctx-menu" class="ctx-menu hidden"></div>
     <footer id="composer">
-      <div id="changed-files" class="changed-files hidden">
+      <div id="changed-files" class="changed-files hidden collapsed">
         <div class="cf-header" id="cf-header">
           <span class="cf-caret">${ICONS.chevron}</span>
           <span class="cf-title">已更改文件</span>

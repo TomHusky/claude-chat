@@ -1928,7 +1928,21 @@ function renderHistory(showAll: boolean) {
     }
     const banner = el("div", "history-expand", `▾ 显示更早的 ${target} 条消息`);
     const cut = cutoff;
-    banner.onclick = () => expandHistory(banner, cut, cpByOrdinal);
+    banner.onclick = () => {
+      // 展开要同步渲染几百轮（markdown+高亮），主线程一卡几百毫秒到数秒，点击
+      // 后毫无反应像没点中。先把横幅原地变成加载态，rAF（本帧提交）+setTimeout
+      // （落到绘制之后）保证加载态真正画出来才开始重活；onclick 置空防连点重入。
+      banner.onclick = null;
+      banner.classList.add("loading");
+      banner.innerHTML = `<span class="hx-spin"></span>正在加载 ${target} 条消息…`;
+      requestAnimationFrame(() =>
+        setTimeout(() => {
+          // 等待的这一帧里整页可能已重载（还原点回退/看门狗重建），横幅不在树上
+          // 说明列表已是新的，此次展开作废。
+          if (banner.isConnected) expandHistory(banner, cut, cpByOrdinal);
+        }, 0),
+      );
+    };
     messagesEl.appendChild(banner);
   }
 

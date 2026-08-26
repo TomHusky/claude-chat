@@ -1874,14 +1874,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         modal: true,
         detail:
           (preview ? `消息：${preview.userText}\n\n` : "") +
-          "将回滚此后的文件改动，并截断对话 —— Claude 会忘记这条消息及之后的所有轮次。此操作不可撤销。",
+          "将回滚此后的文件改动，并截断对话 —— Claude 会忘记这条消息及之后的所有轮次。此操作不可撤销。" +
+          (ctx.proc?.isBusy ? "\n\nClaude 正在回复中，还原会先自动停止本轮。" : ""),
       },
       "还原",
     );
     if (confirm !== "还原") return;
 
-    const result = ctx.checkpoints.restore(checkpointId);
-    if (!result) {
+    // 元数据先行（metaOf 无副作用）：安全闸必须在动任何东西之前跑完。此前是
+    // restore() 先把文件全回滚了才校验，闸拦下时文件已经被改过，「已中止还原」
+    // 是假的；会话还在跑的场景下也不能为一个校验不过的还原点白杀进程。
+    const meta = ctx.checkpoints.metaOf(checkpointId);
+    if (!meta) {
       this.post(ctx, { kind: "error", message: "找不到该还原点。" });
       return;
     }
@@ -1893,21 +1897,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 顺带取回该消息随附的图片——截断后 transcript 里这条消息就没了，必须趁
     // 截断前拿到，稍后随草稿一起回填输入框。
     const nextTurn =
-      ctx.sessionId && result.truncateLine > 0
-        ? this.store.firstUserTurnAfter(ctx.sessionId, result.truncateLine)
+      ctx.sessionId && meta.truncateLine > 0
+        ? this.store.firstUserTurnAfter(ctx.sessionId, meta.truncateLine)
         : undefined;
-    if (ctx.sessionId && result.truncateLine > 0 && result.userText && nextTurn !== undefined) {
+    if (ctx.sessionId && meta.truncateLine > 0 && meta.userText && nextTurn !== undefined) {
       const norm = (t: string) => t.replace(/\s+/g, " ").trim().slice(0, 80);
       // 纯图片轮次 beginTurn 存的是占位符「(图片)」，正文无从比对——改验「该轮
       // 确实是纯图片消息」；此前拿占位符硬比后面某轮的文本，纯图片还原必被误拦。
       const aligned =
-        result.userText === "(图片)"
+        meta.userText === "(图片)"
           ? nextTurn.images.length > 0 && !norm(nextTurn.text)
-          : norm(nextTurn.text) === norm(result.userText);
+          : norm(nextTurn.text) === norm(meta.userText);
       if (!aligned) {
         this.output.appendLine(
-          `[restore] 中止：还原点与 transcript 对不上 truncateLine=${result.truncateLine} ` +
-            `期望提问=${JSON.stringify(norm(result.userText))} 实际=${JSON.stringify(norm(nextTurn.text))} ` +
+          `[restore] 中止：还原点与 transcript 对不上 truncateLine=${meta.truncateLine} ` +
+            `期望提问=${JSON.stringify(norm(meta.userText))} 实际=${JSON.stringify(norm(nextTurn.text))} ` +
             `图片=${nextTurn.images.length}`,
         );
         this.post(ctx, {
@@ -1918,12 +1922,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // 1) Stop the live process AND wait for it to exit — a dying CLI can still
-    //    flush transcript lines after our truncation, undoing the rewind.
-    const proc = ctx.proc;
-    ctx.proc = undefined;
-    ctx.starting = undefined;
-    if (proc) await proc.disposeAndWait();
+    // 1) 会话还在跑就先自动停止，并等进程真正退出——垂死的 CLI 仍可能在截断后
+    //    flush transcript 行；进行中的工具（长 Bash、流式写文件）也会把刚还原
+    //    的文件又改回去，所以停进程必须发生在回滚文件之前。写成循环是为了补杀：
+    //    disposeAndWait 最长等 5s，期间用户可能抢发消息又拉起新进程（spawn 时
+    //    ctx.proc 同步就位）——不补的话它会在截断后继续写 transcript，把回退
+    //    当场冲掉。
+    const wasLive = !!ctx.proc?.isBusy;
+    // 忙时先给界面一个零延迟的「已停止、正在还原」过渡态：下面等进程真实退出
+    // 实测要 1~3s（上限 5s），期间流已被静默、界面却毫无反应，观感就是卡死。
+    if (wasLive) this.post(ctx, { kind: "restoring" });
+    while (ctx.proc) {
+      const dying = ctx.proc;
+      ctx.proc = undefined;
+      ctx.starting = undefined;
+      await dying.disposeAndWait(); // 自带 5s 上限，握手期进程也涵盖
+    }
+    // dispose 之后进程被静默，busy:false / result 都不会再来——不补这条复位，
+    // 中途还原后 webview 会永远停在「回复中」：停止按钮常驻、光圈一直转、新消
+    // 息全进等待队列，用户得再手点一次停止才能解套。（没进程在跑时是空操作。）
+    this.post(ctx, { kind: "busy", busy: false });
+
+    // 校验已过、进程已停——现在才真正回滚文件并丢弃该点之后的还原点。
+    const result = ctx.checkpoints.restore(checkpointId);
+    if (!result) {
+      this.post(ctx, { kind: "error", message: "找不到该还原点。" });
+      return;
+    }
 
     // 2) Truly rewind the conversation: truncate the transcript so a future
     //    --resume makes Claude forget everything after this point.
@@ -1941,7 +1966,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.output.appendLine(
       `[restore] session=${(ctx.sessionId ?? "-").slice(0, 8)} truncateLine=${result.truncateLine} ` +
         `剩余真人提问=${remainingTurns} 文件剩余行=${ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0} ` +
-        `还原文件=${result.restoredFiles} ${rewoundToStart ? "→ 回到开头，转为新对话" : "→ 保留会话并 --resume"}`,
+        `还原文件=${result.restoredFiles} 自动停止=${wasLive ? "是" : "否"} ` +
+        `${rewoundToStart ? "→ 回到开头，转为新对话" : "→ 保留会话并 --resume"}`,
     );
     if (rewoundToStart) {
       ctx.sessionId = undefined;
@@ -1961,7 +1987,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       : "";
     this.post(ctx, {
       kind: "notice",
-      message: `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。${skippedNote}下一条消息将从这里继续。`,
+      message:
+        `${wasLive ? "已自动停止进行中的回复。" : ""}` +
+        `已还原 ${result.restoredFiles} 个文件，并把对话回退到这条消息之前。${skippedNote}下一条消息将从这里继续。`,
     });
     // 被回退掉的那轮提问自动带回输入框（含随附图片），方便改完重发（webview
     // 侧输入框非空时不覆盖）；同步宿主侧留底，看门狗重建 webview 后也不丢。

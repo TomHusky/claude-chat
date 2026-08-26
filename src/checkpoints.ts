@@ -151,6 +151,13 @@ export class CheckpointManager {
     return c ? { userText: c.label } : undefined;
   }
 
+  /** 还原点元数据（截断行 + 完整提问原文），不产生任何副作用——还原前的
+   *  安全校验用它，校验不过时工作区必须原封不动。 */
+  metaOf(checkpointId: string): { truncateLine: number; userText: string } | undefined {
+    const c = this.checkpoints.find((x) => x.id === checkpointId);
+    return c ? { truncateLine: c.truncateLine, userText: c.userText } : undefined;
+  }
+
   /** All file paths touched during this session (incl. pruned-away turns). */
   changedPaths(): string[] {
     const set = new Set<string>(this.baseline.keys());

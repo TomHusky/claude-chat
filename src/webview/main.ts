@@ -894,6 +894,16 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
     case "busy":
       setBusy(m.busy);
       break;
+    case "restoring":
+      // 还原正在自动停止本轮：进程真实退出要等 1~5s，宿主动手杀之前先发这条，
+      // 让界面零延迟进入「已停止、正在还原」的过渡态——否则流被静默后药丸还在
+      // 转，看起来就是卡死几秒。composer 保持锁定（等 busy:false 解锁），这几
+      // 秒里回车的消息照常进等待队列，还原完成后会发进回退后的会话。
+      // 注意不置 userStopped：还原走整页重载收尾，不该给某轮盖「已中断」标记。
+      freezeLiveStream();
+      setGlow("idle");
+      statusLine.textContent = "正在停止回复并还原…";
+      break;
     case "status":
       // Host-driven transient hint (e.g. cold-start context loading). Cleared
       // as soon as the stream produces anything, or when the turn ends.
@@ -1837,6 +1847,21 @@ let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: str
 function loadHistory(items: TimelineItem[], checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
   historyState = { items, checkpoints: checkpoints || [] };
   if (sessionId) vscode.setState({ sessionId });
+  // 整页重载是从 transcript 权威重建，绝不能带出合成标记：还原过渡那几秒里用
+  // 户若又点了停止，残留的 userStopped 会让 renderHistory 收尾的 finalizeTurn
+  // 给最后一轮错盖「[Request interrupted by user]」。
+  userStopped = false;
+  // 中途还原会把进程直接杀掉，收尾事件（result/compacted）永远不会来——宿主已
+  // 补过 busy:false 的话，这里还挂着的「运行中/等待授权」光圈和压缩转圈全是
+  // 残留，一并收掉。done/error 的呼吸光圈是未读标记，保留；正常打开会话时本就
+  // idle，这几行是空操作；编辑重发流程 webview 先置忙（isBusy=true），不受影响。
+  if (!isBusy) {
+    if (glowState === "running" || glowState === "waiting") setGlow("idle");
+    if (compacting) {
+      compacting = false;
+      ctxGauge.classList.remove("compacting");
+    }
+  }
   renderHistory(false);
 }
 
@@ -2563,12 +2588,11 @@ function renderQueue() {
 
 sendBtn.onclick = doSend;
 let userStopped = false; // user hit Stop — append an interrupted marker on finalize
-stopBtn.onclick = () => {
-  userStopped = true;
-  setGlow("idle"); // deliberate cancel — not a failure
-  // Drop everything still in flight for this turn: deltas buffered in the pipe
-  // (or a slow interrupt) would otherwise keep "typing" after the button
-  // already flipped — the classic "stopped but still replying" bug.
+/** 立刻把直播观感「停」下来：吞掉后续流事件、冻结打字机尾巴、收起活动药丸和
+ *  左侧进度脉冲。Stop 按钮与还原的自动停止（restoring）共用，观感必须一致。
+ *  finalizeTurn 也会做后两样，但它要等宿主的 result 落地——那可能比点击晚好
+ *  几秒，期间药丸/脉冲还在动就是经典的「停了还在打字」bug。 */
+function freezeLiveStream() {
   stoppingView = true;
   if (liveBlock) {
     // Freeze the typewriter tail. Don't cut between the two halves of a
@@ -2578,19 +2602,24 @@ stopBtn.onclick = () => {
     liveBlock.raw = liveBlock.raw.slice(0, cut);
     liveBlock.shown = cut;
   }
+  removeWorking();
+  if (assistantEl) {
+    assistantEl.classList.remove("streaming-turn");
+    assistantEl.querySelector(".thread-active")?.remove();
+  }
+}
+stopBtn.onclick = () => {
+  userStopped = true;
+  setGlow("idle"); // deliberate cancel — not a failure
+  // Drop everything still in flight for this turn: deltas buffered in the pipe
+  // (or a slow interrupt) would otherwise keep "typing" after the button
+  // already flipped — the classic "stopped but still replying" bug.
+  freezeLiveStream();
   send({ type: "interrupt" });
   // Optimistic: react to the click itself with zero latency. The host confirms
   // with a busy:false, and the final `result` appends the interrupted marker.
   isBusy = false;
   refreshComposerHint();
-  removeWorking();
-  // Stop the left-rail progress pulse NOW. finalizeTurn also does this, but it
-  // only runs when the host's `result` lands — which can lag seconds behind the
-  // click, leaving the rail animating after "stopped". (bug: rail kept moving.)
-  if (assistantEl) {
-    assistantEl.classList.remove("streaming-turn");
-    assistantEl.querySelector(".thread-active")?.remove();
-  }
 };
 /** True from Stop-click until the next turn starts: render nothing new. */
 let stoppingView = false;

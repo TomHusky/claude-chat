@@ -70,6 +70,9 @@ export type ToWebview =
    *  init event) — the picker syncs to this, never to a local guess. */
   | { kind: "session"; sessionId: string; model: string; cwd: string; tools: string[]; resumed?: boolean; permissionMode?: string }
   | { kind: "busy"; busy: boolean }
+  /** 还原点回退正在自动停止进行中的回复：界面立刻冻结直播观感并给出过渡提示，
+   *  等待随后的 busy:false + load_history 收尾（进程真实退出最长要等 5s）。 */
+  | { kind: "restoring" }
   | { kind: "status"; label: string }
   | { kind: "block_start"; blockType: "text" | "thinking" | "tool_use"; toolId?: string; toolName?: string }
   | { kind: "text_delta"; text: string }

@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.357",
+  "version": "0.1.359",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -100,7 +100,7 @@
       },
       {
         "command": "claude-chat.notifyConfig",
-        "title": "Claude: 任务完成推送配置",
+        "title": "Claude: 任务推送配置",
         "icon": "$(bell)"
       },
       {
@@ -260,13 +260,13 @@
         "claudeChat.notifyWebhook": {
           "type": "string",
           "default": "",
-          "description": "任务完成推送的 webhook 地址。填飞书/企业微信/钉钉群机器人的 webhook 可直接收到文本消息；其他地址会收到通用 JSON（{text, isError, durationMs, project, question}）。留空关闭推送。"
+          "description": "任务推送的 webhook 地址（长任务完成、以及 Claude 停下来等你输入时提醒）。填飞书/企业微信/钉钉群机器人的 webhook 可直接收到文本消息；其他地址会收到通用 JSON（{text, isError, durationMs, project, question}，等待输入推送另带 waiting:true 与 ask）。留空关闭推送。"
         },
         "claudeChat.notifyMinDurationSec": {
           "type": "number",
           "default": 60,
           "minimum": 0,
-          "description": "任务执行时长达到该秒数才推送（默认 60 秒）。"
+          "description": "任务执行时长达到该秒数才推送完成通知（默认 60 秒）；等待输入的提醒同用此阈值——距你上次操作超过该秒数才推。"
         },
         "claudeChat.pythonPath": {
           "type": "string",

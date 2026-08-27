@@ -51,7 +51,7 @@ code --install-extension release/claude-chat.vsix --force
 
 - 🤖 **QQ 机器人**：接入 QQ 开放平台，手机上发消息即可远程操控 Claude 干活。白名单授权 + 配对模式；支持 `/help` `/status` `/usage` `/model` `/effort` `/compact` `/clear` `/stop` 命令。多窗口自动选主，全局只保持一个机器人连接
 - 📈 **SLS 日志查询**：接入阿里云 SLS，让 Claude 直接查生产日志辅助排查；支持**多账号**（独立配置面板，卡片式管理），按应用/项目自动路由到对应账号
-- 🔔 **任务完成推送**：长任务跑完时向 webhook（飞书/企微/钉钉群机器人）推一条通知，任务耗时超过阈值即推。面板标题栏铃铛图标（或命令 `Claude: 任务完成推送配置`）打开配置页，可发测试消息
+- 🔔 **任务推送**：长任务跑完时向 webhook（飞书/企微/钉钉群机器人）推一条通知，任务耗时超过阈值即推；Claude 停下来等你输入（工具授权 / 选项提问）且你离开超过同一阈值时，也推一条「等你输入」提醒（后台会话同样生效）。面板标题栏铃铛图标（或命令 `Claude: 任务推送配置`）打开配置页，可发测试消息
 - ⌨️ **斜杠命令**：输入框支持 `/help` `/clear` `/compact` `/model` `/effort` `/usage`，未知的 `/` 命令原样透传给 CLI（不吞掉 skills）
 - 🔄 **插件更新**：每 3 小时自动检测新版本，侧边栏亮起「发现新版本 · 点击更新」横幅，点击一键下载安装；也可命令面板 `Claude: 检查更新`
 
@@ -70,8 +70,8 @@ code --install-extension release/claude-chat.vsix --force
 | `claudeChat.prewarmMaxSizeMB` | 超过此大小不再预热，改为建议压缩；`0` 表示不限制 | `12` |
 | `claudeChat.turnStallTimeoutSec` | 一轮对话允许的最大完全静默秒数，超时判定卡死并自愈 | `720` |
 | `claudeChat.qqBotPermissionMode` | QQ 机器人专用会话的权限模式 | `acceptEdits` |
-| `claudeChat.notifyWebhook` | 任务完成推送的 webhook（支持飞书/企微/钉钉群机器人），留空关闭 | `""` |
-| `claudeChat.notifyMinDurationSec` | 任务时长达到该秒数才推送 | `60` |
+| `claudeChat.notifyWebhook` | 任务推送的 webhook（完成 + 等待输入提醒，支持飞书/企微/钉钉群机器人），留空关闭 | `""` |
+| `claudeChat.notifyMinDurationSec` | 任务时长达到该秒数才推完成通知；等待输入提醒同用此阈值（距上次操作） | `60` |
 | `claudeChat.pythonPath` | SLS 查询引擎初始化用的 python3 路径 | `""` |
 
 ## 快捷键

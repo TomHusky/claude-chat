@@ -50,6 +50,10 @@ interface SessionCtx {
   sendAt?: number;
   /** 本轮提问原文（截断留底）——任务完成 webhook 推送时带上，让通知可读。 */
   lastUserText?: string;
+  /** 用户最近一次动作的时刻（发消息/点停止/答授权/答提问；等待推送发出后也会
+   *  刷新，兼作冷却锚点）。等待输入的 webhook 推送用它判断「人多半已走开」：
+   *  距它超过阈值才推，连续多个等待按间隔冷却不刷屏。 */
+  lastUserActionAt?: number;
   /** 轮次看门狗：本轮最后一次收到任何 CLI 事件的时刻；有值 = 轮次进行中。
    *  CLI 有已知的静默 hang 缺陷（stream-json 多轮、result 后不退出等），一旦发生
    *  我们永远等不到 result、界面永远转圈。超过静默上限就判定卡死并自愈。 */
@@ -1301,6 +1305,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "interrupt":
           ctx.pendingPerm = undefined;
+          ctx.lastUserActionAt = Date.now(); // 点停止也是在场证明
           ctx.lastEventAt = undefined; // 用户主动停止，本轮不再受看门狗管辖
           ctx.stopSeq = ctx.sendSeq ?? 0; // cancel every send already in flight (incl. mid-spawn)
           this.post(ctx, { kind: "busy", busy: false }); // instant UI feedback regardless of CLI latency
@@ -1321,12 +1326,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
         case "permission":
           ctx.pendingPerm = undefined;
+          ctx.lastUserActionAt = Date.now(); // 答复授权 = 人在屏幕前
           // 挂起期间不计时（checkTurnStall 跳过），答复后从现在重新起算。
           if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
           this.handlePermission(ctx, m.requestId, m.behavior, m.suggestionId);
           break;
         case "answerQuestion":
           ctx.pendingPerm = undefined;
+          ctx.lastUserActionAt = Date.now(); // 答复提问 = 人在屏幕前
           if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
           ctx.proc?.answerQuestion(m.requestId, m.answers);
           break;
@@ -1574,6 +1581,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctx.sendAt = Date.now(); // 埋点：首个流事件到达时计算真实等待时长
     ctx.lastEventAt = ctx.sendAt; // 轮次看门狗开始计时（任何事件都会刷新它）
     ctx.lastUserText = (text || "(图片)").slice(0, 200); // 完成推送的通知正文用
+    ctx.lastUserActionAt = ctx.sendAt; // 等待输入推送的「用户在场」锚点
     this.output.appendLine(
       `[${new Date().toISOString()}] [send] session=${ctx.sessionId?.slice(0, 8)} 正文${text.length}字 附加${attached?.length ?? 0}字 图片${images?.length ?? 0}`,
     );
@@ -2488,7 +2496,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     const panel = vscode.window.createWebviewPanel(
       "claude-chat.notify",
-      "任务完成推送",
+      "任务推送",
       { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
       { enableScripts: true, retainContextWhenHidden: true },
     );
@@ -2581,8 +2589,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
 <div class="wrap">
-  <h2>🔔 任务完成推送</h2>
-  <div class="sub">长任务跑完时向 webhook 推一条通知：任务耗时达到阈值即推送。</div>
+  <h2>🔔 任务推送</h2>
+  <div class="sub">长任务跑完时向 webhook 推一条通知：任务耗时达到阈值即推送。Claude 停下来等你输入（工具授权 / 选项提问）且你离开超过同一阈值时，也会推一条「等你输入」。</div>
   <label class="f"><span>Webhook 地址</span><input id="webhook" type="text" spellcheck="false" placeholder="飞书/企业微信/钉钉群机器人的 webhook，或任意接收 JSON 的地址" /></label>
   <label class="f"><span>耗时阈值（秒）</span><input id="minsec" type="number" min="0" step="10" placeholder="60" /></label>
   <div id="status" class="status hidden"></div>
@@ -2590,7 +2598,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <button id="test" class="btn">发送测试消息</button>
     <button id="save" class="btn primary">保存</button>
   </div>
-  <div class="sub">飞书 / 企业微信 / 钉钉的群机器人按域名自动适配报文格式，直接收到文本；其他地址收到通用 JSON：{ text, isError, durationMs, project, question }。配置与 VS Code 设置（claudeChat.notifyWebhook / notifyMinDurationSec）互通。</div>
+  <div class="sub">飞书 / 企业微信 / 钉钉的群机器人按域名自动适配报文格式，直接收到文本；其他地址收到通用 JSON：{ text, isError, durationMs, project, question }（等待输入的推送另带 waiting:true 与 ask）。配置与 VS Code 设置（claudeChat.notifyWebhook / notifyMinDurationSec）互通。</div>
 </div>
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
@@ -3826,6 +3834,51 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  /** AI 停下来等用户输入（工具授权 / AskUserQuestion 选项提问）的 webhook 推送。
+   *  语义是「提示晾着没人管才提醒」：不能在提示弹出的瞬间判断——那时多半刚发完
+   *  消息、距上次操作不足阈值，而“问题弹出后人才走开”恰是主场景，一次性判断
+   *  永远推不出来。改为定时到「距上次用户动作满阈值」的时刻再看：这条提示仍挂
+   *  着没被答复才推。答复/停止/新消息都会清 pendingPerm、还原会换掉 proc，定时
+   *  器醒来自证作废；CLI 等答复期间不会弹新提示，一条提示至多推一次，天然不刷
+   *  屏。复用完成推送的 webhook 与阈值配置，失败只记日志，绝不影响会话流程。 */
+  private maybeNotifyWaiting(ctx: SessionCtx, req: PermissionRequest): void {
+    const cfg = vscode.workspace.getConfiguration("claudeChat");
+    const url = (cfg.get<string>("notifyWebhook") || "").trim();
+    if (!url) return;
+    const minSec = cfg.get<number>("notifyMinDurationSec") ?? 60;
+    const since = ctx.lastUserActionAt ?? Date.now();
+    const delay = Math.max(0, minSec * 1000 - (Date.now() - since));
+    const proc = ctx.proc;
+    setTimeout(() => {
+      if (ctx.proc !== proc) return; // 进程已被换掉/杀掉（还原、重启），提示已作废
+      const pend = ctx.pendingPerm;
+      if (pend?.kind !== "permission_request" || pend.requestId !== req.requestId) return; // 已被答复/清除
+      const waited = Date.now() - (ctx.lastUserActionAt ?? since);
+      const mins = Math.floor(waited / 60000);
+      const secs = Math.round((waited % 60000) / 1000);
+      const durText = mins ? `${mins} 分 ${secs} 秒` : `${secs} 秒`;
+      const proj = vscode.workspace.workspaceFolders?.[0]?.name ?? "";
+      // 只读不消费 lastUserText——本轮收尾的完成推送还要用它。
+      const q = (ctx.lastUserText ?? "").replace(/\s+/g, " ").slice(0, 80);
+      let ask: string;
+      if (req.toolName === "AskUserQuestion") {
+        const qs = (req.input as { questions?: { question?: string }[] } | undefined)?.questions;
+        const first = (qs?.[0]?.question ?? "").replace(/\s+/g, " ").slice(0, 80);
+        ask = `待回答：${first || "（选项提问）"}${qs && qs.length > 1 ? `（共 ${qs.length} 问）` : ""}`;
+      } else {
+        ask = `待授权：${req.displayName || req.toolName}`;
+      }
+      const msg =
+        `⏳ Claude 正在等你输入（距上次操作 ${durText}）` +
+        `${proj ? `\n项目：${proj}` : ""}\n${ask}${q ? `\n本轮提问：${q}` : ""}`;
+      void this.sendWebhook(url, msg, { waiting: true, project: proj, question: q, ask }).then((r) =>
+        this.output.appendLine(
+          `[${new Date().toISOString()}] [notify] ${r.ok ? `等待输入推送 HTTP ${r.status}` : `等待输入推送失败: ${r.error}`}`,
+        ),
+      );
+    }, delay);
+  }
+
   /** 按目标域名适配报文：飞书/企微/钉钉群机器人收纯文本，其他地址收通用 JSON。 */
   private async sendWebhook(
     url: string,
@@ -3963,6 +4016,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // replay it (the process keeps waiting in the meantime). Cleared on answer.
     ctx.pendingPerm = msg;
     if (this.alive(ctx)) this.post(ctx, msg);
+    // 后台/前台会话都提醒：等的就是不在屏幕前的人。
+    this.maybeNotifyWaiting(ctx, req);
   }
 
   private onSessionId(ctx: SessionCtx, id: string, resumed: boolean): void {

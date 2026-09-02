@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.359",
+  "version": "0.1.360",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -285,7 +285,7 @@
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.223",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.258",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.90.0",

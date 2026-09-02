@@ -3033,10 +3033,12 @@ const MODES = [
 ];
 const MODELS = [
   { id: "", label: "默认模型", short: "默认", desc: "使用 CLI 默认模型" },
-  { id: "opus", label: "Claude Opus 5", short: "Opus", desc: "最强 · 复杂任务" },
+  // id 用 CLI 别名（fable/opus/…），CLI 升级后自动指向该系最新模型；label 跟随
+  // 当前线上版本手动更新（对齐 platform.claude.com 模型总览）。
+  { id: "fable", label: "Claude Fable 5.1", short: "Fable", desc: "最强 · 深度推理与长程任务" },
+  { id: "opus", label: "Claude Opus 5", short: "Opus", desc: "复杂编码 · 企业级任务" },
   { id: "sonnet", label: "Claude Sonnet 5", short: "Sonnet", desc: "均衡 · 日常编码" },
   { id: "haiku", label: "Claude Haiku 4.5", short: "Haiku", desc: "最快 · 轻量任务" },
-  { id: "fable", label: "Fable 5", short: "Fable", desc: "" },
 ];
 // Reasoning-effort levels — labels + wording aligned with Claude Code's `/effort`.
 const EFFORTS = [

@@ -3785,6 +3785,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // post() safely no-ops if this ctx's panel was closed (detached/background).
     this.post(ctx, e);
     // Track streaming state to drive the "active" green dot in the session list.
+    // CLI 自己撤回了一条权限询问（中断、轮次结束、abort）：宿主侧的挂起记录要同步
+    // 清掉，否则 checkTurnStall 一直以为「在等用户答复」而永不判定卡死——一次
+    // 卡死的 /compact 就这样挂了 20 分钟没人管。只清同一条，别误清更新的询问。
+    if (e.kind === "permission_resolved" && ctx.pendingPerm?.kind === "permission_request" && ctx.pendingPerm.requestId === e.requestId) {
+      ctx.pendingPerm = undefined;
+    }
     if (e.kind === "busy") this.broadcastRunning();
     // Refresh the changed-files panel when a turn finishes or a file result lands.
     if (e.kind === "result" || (e.kind === "tool_result" && !e.isError)) {
@@ -3794,6 +3800,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     if (e.kind === "result") {
       ctx.sendAt = undefined; // 秒错的轮次没有流事件——别把时间戳漏进下一轮的测量
       ctx.lastEventAt = undefined; // 轮次正常收尾，停掉看门狗
+      ctx.pendingPerm = undefined; // 轮次已结束不可能还有挂起询问；残留会让看门狗跳过下一轮（如 /compact）
       this.output.appendLine(
         `[${new Date().toISOString()}] [turn] session=${ctx.sessionId?.slice(0, 8)} 完成 ${e.durationMs}ms 轮次${e.numTurns}${e.isError ? " (出错)" : ""}`,
       );

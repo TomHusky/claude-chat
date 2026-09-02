@@ -228,12 +228,7 @@ function finalizeTurn() {
     // "Empty" must ignore the thread-line/active scaffolding that now lives in
     // the body — a contentless turn (e.g. the /compact summarization pass)
     // otherwise survives as a ghost avatar with an action row.
-    const hasContent =
-      body &&
-      Array.from(body.children).some(
-        (c) => !c.classList.contains("thread-line") && !c.classList.contains("thread-active") && !c.classList.contains("working-pill"),
-      );
-    if (body && !hasContent) {
+    if (body && !assistantHasContent(assistantEl)) {
       assistantEl.remove();
     } else if (body) {
       // Mark the final summary text as the closing timeline node (a dot at its
@@ -258,6 +253,17 @@ function finalizeTurn() {
   userStopped = false;
   assistantEl = null;
   liveBlock = null;
+}
+
+/** 气泡里除脚手架（时间线、活动脉冲、转圈药丸）外是否还有真正内容。 */
+function assistantHasContent(msg: HTMLElement): boolean {
+  const body = msg.querySelector(".msg-body");
+  return (
+    !!body &&
+    Array.from(body.children).some(
+      (c) => !c.classList.contains("thread-line") && !c.classList.contains("thread-active") && !c.classList.contains("working-pill"),
+    )
+  );
 }
 
 /** The turn is over — any interactive UI still waiting for the user (question
@@ -2629,6 +2635,16 @@ stopBtn.onclick = () => {
   // (or a slow interrupt) would otherwise keep "typing" after the button
   // already flipped — the classic "stopped but still replying" bug.
   freezeLiveStream();
+  // 停的可能是一次卡死的压缩：result 永远不会来，仪表盘转圈和只剩头像的空气泡
+  // 不能等它收尾，这里直接清。有内容的气泡照旧等 result 盖「已中断」标记。
+  if (compacting) {
+    compacting = false;
+    ctxGauge.classList.remove("compacting");
+  }
+  if (assistantEl && !assistantHasContent(assistantEl)) {
+    assistantEl.remove();
+    assistantEl = null;
+  }
   send({ type: "interrupt" });
   // Optimistic: react to the click itself with zero latency. The host confirms
   // with a busy:false, and the final `result` appends the interrupted marker.

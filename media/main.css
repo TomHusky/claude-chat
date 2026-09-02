@@ -1491,6 +1491,29 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   background: rgba(128,128,128,.14); border-radius: 5px; padding: 2px 6px;
   white-space: nowrap;
 }
+/* 模型行「›」：打开该家族的历史版本列表 */
+.pick-more {
+  flex: 0 0 auto; width: 18px; height: 18px; border-radius: 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--vscode-descriptionForeground);
+}
+.pick-more svg { width: 13px; height: 13px; display: block; }
+.pick-more:hover { background: rgba(128,128,128,.22); color: var(--vscode-foreground); }
+/* 历史版本子菜单：贴在模型菜单右侧、与所点家族行对齐 */
+.pick-sub {
+  position: absolute; left: calc(100% + 6px); top: 0; z-index: 42;
+  min-width: 196px; padding: 5px;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background, #252526));
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-menu-border, var(--vscode-widget-border, rgba(128,128,128,.3)));
+  border-radius: 10px; box-shadow: 0 6px 20px rgba(0,0,0,.45);
+}
+.pick-sub-head { display: flex; align-items: center; justify-content: space-between; }
+.pick-sub-count { font-size: 10.5px; opacity: .7; }
+.pick-date {
+  flex: 0 0 auto; font-family: var(--code-font); font-size: 10px; letter-spacing: .3px;
+  color: var(--vscode-descriptionForeground); white-space: nowrap;
+}
 /* the danger row is separated and coloured — it is not one more mode */
 .pick-row.danger .pick-title { color: #e08a78; }
 .pick-row.danger .pick-ico { background: rgba(199,78,57,.14); color: #e08a78; }

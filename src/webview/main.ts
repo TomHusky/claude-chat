@@ -3047,13 +3047,36 @@ const MODES = [
   // back to MODES[0] would label the most dangerous mode "发送前确认".
   { id: "bypassPermissions", icon: ICONS.bypassPermissions, title: "绕过权限", desc: "跳过所有权限检查（危险）" },
 ];
-const MODELS = [
+/** versions：该家族可选的版本，首项是当前版本（沿用别名 id），其余用完整模型 ID
+ *  （CLI 直接认）；date 为发布月份——官网只公布退役日期，但承诺发布后至少一年才
+ *  退役，用已知发布日的 Sonnet 4.5 / Haiku 4.5 核对退役日减一年正好吻合，据此反推。
+ *  Haiku 只有 4.5 在役，没有历史版本。 */
+const MODELS: { id: string; label: string; short: string; desc: string; versions?: { id: string; label: string; date: string }[] }[] = [
   { id: "", label: "默认模型", short: "默认", desc: "使用 CLI 默认模型" },
   // id 用 CLI 别名（fable/opus/…），CLI 升级后自动指向该系最新模型；label 跟随
   // 当前线上版本手动更新（对齐 platform.claude.com 模型总览）。
-  { id: "fable", label: "Claude Fable 5.1", short: "Fable", desc: "最强 · 深度推理与长程任务" },
-  { id: "opus", label: "Claude Opus 5", short: "Opus", desc: "复杂编码 · 企业级任务" },
-  { id: "sonnet", label: "Claude Sonnet 5", short: "Sonnet", desc: "均衡 · 日常编码" },
+  {
+    id: "fable", label: "Claude Fable 5.1", short: "Fable", desc: "最强 · 深度推理与长程任务",
+    versions: [{ id: "fable", label: "Fable 5.1", date: "" }, { id: "claude-fable-5", label: "Fable 5", date: "2026-06" }],
+  },
+  {
+    id: "opus", label: "Claude Opus 5", short: "Opus", desc: "复杂编码 · 企业级任务",
+    versions: [
+      { id: "opus", label: "Opus 5", date: "" },
+      { id: "claude-opus-4-8", label: "Opus 4.8", date: "2026-05" },
+      { id: "claude-opus-4-7", label: "Opus 4.7", date: "2026-04" },
+      { id: "claude-opus-4-6", label: "Opus 4.6", date: "2026-02" },
+      { id: "claude-opus-4-5", label: "Opus 4.5", date: "2025-11" },
+    ],
+  },
+  {
+    id: "sonnet", label: "Claude Sonnet 5", short: "Sonnet", desc: "均衡 · 日常编码",
+    versions: [
+      { id: "sonnet", label: "Sonnet 5", date: "" },
+      { id: "claude-sonnet-4-6", label: "Sonnet 4.6", date: "2026-02" },
+      { id: "claude-sonnet-4-5", label: "Sonnet 4.5", date: "2025-09" },
+    ],
+  },
   { id: "haiku", label: "Claude Haiku 4.5", short: "Haiku", desc: "最快 · 轻量任务" },
 ];
 // Reasoning-effort levels — labels + wording aligned with Claude Code's `/effort`.
@@ -3080,8 +3103,16 @@ function syncPickers() {
   };
   modeIcon.innerHTML = mode.icon;
   modeLabel.textContent = mode.title;
-  const model = MODELS.find((x) => x.id === currentModel) || MODELS[0];
-  modelLabel.textContent = model.label;
+  const model = MODELS.find((x) => x.id === currentModel);
+  let text = model?.label;
+  if (!text) {
+    // 选的是历史版本（完整模型 ID）：显示该版本，而不是回落成「默认模型」。
+    for (const f of MODELS) {
+      const v = f.versions?.find((x) => x.id === currentModel);
+      if (v) { text = `Claude ${v.label}`; break; }
+    }
+  }
+  modelLabel.textContent = text || MODELS[0].label;
 }
 
 syncPickers(); // paint the real labels immediately (host `config` refines them)
@@ -3111,10 +3142,16 @@ function buildModeMenu() {
 function buildModelMenu() {
   let html = `<div class="pick-head">模型</div>`;
   for (const m of MODELS) {
-    const on = m.id === currentModel;
+    const vs = m.versions || [];
+    const ver = vs.find((v) => v.id === currentModel);
+    const on = m.id === currentModel || !!ver;
     // Short id on the right so the list scans without reading the full names;
     // it yields to the ✓ on the selected row (both would crowd the edge).
-    const tail = on ? `<span class="pick-check">${ICON.check}</span>` : m.id ? `<span class="pick-tag">${m.short}</span>` : "";
+    // 有历史版本的家族行：chip 显示当前选中的版本，再加「›」打开版本列表。
+    const check = on ? `<span class="pick-check">${ICON.check}</span>` : "";
+    const tail = vs.length
+      ? `${check}<span class="pick-tag">${ver && ver.id !== m.id ? ver.label : m.short}</span><span class="pick-more" data-versions="${m.id}" title="历史版本">${ICON.chevronRight}</span>`
+      : on ? check : m.id ? `<span class="pick-tag">${m.short}</span>` : "";
     html +=
       `<button class="pick-row${on ? " on" : ""}" data-model="${m.id}">` +
       `<span class="pick-text"><span class="pick-title">${m.label}</span>${m.desc ? `<span class="pick-desc">${m.desc}</span>` : ""}</span>` +
@@ -3130,6 +3167,40 @@ function buildModelMenu() {
   });
   html += `</span></div>`;
   modelMenu.innerHTML = html;
+}
+
+/** 历史版本子菜单：贴在模型菜单右侧、与所点家族行对齐；再点一次「›」收起。
+ *  侧栏太窄放不下时贴在菜单右缘内侧。 */
+function openVersionMenu(familyId: string) {
+  const fam = MODELS.find((m) => m.id === familyId);
+  if (!fam?.versions) return;
+  const prev = modelMenu.querySelector(".pick-sub") as HTMLElement | null;
+  if (prev) {
+    const same = prev.dataset.family === familyId;
+    prev.remove();
+    if (same) return;
+  }
+  const sub = el("div", "pick-sub");
+  sub.dataset.family = familyId;
+  let html = `<div class="pick-head pick-sub-head"><span>历史版本</span><span class="pick-sub-count">${fam.versions.length}</span></div>`;
+  for (const v of fam.versions) {
+    const cur = v.id === fam.id;
+    const on = currentModel === v.id;
+    html +=
+      `<button class="pick-row${on ? " on" : ""}" data-version="${v.id}">` +
+      `<span class="pick-text"><span class="pick-title">${v.label}</span>${cur ? `<span class="pick-desc">当前版本</span>` : ""}</span>` +
+      (on ? `<span class="pick-check">${ICON.check}</span>` : "") +
+      (cur ? "" : `<span class="pick-date">${v.date}</span>`) +
+      `</button>`;
+  }
+  sub.innerHTML = html;
+  modelMenu.appendChild(sub);
+  const row = modelMenu.querySelector(`[data-model="${familyId}"]`) as HTMLElement | null;
+  if (row) sub.style.top = `${Math.max(0, Math.min(row.offsetTop, modelMenu.clientHeight - sub.offsetHeight))}px`;
+  if (modelMenu.getBoundingClientRect().right + sub.offsetWidth + 8 > window.innerWidth) {
+    sub.style.left = "auto";
+    sub.style.right = "4px";
+  }
 }
 
 /** Anchor a picker directly above its trigger button (same scheme as the
@@ -3186,9 +3257,16 @@ modelMenu.addEventListener("click", (e) => {
     buildModelMenu(); // keep menu open, update dots
     return;
   }
-  const row = t.closest("[data-model]") as HTMLElement | null;
+  const more = t.closest("[data-versions]") as HTMLElement | null;
+  if (more) {
+    e.stopPropagation();
+    openVersionMenu(more.dataset.versions || "");
+    return;
+  }
+  const ver = t.closest("[data-version]") as HTMLElement | null;
+  const row = ver ?? (t.closest("[data-model]") as HTMLElement | null);
   if (!row) return;
-  currentModel = row.dataset.model || "";
+  currentModel = (ver ? row.dataset.version : row.dataset.model) || "";
   send({ type: "setModel", model: currentModel });
   syncPickers();
   closePickers();

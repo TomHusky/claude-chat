@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { ClaudeProcess, PermissionRequest } from "../claude/process";
 import { SessionStore } from "../claude/session";
 import { CheckpointManager, shortLabel } from "../checkpoints";
-import { ChangedFile, CheckpointSummary, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, QQConfig, SlsConfig, ToWebview } from "../shared";
+import { ChangedFile, CheckpointSummary, contextWindowFor, CTX_OPEN, CTX_CLOSE, SLS_CTX_OPEN, SLS_CTX_CLOSE, FromWebview, ICONS, QQConfig, SessionSummary, SlsConfig, ToWebview } from "../shared";
 import { QQBot, QQIncoming, QQState, splitForQQ } from "../qq/bot";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
@@ -495,7 +495,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (view.visible) {
         this.post2(view.webview, {
           kind: "sessions",
-          list: this.store.list(),
+          list: this.withPinned(this.store.list()),
           activeId: this.activeCtx?.sessionId,
           runningIds: this.runningIds(),
         });
@@ -554,7 +554,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       this.view?.webview.postMessage({
         kind: "sessions",
-        list,
+        list: this.withPinned(list),
         activeId: this.activeCtx?.sessionId,
         runningIds: this.runningIds(),
       } satisfies ToWebview);
@@ -1221,6 +1221,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         case "renameSession":
           this.renameSession(m.sessionId, m.title);
+          break;
+        case "pinSession":
+          await this.setPinned(m.sessionId, m.pinned);
           break;
         case "slsLoad":
         case "slsSave":
@@ -2431,6 +2434,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private static readonly QQ_STATE_KEY = "claudeChat.qq";
   private static readonly QQ_SECRET_KEY = "claudeChat.qq.appSecret";
   private static readonly QQ_SESSION_KEY = "claudeChat.qq.sessionId";
+  /** 会话列表里被用户置顶的 sessionId 集合（存 globalState，跨窗口/重启保留）。 */
+  private static readonly PINNED_KEY = "claudeChat.pinnedSessions";
+
+  /** 读出置顶集合。删除会话时旧 id 会残留，但只是查表命中不到、无副作用。 */
+  private pinnedSet(): Set<string> {
+    return new Set(this.context.globalState.get<string[]>(ChatViewProvider.PINNED_KEY) ?? []);
+  }
+
+  /** 给会话摘要打上 pinned 标记（列表分组用），顺序不变，仍按 updatedAt 降序。 */
+  private withPinned(list: SessionSummary[]): SessionSummary[] {
+    const pinned = this.pinnedSet();
+    return list.map((s) => (pinned.has(s.id) ? { ...s, pinned: true } : s));
+  }
+
+  /** 置顶/取消置顶后写回 globalState 并刷新侧边栏。 */
+  private async setPinned(sessionId: string, pinned: boolean): Promise<void> {
+    const set = this.pinnedSet();
+    if (pinned) set.add(sessionId);
+    else set.delete(sessionId);
+    await this.context.globalState.update(ChatViewProvider.PINNED_KEY, [...set]);
+    this.refreshSessions();
+  }
 
   /** 「QQ 机器人」独立配置面板：自己的 HTML、脚本和消息通道，完全不碰侧边栏。 */
   showQQConfig(): void {
@@ -4818,6 +4843,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4.5h10M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3M5 4.5l.6 8a.8.8 0 0 0 .8.7h3.2a.8.8 0 0 0 .8-.7l.6-8"/></svg>';
     const PENCIL =
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 3.2H3.6a1 1 0 0 0-1 1v7.2a1 1 0 0 0 1 1h7.2a1 1 0 0 0 1-1V7.5"/><path d="M11 2.6a1.1 1.1 0 0 1 1.6 1.6L7.8 9 5.6 9.6 6.2 7.4z"/></svg>';
+    // pushpin — 置顶开关与「置顶」组头共用；置顶行由 CSS 填充实心。
+    const PIN =
+      '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5.5 2.6h5M6.6 2.6l-.5 4-2 2v.7h7.8v-.7l-2-2-.5-4M8 9.3V13"/></svg>';
     const EYE =
       '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M1.5 8S4 3.5 8 3.5 14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8Z"/><circle cx="8" cy="8" r="2"/></svg>';
     const EYE_OFF =
@@ -4873,6 +4901,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   .row .del:hover { opacity: 1; color: var(--vscode-errorForeground, #e55); }
   .row .edit svg, .row .del svg { width: 14px; height: 14px; }
   body.multi .row .edit, body.multi .row .del { display: none; }
+  /* 置顶开关：与 edit/del 同款（hover 才现，pinned 行常亮实心图钉）。 */
+  .row .pin { flex: 0 0 auto; opacity: 0; background: none; border: none; color: var(--vscode-foreground); cursor: pointer; padding: 2px; border-radius: 4px; }
+  .row:hover .pin { opacity: .65; }
+  .row .pin:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.25)); }
+  .row .pin svg { width: 14px; height: 14px; }
+  .row.pinned .pin { opacity: .9; }
+  .row.pinned .pin svg { fill: currentColor; }
+  body.multi .row .pin { display: none; }
+  /* 置顶区独立成组：中性浅底一整块，「置顶」组头（图钉 + 计数），「最近」分隔。 */
+  .group-head { display: flex; align-items: center; gap: 6px; padding: 9px 8px 4px; font-size: 11px; opacity: .6; }
+  .group-head svg { width: 12px; height: 12px; flex: 0 0 auto; }
+  .group-head .gh-ttl { flex: 1; }
+  .group-head .gh-count { font-variant-numeric: tabular-nums; opacity: .85; }
+  .pin-zone { background: rgba(127,127,127,.08); border-radius: 8px; padding: 2px; margin: 0 2px 4px; }
+  .recent-head { padding: 6px 8px 3px; font-size: 11px; opacity: .5; }
 </style>
 </head>
 <body>
@@ -4897,6 +4940,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
     const TRASH = ${JSON.stringify(TRASH)};
     const PENCIL = ${JSON.stringify(PENCIL)};
+    const PIN = ${JSON.stringify(PIN)};
     const EYE = ${JSON.stringify(EYE)}, EYE_OFF = ${JSON.stringify(EYE_OFF)};
     let sessions = [], activeId = null, runningIds = new Set(), multi = false;
     const sel = new Set();
@@ -4910,33 +4954,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return (d.getMonth() + 1) + "月" + d.getDate() + "日";
     }
 
+    function makeRow(s) {
+      const row = document.createElement("div");
+      row.className = "row" + (s.id === activeId ? " active" : "") + (s.pinned ? " pinned" : "");
+      row.dataset.id = s.id;
+      const chk = document.createElement("input");
+      chk.type = "checkbox"; chk.className = "chk"; chk.checked = sel.has(s.id);
+      chk.addEventListener("click", (e) => { e.stopPropagation(); toggle(s.id, chk.checked); });
+      const body = document.createElement("div"); body.className = "body";
+      const tRow = document.createElement("div"); tRow.className = "trow";
+      if (runningIds.has(s.id)) { const dot = document.createElement("span"); dot.className = "run-dot"; dot.title = "正在回复中"; tRow.appendChild(dot); }
+      const t = document.createElement("div"); t.className = "t"; t.textContent = s.title || "新对话";
+      tRow.appendChild(t);
+      const meta = document.createElement("div"); meta.className = "meta";
+      meta.textContent = fmt(s.updatedAt) + (s.messageCount ? "  ·  " + s.messageCount + " 条" : "");
+      body.append(tRow, meta);
+      const pin = document.createElement("button"); pin.className = "pin";
+      pin.title = s.pinned ? "取消置顶" : "置顶"; pin.innerHTML = PIN;
+      pin.addEventListener("click", (e) => { e.stopPropagation(); vscode.postMessage({ type: "pinSession", sessionId: s.id, pinned: !s.pinned }); });
+      const edit = document.createElement("button"); edit.className = "edit"; edit.title = "重命名"; edit.innerHTML = PENCIL;
+      edit.addEventListener("click", (e) => { e.stopPropagation(); rename(s.id); });
+      const del = document.createElement("button"); del.className = "del"; del.title = "删除"; del.innerHTML = TRASH;
+      del.addEventListener("click", (e) => { e.stopPropagation(); confirmDel([s.id]); });
+      row.append(chk, body, pin, edit, del);
+      row.addEventListener("click", () => { if (multi) toggle(s.id, !sel.has(s.id)); else open(s.id); });
+      return row;
+    }
+
     function render() {
       const list = $("list");
       if (!sessions.length) { list.innerHTML = '<div class="empty">暂无会话</div>'; return; }
       list.innerHTML = "";
-      for (const s of sessions) {
-        const row = document.createElement("div");
-        row.className = "row" + (s.id === activeId ? " active" : "");
-        row.dataset.id = s.id;
-        const chk = document.createElement("input");
-        chk.type = "checkbox"; chk.className = "chk"; chk.checked = sel.has(s.id);
-        chk.addEventListener("click", (e) => { e.stopPropagation(); toggle(s.id, chk.checked); });
-        const body = document.createElement("div"); body.className = "body";
-        const tRow = document.createElement("div"); tRow.className = "trow";
-        if (runningIds.has(s.id)) { const dot = document.createElement("span"); dot.className = "run-dot"; dot.title = "正在回复中"; tRow.appendChild(dot); }
-        const t = document.createElement("div"); t.className = "t"; t.textContent = s.title || "新对话";
-        tRow.appendChild(t);
-        const meta = document.createElement("div"); meta.className = "meta";
-        meta.textContent = fmt(s.updatedAt) + (s.messageCount ? "  ·  " + s.messageCount + " 条" : "");
-        body.append(tRow, meta);
-        const edit = document.createElement("button"); edit.className = "edit"; edit.title = "重命名"; edit.innerHTML = PENCIL;
-        edit.addEventListener("click", (e) => { e.stopPropagation(); rename(s.id); });
-        const del = document.createElement("button"); del.className = "del"; del.title = "删除"; del.innerHTML = TRASH;
-        del.addEventListener("click", (e) => { e.stopPropagation(); confirmDel([s.id]); });
-        row.append(chk, body, edit, del);
-        row.addEventListener("click", () => { if (multi) toggle(s.id, !sel.has(s.id)); else open(s.id); });
-        list.appendChild(row);
+      const pinned = sessions.filter((s) => s.pinned);
+      const others = sessions.filter((s) => !s.pinned);
+      if (pinned.length) {
+        const gh = document.createElement("div"); gh.className = "group-head";
+        gh.innerHTML = PIN + '<span class="gh-ttl">置顶</span><span class="gh-count">' + pinned.length + '</span>';
+        list.appendChild(gh);
+        const zone = document.createElement("div"); zone.className = "pin-zone";
+        for (const s of pinned) zone.appendChild(makeRow(s));
+        list.appendChild(zone);
+        if (others.length) {
+          const rh = document.createElement("div"); rh.className = "recent-head"; rh.textContent = "最近";
+          list.appendChild(rh);
+        }
       }
+      for (const s of others) list.appendChild(makeRow(s));
     }
 
     function toggle(id, on) { if (on) sel.add(id); else sel.delete(id); $("delsel").classList.toggle("hidden", sel.size === 0); render(); }

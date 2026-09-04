@@ -2723,7 +2723,7 @@ function refreshComposerHint() {
 }
 function autoResize() {
   inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + "px";
+  inputEl.style.height = Math.min(inputEl.scrollHeight, 240) + "px";
 }
 
 /** Collapse the composer's control row to icon-only (and hide the usage
@@ -3770,6 +3770,149 @@ function toolIcon(name: string): string {
   };
   return map[name] || ICON.tool;
 }
+// ---------------------------------------------------------------------------
+// 全局搜索（Cmd/Ctrl+F）：在消息区里查找文本，命中加底色、当前一条描边并滚到视野内。
+// 浮层绝对定位在聊天区右上角，不改变消息布局与滚动位置。
+// ---------------------------------------------------------------------------
+const findBar = el("div", "find-bar hidden");
+const findInput = el("input", "find-input") as HTMLInputElement;
+findInput.type = "text";
+findInput.placeholder = "查找";
+findInput.spellcheck = false;
+const findCount = el("span", "find-count", "—");
+const findPrev = el("button", "find-btn find-prev");
+findPrev.title = "上一处 (⇧↵)";
+findPrev.innerHTML = ICON.chevron;
+const findNext = el("button", "find-btn find-next");
+findNext.title = "下一处 (↵)";
+findNext.innerHTML = ICON.chevron;
+const findClose = el("button", "find-btn find-close", "×");
+findClose.title = "关闭 (Esc)";
+findBar.append(findInput, findCount, findPrev, findNext, findClose);
+$("app").appendChild(findBar);
+
+let findHits: HTMLElement[] = [];
+let findIdx = -1;
+
+/** 拆掉所有 <mark class="find-hit">，把文本还原回原文本节点（父节点归并相邻文本）。 */
+function findClear() {
+  const marks = messagesEl.querySelectorAll("mark.find-hit");
+  const parents = new Set<Node>();
+  marks.forEach((m) => {
+    const p = m.parentNode;
+    if (!p) return;
+    p.replaceChild(document.createTextNode(m.textContent || ""), m);
+    parents.add(p);
+  });
+  parents.forEach((p) => (p as Node).normalize());
+  findHits = [];
+  findIdx = -1;
+}
+
+/** 遍历消息区文本节点，把匹配片段包进 <mark>，返回命中列表（跳过脚本/浮层自身）。 */
+function findCollect(q: string): HTMLElement[] {
+  const marks: HTMLElement[] = [];
+  const lc = q.toLowerCase();
+  const walker = document.createTreeWalker(messagesEl, NodeFilter.SHOW_TEXT, {
+    acceptNode(node: Node) {
+      const v = node.nodeValue;
+      if (!v || !v.toLowerCase().includes(lc)) return NodeFilter.FILTER_REJECT;
+      const p = node.parentElement;
+      if (!p) return NodeFilter.FILTER_REJECT;
+      const tag = p.tagName;
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "MARK") return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const nodes: Text[] = [];
+  let n: Node | null;
+  while ((n = walker.nextNode())) nodes.push(n as Text);
+  for (const node of nodes) {
+    const text = node.nodeValue || "";
+    const lower = text.toLowerCase();
+    const frag = document.createDocumentFragment();
+    let i = 0;
+    let idx = lower.indexOf(lc, i);
+    while (idx !== -1) {
+      if (idx > i) frag.appendChild(document.createTextNode(text.slice(i, idx)));
+      const mark = document.createElement("mark");
+      mark.className = "find-hit";
+      mark.textContent = text.slice(idx, idx + q.length);
+      frag.appendChild(mark);
+      marks.push(mark);
+      i = idx + q.length;
+      idx = lower.indexOf(lc, i);
+    }
+    if (i < text.length) frag.appendChild(document.createTextNode(text.slice(i)));
+    node.parentNode?.replaceChild(frag, node);
+  }
+  return marks;
+}
+
+/** 更新计数、无结果红框，并把当前命中标 .current 且滚到视野中央。 */
+function findMark(scroll: boolean) {
+  findBar.classList.toggle("empty-hits", !!findInput.value && findHits.length === 0);
+  if (!findInput.value) {
+    findCount.textContent = "—";
+  } else if (!findHits.length) {
+    findCount.textContent = "0 / 0";
+  } else {
+    findCount.textContent = `${findIdx + 1} / ${findHits.length}`;
+  }
+  findPrev.disabled = findHits.length === 0;
+  findNext.disabled = findHits.length === 0;
+  findHits.forEach((m, i) => m.classList.toggle("current", i === findIdx));
+  if (scroll && findIdx >= 0) findHits[findIdx].scrollIntoView({ block: "center", behavior: "auto" });
+}
+
+function findRun() {
+  findClear();
+  const q = findInput.value;
+  if (q) {
+    findHits = findCollect(q);
+    findIdx = findHits.length ? 0 : -1;
+  }
+  findMark(true);
+}
+
+function findGoto(delta: number) {
+  if (!findHits.length) return;
+  findIdx = (findIdx + delta + findHits.length) % findHits.length;
+  findMark(true);
+}
+
+function findOpen() {
+  findBar.classList.remove("hidden");
+  findInput.focus();
+  findInput.select();
+  if (findInput.value) findRun();
+}
+function findCloseBar() {
+  findClear();
+  findBar.classList.add("hidden");
+  findBar.classList.remove("empty-hits");
+  inputEl.focus();
+}
+
+findInput.addEventListener("input", findRun);
+findInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); findGoto(e.shiftKey ? -1 : 1); }
+  else if (e.key === "ArrowDown") { e.preventDefault(); findGoto(1); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); findGoto(-1); }
+  else if (e.key === "Escape") { e.preventDefault(); findCloseBar(); }
+});
+findPrev.onclick = () => { findGoto(-1); findInput.focus(); };
+findNext.onclick = () => { findGoto(1); findInput.focus(); };
+findClose.onclick = findCloseBar;
+window.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && (e.key === "f" || e.key === "F")) {
+    e.preventDefault();
+    findOpen();
+  } else if (e.key === "Escape" && !findBar.classList.contains("hidden")) {
+    findCloseBar();
+  }
+}, true);
+
 // ---------------------------------------------------------------------------
 send({ type: "ready" });
 autoResize();

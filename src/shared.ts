@@ -167,6 +167,8 @@ export interface SessionSummary {
   title: string;
   updatedAt: number;
   messageCount: number;
+  /** 用户在会话列表里手动置顶——由宿主根据 globalState 里的置顶集合回填。 */
+  pinned?: boolean;
 }
 
 export interface CheckpointSummary {
@@ -247,6 +249,8 @@ export type FromWebview =
   | { type: "openSession"; sessionId: string }
   | { type: "newInEditor" }
   | { type: "renameSession"; sessionId: string; title: string }
+  /** 会话列表里置顶/取消置顶——宿主把 sessionId 加入/移出 globalState 的置顶集合。 */
+  | { type: "pinSession"; sessionId: string; pinned: boolean }
   | { type: "deleteSessions"; sessionIds: string[] }
   | { type: "restoreCheckpoint"; checkpointId: string }
   /** 从该还原点派生一个新会话（复制截断点之前的对话到新 sessionId，新标签页打开；当前会话不动）。 */

@@ -1684,8 +1684,8 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
   font-family: inherit;
   font-size: inherit;
   line-height: 1.5;
-  min-height: 40px;
-  max-height: 200px;
+  min-height: 62px;
+  max-height: 240px;
 }
 /* The controls wrap as a group; the send button never leaves the right edge. */
 .composer-bottom { display: flex; align-items: flex-end; gap: 8px; }
@@ -1863,3 +1863,47 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 .todo-item.doing .todo-box::before { content: "•"; font-size: 12px; }
 .todo-item.doing .todo-text { color: var(--vscode-foreground); font-weight: 600; }
 .todo-item .todo-text { color: var(--vscode-descriptionForeground); word-break: break-word; }
+
+/* ---- 全局搜索：Cmd/Ctrl+F 唤出的浮层，浮在聊天区右上角，不挤压内容也不改滚动 ---- */
+.find-bar {
+  position: absolute; top: 8px; right: var(--pad-msgs); z-index: 30;
+  display: flex; align-items: center; gap: 3px;
+  padding: 4px 5px;
+  background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border, rgba(128,128,128,.35)));
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.28);
+}
+.find-bar.hidden { display: none; }
+.find-input {
+  width: 150px; font: inherit; font-size: 12.5px;
+  padding: 3px 7px; border-radius: 5px; outline: none;
+  border: 1px solid transparent;
+  background: var(--vscode-input-background); color: var(--vscode-input-foreground);
+}
+.find-input:focus { border-color: var(--vscode-focusBorder, #3794ff); }
+/* 无结果：输入框转红（等宽计数同时显示 0 / 0） */
+.find-bar.empty-hits .find-input { border-color: var(--vscode-inputValidation-errorBorder, #e5534b); }
+.find-count {
+  min-width: 48px; text-align: center; font-size: 11.5px; opacity: .68;
+  font-variant-numeric: tabular-nums; font-feature-settings: "tnum";
+}
+.find-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0; border: none; border-radius: 5px;
+  background: none; color: var(--vscode-foreground); opacity: .68; cursor: pointer;
+}
+.find-btn:hover { opacity: 1; background: var(--vscode-toolbar-hoverBackground, rgba(127,127,127,.2)); }
+.find-btn:disabled { opacity: .3; cursor: default; background: none; }
+.find-btn svg { width: 14px; height: 14px; }
+.find-btn.find-close { font-size: 16px; line-height: 1; }
+.find-prev svg { transform: rotate(180deg); }
+/* 命中处用底色标记；当前一条加描边并自动滚到视野内 */
+mark.find-hit {
+  background: var(--vscode-editor-findMatchHighlightBackground, rgba(234,183,45,.4));
+  color: inherit; border-radius: 2px; padding: 0 .5px;
+}
+mark.find-hit.current {
+  background: var(--vscode-editor-findMatchBackground, rgba(234,140,45,.7));
+  outline: 1px solid var(--vscode-editor-findMatchBorder, #e8b93d); outline-offset: 0;
+}

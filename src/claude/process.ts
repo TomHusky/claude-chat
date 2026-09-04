@@ -12,10 +12,6 @@ export interface ClaudeProcessOptions {
   permissionMode: string;
   /** Resume an existing session id instead of creating a new one. */
   resumeSessionId?: string;
-  /** 与 resumeSessionId 连用：只恢复到这个链条目（含）为止，之后的记录当作被放弃
-   *  的分支——还原点回退的官方实现（Claude Code 自己的 /rewind 就是这么做的），
-   *  不截 transcript。 */
-  resumeSessionAt?: string;
   /** Force a specific session id for a brand new session. */
   sessionId?: string;
   addDirs?: string[];
@@ -150,7 +146,6 @@ export class ClaudeProcess {
       model: this.opts.model || undefined,
       effort: (this.opts.effort || undefined) as Options["effort"],
       resume: this.opts.resumeSessionId,
-      resumeSessionAt: this.opts.resumeSessionId ? this.opts.resumeSessionAt : undefined,
       sessionId: this.opts.resumeSessionId ? undefined : this.opts.sessionId,
       forkSession: this.opts.forkNoPersist ? true : undefined,
       persistSession: this.opts.forkNoPersist ? false : undefined,

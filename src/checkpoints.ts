@@ -44,9 +44,6 @@ export class CheckpointManager {
    *  "revert file" would silently keep those edits while claiming success. */
   private baseline = new Map<string, string | null>();
   private baselineSkipped = new Set<string>();
-  /** 还原点回退后的对话叶子（链条目 uuid）：在 CLI 于新分支上写出记录之前，每次
-   *  resume 都要带上它（resumeSessionAt），否则 CLI 会从被放弃的旧尾巴接着聊。 */
-  private resumeAt?: string;
   private sessionId?: string;
 
   constructor(private readonly storageDir: string) {}
@@ -133,20 +130,6 @@ export class CheckpointManager {
   /** 该还原点记录的截断行数（派生分支用），找不到返回 undefined。 */
   cutLineOf(checkpointId: string): number | undefined {
     return this.checkpoints.find((x) => x.id === checkpointId)?.truncateLine;
-  }
-
-  /** 派生会话时把「截断点之前」的还原点复制给新会话——分支里同样能继续往回还原。
-   *  baseline 一并带上（其中可能存有早期快照被裁剪后的兜底原文）。 */
-  static copyPrefixFor(storageDir: string, srcSessionId: string, destSessionId: string, maxTruncateLine: number): void {
-    try {
-      const raw = fs.readFileSync(path.join(storageDir, `checkpoints-${srcSessionId}.json`), "utf8");
-      const j = JSON.parse(raw) as { checkpoints?: Checkpoint[]; baseline?: unknown; baselineSkipped?: unknown };
-      const kept = (j.checkpoints ?? []).filter((c) => typeof c.truncateLine === "number" && c.truncateLine < maxTruncateLine);
-      const payload = { checkpoints: kept, baseline: j.baseline ?? [], baselineSkipped: j.baselineSkipped ?? [] };
-      fs.writeFileSync(path.join(storageDir, `checkpoints-${destSessionId}.json`), JSON.stringify(payload), { mode: 0o600 });
-    } catch {
-      /* 分支缺还原点不致命——新会话从第一轮重新积累 */
-    }
   }
 
   preview(checkpointId: string): { userText: string } | undefined {
@@ -258,22 +241,86 @@ export class CheckpointManager {
     return { restoredFiles: restored, skipped: [...skippedSet], userText, truncateLine };
   }
 
+  /** 合成还原点（该轮没有文件快照）回退对话时用：截点及之后的真实还原点随被丢弃
+   *  的轮次一起作废；它们的最早快照折进 baseline，保住「已更改文件」的回滚原文。 */
+  pruneFrom(cutLine: number): void {
+    const keep: Checkpoint[] = [];
+    let changed = false;
+    for (const c of this.checkpoints) {
+      if (c.truncateLine < cutLine) {
+        keep.push(c);
+        continue;
+      }
+      changed = true;
+      for (const f of c.files) if (!this.baseline.has(f.path)) this.baseline.set(f.path, f.content);
+      for (const x of c.skipped ?? []) this.baselineSkipped.add(x);
+    }
+    if (!changed) return;
+    this.checkpoints = keep;
+    this.persist();
+  }
+
   clear(): void {
     this.checkpoints = [];
     this.baseline.clear();
     this.baselineSkipped.clear();
-    this.resumeAt = undefined;
     this.persist();
   }
 
-  getResumeAt(): string | undefined {
-    return this.resumeAt;
+  /** 还原 = 派生出新会话替换旧会话后，还原点随之迁移：fork 只复制链记录，行号与原
+   *  文件不同，这里按「同一段提问文本」（纯图片轮次按「带图且无正文」）在新文件里
+   *  单调向前匹配，把 truncateLine 重对齐为该提问所在行之前的行数；对不上的还原点
+   *  已无法安全还原，直接丢弃。随后把持久化文件切到新会话、删除旧文件。 */
+  migrateTo(newSessionId: string, turns: { text: string; hasImages: boolean; line: number }[]): void {
+    const old = this.sessionId;
+    this.checkpoints = CheckpointManager.rebase(this.checkpoints, turns);
+    this.sessionId = newSessionId;
+    this.persist();
+    if (old && old !== newSessionId) CheckpointManager.deleteFor(this.storageDir, old);
   }
 
-  setResumeAt(uuid: string | undefined): void {
-    if (this.resumeAt === uuid) return;
-    this.resumeAt = uuid;
-    this.persist();
+  /** 按提问文本把还原点的 truncateLine 重对齐到另一份 transcript（单调向前匹配；
+   *  纯图片轮次按「带图且无正文」）；对不上的丢弃。 */
+  private static rebase(cps: Checkpoint[], turns: { text: string; hasImages: boolean; line: number }[]): Checkpoint[] {
+    const norm = (t: string) => t.replace(/\s+/g, " ").trim().slice(0, 80);
+    const kept: Checkpoint[] = [];
+    let from = 0;
+    for (const c of cps) {
+      let hit = -1;
+      for (let k = from; k < turns.length; k++) {
+        const t = turns[k];
+        const ok = c.userText === "(图片)" ? t.hasImages && !norm(t.text) : norm(t.text) === norm(c.userText);
+        if (ok) {
+          hit = k;
+          break;
+        }
+      }
+      if (hit < 0) continue;
+      c.truncateLine = turns[hit].line - 1;
+      kept.push(c);
+      from = hit + 1;
+    }
+    return kept;
+  }
+
+  /** 派生会话：把「截断点之前」的还原点复制给新会话并按新文件的提问行重对齐（新会话
+   *  由 SDK forkSession 生成，只含链记录，行号与原文件不同）。baseline 一并带上。 */
+  static forkFor(
+    storageDir: string,
+    srcSessionId: string,
+    destSessionId: string,
+    maxTruncateLine: number,
+    turns: { text: string; hasImages: boolean; line: number }[],
+  ): void {
+    try {
+      const raw = fs.readFileSync(path.join(storageDir, `checkpoints-${srcSessionId}.json`), "utf8");
+      const j = JSON.parse(raw) as { checkpoints?: Checkpoint[]; baseline?: unknown; baselineSkipped?: unknown };
+      const prefix = (j.checkpoints ?? []).filter((c) => typeof c.truncateLine === "number" && c.truncateLine < maxTruncateLine);
+      const payload = { checkpoints: CheckpointManager.rebase(prefix, turns), baseline: j.baseline ?? [], baselineSkipped: j.baselineSkipped ?? [] };
+      fs.writeFileSync(path.join(storageDir, `checkpoints-${destSessionId}.json`), JSON.stringify(payload), { mode: 0o600 });
+    } catch {
+      /* 分支缺还原点不致命——新会话从第一轮重新积累 */
+    }
   }
 
   /** Force any debounced snapshot write to disk (window closing / disposal). */
@@ -303,7 +350,6 @@ export class CheckpointManager {
     this.checkpoints = [];
     this.baseline = new Map();
     this.baselineSkipped = new Set();
-    this.resumeAt = undefined;
     try {
       const raw = JSON.parse(fs.readFileSync(this.file(), "utf8"));
       // Legacy files are a bare array; new ones carry the folded baseline too.
@@ -313,7 +359,6 @@ export class CheckpointManager {
         this.checkpoints = raw.checkpoints;
         for (const [p, c] of raw.baseline ?? []) this.baseline.set(p, c);
         for (const s of raw.baselineSkipped ?? []) this.baselineSkipped.add(s);
-        if (typeof raw.resumeAt === "string") this.resumeAt = raw.resumeAt;
       }
     } catch {
       /* absent/corrupt — start clean */
@@ -342,7 +387,6 @@ export class CheckpointManager {
         checkpoints: this.checkpoints,
         baseline: [...this.baseline],
         baselineSkipped: [...this.baselineSkipped],
-        ...(this.resumeAt ? { resumeAt: this.resumeAt } : {}),
       };
       fs.writeFileSync(this.file(), JSON.stringify(payload), "utf8");
     } catch {
@@ -351,7 +395,7 @@ export class CheckpointManager {
   }
 }
 
-function shortLabel(text: string): string {
+export function shortLabel(text: string): string {
   const t = text.replace(/\s+/g, " ").trim();
   return t.length > 48 ? t.slice(0, 48) + "…" : t || "(空消息)";
 }

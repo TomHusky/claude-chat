@@ -170,7 +170,10 @@ export interface SessionSummary {
 }
 
 export interface CheckpointSummary {
+  /** 真实还原点为 uuid；`turn:<行号>` 是从 transcript 合成的还原点（该轮没有文件
+   *  快照——由官方插件/其它窗口发出的轮次），只能回退对话，不回滚文件。 */
   id: string;
+  synthetic?: boolean;
   label: string;
   createdAt: number;
   userText: string;

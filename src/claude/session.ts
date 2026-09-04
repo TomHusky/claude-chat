@@ -132,19 +132,21 @@ export class SessionStore {
   }
 
   /** Rehydrate a full session transcript into renderable timeline items.
-   *  只读取从叶子沿 parentUuid 链可达的记录（与官方读取器一致）：还原点回退后
-   *  被放弃的旧分支仍留在文件里，但不再显示。`leafUuid` 指定叶子（回退后、CLI
-   *  还没在新分支上写记录时用回退点当叶子），缺省取文件里最后一个链条目。 */
-  load(sessionId: string, leafUuid?: string): TimelineItem[] {
+   *  按文件顺序读取，但跳过「被放弃的分支」：从主链（文件末尾链条目的祖先链，压缩
+   *  边界经 logicalParentUuid 接上）某节点分叉出去、却不在主链上的记录——那是回退
+   *  /编辑重发之后留在文件里的旧尾巴，显示出来会占掉可见的最后几轮且没有还原点。
+   *  与主链完全不相连的孤儿树（旧版截断留下的断链、CLI 侧其它情况）照常显示：
+   *  纯沿链过滤实测会把老会话大段真实历史连同还原点一起藏掉。 */
+  load(sessionId: string): TimelineItem[] {
     const file = this.findFile(sessionId);
     if (!file) return [];
     const all = this.readLines(file);
-    const chain = this.chainFrom(all, leafUuid);
+    const abandoned = this.abandonedSet(all);
     const items: TimelineItem[] = [];
     const toolIndex = new Map<string, number>(); // tool_use_id -> items index
     let prevTs = 0; // previous record's timestamp — estimates thinking duration
     for (const o of all) {
-      if (chain && typeof o.uuid === "string" && !chain.has(o.uuid)) continue;
+      if (typeof o.uuid === "string" && abandoned.has(o.uuid)) continue;
       const ts = typeof o.timestamp === "string" ? Date.parse(o.timestamp) : NaN;
       if (o.type === "user" && Array.isArray(o.message?.content)) {
         const images: string[] = [];
@@ -272,7 +274,7 @@ export class SessionStore {
 
   /** 截点（前 keepLines 个非空行）之前最后一个链条目的 uuid——即回退后对话的叶子。
    *  链条目 = 同时带 uuid 与 parentUuid 键的记录（user/assistant/attachment/system
-   *  皆可）；SDK 的 resumeSessionAt 与 forkSession.upToMessageId 都接受任意链条目。 */
+   *  皆可）；SDK 的 forkSession.upToMessageId 接受任意链条目。 */
   lastChainUuidBefore(sessionId: string, keepLines: number): string | undefined {
     const file = this.findFile(sessionId);
     if (!file) return undefined;
@@ -298,85 +300,119 @@ export class SessionStore {
     return last;
   }
 
-  /** 回退点是否仍需在下次 resume 时传给 CLI：文件里最后一个链条目还不是回退点
-   *  的后代（CLI 尚未在新分支上写过记录）就仍需要；已接上则回退点功成身退。 */
-  resumePointStillPending(sessionId: string, leaf: string): boolean {
+  /** 文件里每条真人提问所在的行号（非空行计数，1 起）及其正文/是否带图——还原点
+   *  迁移到派生出的新会话时，靠「同一段提问文本」把 truncateLine 重新对齐到新文件
+   *  （fork 只复制链记录，行号与原文件不同）。判定规则与 firstUserTurnAfter 一致。 */
+  userTurnLines(sessionId: string): { text: string; hasImages: boolean; line: number }[] {
     const file = this.findFile(sessionId);
-    if (!file) return false;
-    const all = this.readLines(file);
-    const byId = new Map<string, any>();
-    let last: any;
-    for (const o of all) {
-      if (typeof o?.uuid === "string" && "parentUuid" in o) {
-        byId.set(o.uuid, o);
-        last = o;
-      }
-    }
-    if (!last || !byId.has(leaf)) return false;
-    const seen = new Set<string>();
-    for (let cur = last; cur && !seen.has(cur.uuid); cur = byId.get(cur.parentUuid)) {
-      if (cur.uuid === leaf) return false;
-      seen.add(cur.uuid);
-    }
-    return true;
-  }
-
-  /** 从叶子沿 parentUuid 走到根，得到这条对话线上的全部 uuid。叶子缺省为文件里最后
-   *  一个链条目；找不到叶子（老格式/异常文件）返回 undefined = 不过滤。 */
-  private chainFrom(all: any[], leafUuid?: string): Set<string> | undefined {
-    const byId = new Map<string, any>();
-    let last: any;
-    for (const o of all) {
-      if (typeof o?.uuid === "string" && "parentUuid" in o) {
-        byId.set(o.uuid, o);
-        last = o;
-      }
-    }
-    const leaf = leafUuid && byId.has(leafUuid) ? byId.get(leafUuid) : last;
-    if (!leaf) return undefined;
-    const keep = new Set<string>();
-    for (let cur = leaf; cur && !keep.has(cur.uuid); cur = byId.get(cur.parentUuid)) keep.add(cur.uuid);
-    return keep;
-  }
-
-  /**
-   * 从 `keepLines`（非空行数）处派生一个新会话：
-   * 把截断点之前的对话前缀复制成 `newId` 的 transcript（各记录的 sessionId 字段
-   * 重写为新 id，防止官方索引串台），原会话文件分毫不动。
-   * 返回新会话里的真人提问轮数（0 = 没有可用内容，调用方应放弃派生）。
-   */
-  forkAt(sessionId: string, keepLines: number, newId: string): number {
-    const file = this.findFile(sessionId);
-    if (!file) return 0;
+    if (!file) return [];
     let raw: string;
     try {
       raw = fs.readFileSync(file, "utf8");
     } catch {
-      return 0;
+      return [];
     }
-    const out: string[] = [];
-    let kept = 0;
-    let userTurns = 0;
+    const out: { text: string; hasImages: boolean; line: number }[] = [];
+    let seen = 0;
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
-      if (kept >= keepLines) break;
+      seen++;
+      let o: any;
       try {
-        const o = JSON.parse(line);
-        if (o && typeof o === "object" && "sessionId" in o) o.sessionId = newId;
-        if (o.type === "user" && this.isRealUserText(o)) userTurns++;
-        out.push(JSON.stringify(o));
+        o = JSON.parse(line);
       } catch {
-        out.push(line); // 非 JSON 行原样保留
+        continue;
       }
-      kept++;
+      if (o?.type !== "user" || o.isMeta === true || o.isCompactSummary === true) continue;
+      const originKind = o?.origin?.kind;
+      if (typeof originKind === "string" && originKind !== "human") continue;
+      const content = o.message?.content;
+      let hasImages = false;
+      if (Array.isArray(content)) {
+        if (content.some((b: any) => b?.type === "tool_result")) continue;
+        hasImages = content.some((b: any) => b?.type === "image");
+      }
+      if (!this.isRealUserText(o) && !hasImages) continue;
+      const t = this.userText(o);
+      out.push({ text: splitAttachedContext(t).text || t, hasImages, line: seen });
     }
-    if (!userTurns) return 0;
+    return out;
+  }
+
+  /** 回退到「第 cutLine 行之前」时应接续的链节点：取截点后第一条链记录（即该轮的
+   *  提问）的 parentUuid——那才是这一轮当初接在哪个节点上；文件里若有被放弃的分支，
+   *  「截点前最后一行」可能正好是旧分支的尾巴，会切到错误的分支。截点后没有链记录
+   *  时退回截点前最后一条链记录。 */
+  rewindLeafFor(sessionId: string, cutLine: number): string | undefined {
+    const file = this.findFile(sessionId);
+    if (!file) return undefined;
+    let raw: string;
     try {
-      fs.writeFileSync(path.join(path.dirname(file), `${newId}.jsonl`), out.join("\n") + "\n", "utf8");
+      raw = fs.readFileSync(file, "utf8");
     } catch {
-      return 0;
+      return undefined;
     }
-    return userTurns;
+    const ids = new Set<string>();
+    let seen = 0;
+    let firstAfter: any;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      seen++;
+      let o: any;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof o?.uuid !== "string" || !("parentUuid" in o)) continue;
+      ids.add(o.uuid);
+      if (seen > cutLine && !firstAfter) firstAfter = o;
+    }
+    const parent = firstAfter?.parentUuid;
+    if (typeof parent === "string" && ids.has(parent)) return parent;
+    return this.lastChainUuidBefore(sessionId, cutLine);
+  }
+
+  /** 被放弃分支上的记录 uuid：不在主链上、但沿 parentUuid 往上能走到主链节点的记录。
+   *  主链 = 文件末尾链条目的祖先链（压缩边界经 logicalParentUuid 接上）。往上走到
+   *  断链/根而未触及主链的记录属于孤儿树，不算放弃，照常显示。 */
+  private abandonedSet(all: any[]): Set<string> {
+    const byId = new Map<string, any>();
+    let leaf: any;
+    for (const o of all) {
+      if (typeof o?.uuid === "string" && "parentUuid" in o) {
+        byId.set(o.uuid, o);
+        leaf = o;
+      }
+    }
+    const chain = new Set<string>();
+    for (let cur = leaf; cur && !chain.has(cur.uuid); ) {
+      chain.add(cur.uuid);
+      const next = cur.parentUuid ?? cur.logicalParentUuid;
+      cur = typeof next === "string" ? byId.get(next) : undefined;
+    }
+    const abandoned = new Set<string>();
+    const verdict = new Map<string, boolean>(); // uuid -> 是否挂在主链下（即被放弃）
+    for (const o of byId.values()) {
+      if (chain.has(o.uuid)) continue;
+      const path: any[] = [];
+      let cur: any = o;
+      let hangsOffChain = false;
+      while (cur && !verdict.has(cur.uuid) && !path.includes(cur)) {
+        if (chain.has(cur.uuid)) {
+          hangsOffChain = true;
+          break;
+        }
+        path.push(cur);
+        cur = typeof cur.parentUuid === "string" ? byId.get(cur.parentUuid) : undefined;
+      }
+      if (cur && verdict.has(cur.uuid)) hangsOffChain = verdict.get(cur.uuid)!;
+      for (const p of path) {
+        verdict.set(p.uuid, hangsOffChain);
+        if (hangsOffChain) abandoned.add(p.uuid);
+      }
+    }
+    return abandoned;
   }
 
   /** 截断点之后的第一条真人消息（提问文本 + 随附图片）——还原时既做对齐校验，

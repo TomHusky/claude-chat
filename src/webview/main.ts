@@ -908,7 +908,8 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       // 注意不置 userStopped：还原走整页重载收尾，不该给某轮盖「已中断」标记。
       freezeLiveStream();
       setGlow("idle");
-      statusLine.textContent = "正在停止回复并还原…";
+      statusLine.textContent = isBusy ? "正在停止回复并还原…" : "正在还原…";
+      showRestoring();
       break;
     case "status":
       // Host-driven transient hint (e.g. cold-start context loading). Cleared
@@ -1011,6 +1012,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       clearRateLimit();
       break;
     case "error":
+      hideRestoring(); // 还原失败也要撤掉遮罩
       setGlow("error");
       finalizeTurn();
       // A fatal error may arrive with no busy:false (spawn failures kill the
@@ -1857,6 +1859,7 @@ function loadHistory(items: TimelineItem[], checkpoints?: { id: string; label: s
   // 户若又点了停止，残留的 userStopped 会让 renderHistory 收尾的 finalizeTurn
   // 给最后一轮错盖「[Request interrupted by user]」。
   userStopped = false;
+  hideRestoring(); // 还原完成：新历史到了，遮罩撤掉
   // 中途还原会把进程直接杀掉，收尾事件（result/compacted）永远不会来——宿主已
   // 补过 busy:false 的话，这里还挂着的「运行中/等待授权」光圈和压缩转圈全是
   // 残留，一并收掉。done/error 的呼吸光圈是未读标记，保留；正常打开会话时本就
@@ -1899,7 +1902,7 @@ function renderHistory(showAll: boolean) {
   const userTexts: string[] = [];
   for (const it of items) if (it.type === "user") userTexts.push((it.text || "").trim());
   const userTotal = userTexts.length;
-  const cpByOrdinal = new Map<number, { id: string }>();
+  const cpByOrdinal = new Map<number, { id: string; synthetic?: boolean }>();
   {
     let from = 0; // 单调向前扫，保证还原点之间的相对顺序不被打乱
     for (const c of checkpoints) {
@@ -1961,7 +1964,7 @@ function renderHistory(showAll: boolean) {
 /** Render the folded (older) portion in place of the banner. The recent/live
  *  DOM is detached into a fragment first — the append-style render helpers and
  *  their finalize sweeps then can't touch it — and re-attached afterwards. */
-function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<number, { id: string }>) {
+function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<number, { id: string; synthetic?: boolean }>) {
   if (!historyState) return;
   const items = historyState.items;
   // The viewport must not MOVE: whatever the user was looking at stays put and
@@ -2004,7 +2007,7 @@ function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<num
 
 /** Append items[from..to) to messagesEl. Checkpoint ordinals stay correct for
  *  any sub-range because user turns are counted from the start of `items`. */
-function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOrdinal: Map<number, { id: string }>) {
+function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOrdinal: Map<number, { id: string; synthetic?: boolean }>) {
   let userOrdinal = -1;
   for (let i = 0; i < from; i++) if (items[i].type === "user") userOrdinal++;
   for (let i = from; i < to; i++) {
@@ -2013,7 +2016,7 @@ function renderItemRange(items: TimelineItem[], from: number, to: number, cpByOr
       userOrdinal++;
       finalizeTurn();
       const cp = cpByOrdinal.get(userOrdinal);
-      if (cp && userOrdinal > 0) messagesEl.appendChild(renderCheckpointDivider(cp.id)); // no divider above the very first message
+      if (cp) messagesEl.appendChild(renderCheckpointDivider(cp.id, cp.synthetic)); // 第一条前也画：还原到它之前 = 清空对话重来
       const m = appendUser(it.text, it.files || [], it.images || [], it.sls);
       if (cp) m.dataset.checkpointId = cp.id; // link message -> checkpoint (for edit)
     } else if (it.type === "image") {
@@ -2302,14 +2305,15 @@ function renderChangedFiles(
 // ---------------------------------------------------------------------------
 // Inline restore points (checkpoint dividers in the conversation stream)
 // ---------------------------------------------------------------------------
-function renderCheckpointDivider(checkpointId: string): HTMLElement {
+function renderCheckpointDivider(checkpointId: string, synthetic?: boolean): HTMLElement {
   const d = el("div", "checkpoint-divider");
   d.dataset.checkpointId = checkpointId;
   // A single, always-present control — hovering only restyles it (no extra
   // element appears), so the row never reflows / flickers.
   const btn = el("button", "cp-restore");
   btn.textContent = "还原到此处";
-  btn.title = "还原到此检查点（恢复改动前）";
+  // 合成还原点：该轮不是从本插件发出（官方插件/其它窗口），没有文件快照，只回退对话。
+  btn.title = synthetic ? "还原到此处（该轮无文件快照：只回退对话，不回滚文件）" : "还原到此检查点（恢复改动前）";
   // Confirmation is shown by the extension (native modal); we just request it.
   btn.onclick = () => send({ type: "restoreCheckpoint", checkpointId });
   // 从此处派生新会话（对齐官方 "Fork conversation from here"）：复制该点之前
@@ -2336,8 +2340,8 @@ function renderCompactionDivider(preTokens: number, postTokens: number): HTMLEle
 /** Live: a restore point was created for the turn just sent. */
 function onCheckpointMarker(checkpointId: string) {
   if (lastUserEl) lastUserEl.dataset.checkpointId = checkpointId; // link message -> its checkpoint (for edit)
-  if (userMsgCount <= 1 || !lastUserEl) return; // no divider above the very first message
-  messagesEl.insertBefore(renderCheckpointDivider(checkpointId), lastUserEl);
+  if (!lastUserEl) return;
+  messagesEl.insertBefore(renderCheckpointDivider(checkpointId), lastUserEl); // 第一条前也画：还原到它之前 = 清空对话重来
   scrollToBottom();
 }
 
@@ -2608,6 +2612,20 @@ function renderQueue() {
 
 sendBtn.onclick = doSend;
 let userStopped = false; // user hit Stop — append an interrupted marker on finalize
+/** 还原过渡态的遮罩：消息区压暗 + 居中转圈药丸。停进程（忙时 1~5s）和派生复制
+ *  transcript 的这几秒里，用户能看到「正在还原」而不是一片死寂。 */
+function showRestoring() {
+  messagesEl.classList.add("restoring");
+  if (document.querySelector(".restore-overlay")) return;
+  const o = el("div", "restore-overlay");
+  o.innerHTML = `<span class="hx-spin"></span>正在还原到此处…`;
+  document.body.appendChild(o);
+}
+function hideRestoring() {
+  messagesEl.classList.remove("restoring");
+  document.querySelector(".restore-overlay")?.remove();
+}
+
 /** 立刻把直播观感「停」下来：吞掉后续流事件、冻结打字机尾巴、收起活动药丸和
  *  左侧进度脉冲。Stop 按钮与还原的自动停止（restoring）共用，观感必须一致。
  *  finalizeTurn 也会做后两样，但它要等宿主的 result 落地——那可能比点击晚好

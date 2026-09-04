@@ -44,6 +44,9 @@ export class CheckpointManager {
    *  "revert file" would silently keep those edits while claiming success. */
   private baseline = new Map<string, string | null>();
   private baselineSkipped = new Set<string>();
+  /** 还原点回退后的对话叶子（链条目 uuid）：在 CLI 于新分支上写出记录之前，每次
+   *  resume 都要带上它（resumeSessionAt），否则 CLI 会从被放弃的旧尾巴接着聊。 */
+  private resumeAt?: string;
   private sessionId?: string;
 
   constructor(private readonly storageDir: string) {}
@@ -259,6 +262,17 @@ export class CheckpointManager {
     this.checkpoints = [];
     this.baseline.clear();
     this.baselineSkipped.clear();
+    this.resumeAt = undefined;
+    this.persist();
+  }
+
+  getResumeAt(): string | undefined {
+    return this.resumeAt;
+  }
+
+  setResumeAt(uuid: string | undefined): void {
+    if (this.resumeAt === uuid) return;
+    this.resumeAt = uuid;
     this.persist();
   }
 
@@ -289,6 +303,7 @@ export class CheckpointManager {
     this.checkpoints = [];
     this.baseline = new Map();
     this.baselineSkipped = new Set();
+    this.resumeAt = undefined;
     try {
       const raw = JSON.parse(fs.readFileSync(this.file(), "utf8"));
       // Legacy files are a bare array; new ones carry the folded baseline too.
@@ -298,6 +313,7 @@ export class CheckpointManager {
         this.checkpoints = raw.checkpoints;
         for (const [p, c] of raw.baseline ?? []) this.baseline.set(p, c);
         for (const s of raw.baselineSkipped ?? []) this.baselineSkipped.add(s);
+        if (typeof raw.resumeAt === "string") this.resumeAt = raw.resumeAt;
       }
     } catch {
       /* absent/corrupt — start clean */
@@ -326,6 +342,7 @@ export class CheckpointManager {
         checkpoints: this.checkpoints,
         baseline: [...this.baseline],
         baselineSkipped: [...this.baselineSkipped],
+        ...(this.resumeAt ? { resumeAt: this.resumeAt } : {}),
       };
       fs.writeFileSync(this.file(), JSON.stringify(payload), "utf8");
     } catch {

@@ -131,14 +131,20 @@ export class SessionStore {
     return { title, messageCount, hasContent };
   }
 
-  /** Rehydrate a full session transcript into renderable timeline items. */
-  load(sessionId: string): TimelineItem[] {
+  /** Rehydrate a full session transcript into renderable timeline items.
+   *  只读取从叶子沿 parentUuid 链可达的记录（与官方读取器一致）：还原点回退后
+   *  被放弃的旧分支仍留在文件里，但不再显示。`leafUuid` 指定叶子（回退后、CLI
+   *  还没在新分支上写记录时用回退点当叶子），缺省取文件里最后一个链条目。 */
+  load(sessionId: string, leafUuid?: string): TimelineItem[] {
     const file = this.findFile(sessionId);
     if (!file) return [];
+    const all = this.readLines(file);
+    const chain = this.chainFrom(all, leafUuid);
     const items: TimelineItem[] = [];
     const toolIndex = new Map<string, number>(); // tool_use_id -> items index
     let prevTs = 0; // previous record's timestamp — estimates thinking duration
-    for (const o of this.readLines(file)) {
+    for (const o of all) {
+      if (chain && typeof o.uuid === "string" && !chain.has(o.uuid)) continue;
       const ts = typeof o.timestamp === "string" ? Date.parse(o.timestamp) : NaN;
       if (o.type === "user" && Array.isArray(o.message?.content)) {
         const images: string[] = [];
@@ -264,57 +270,77 @@ export class SessionStore {
     }
   }
 
-  /**
-   * Truncate a session transcript to its first `keepLines` non-empty lines.
-   * This is how a restore point rewinds the conversation: resuming the
-   * truncated session makes Claude forget everything after the cut.
-   * Returns the number of real user turns remaining after truncation.
-   */
-  truncateToLines(sessionId: string, keepLines: number): number {
+  /** 截点（前 keepLines 个非空行）之前最后一个链条目的 uuid——即回退后对话的叶子。
+   *  链条目 = 同时带 uuid 与 parentUuid 键的记录（user/assistant/attachment/system
+   *  皆可）；SDK 的 resumeSessionAt 与 forkSession.upToMessageId 都接受任意链条目。 */
+  lastChainUuidBefore(sessionId: string, keepLines: number): string | undefined {
     const file = this.findFile(sessionId);
-    if (!file) return 0;
+    if (!file) return undefined;
     let raw: string;
     try {
       raw = fs.readFileSync(file, "utf8");
     } catch {
-      return 0;
+      return undefined;
     }
-    const out: string[] = [];
-    const carried: string[] = []; // title lines beyond the cut — keep them, or a
-    let kept = 0; //                  rewind silently erases a later rename/ai-title
-    let userTurns = 0;
-    let pastCut = false;
+    let seen = 0;
+    let last: string | undefined;
     for (const line of raw.split("\n")) {
-      if (line.trim()) {
-        if (kept >= keepLines) pastCut = true;
-        try {
-          const o = JSON.parse(line);
-          if (pastCut) {
-            if (o.type === "custom-title" || o.type === "ai-title") carried.push(line);
-            continue;
-          }
-          if (o.type === "user" && this.isRealUserText(o)) userTurns++;
-        } catch {
-          if (pastCut) continue;
-          /* keep non-JSON lines verbatim */
-        }
-        kept++;
-      } else if (pastCut) {
-        continue;
+      if (!line.trim()) continue;
+      seen++;
+      if (seen > keepLines) break;
+      try {
+        const o = JSON.parse(line);
+        if (typeof o?.uuid === "string" && "parentUuid" in o) last = o.uuid;
+      } catch {
+        /* skip */
       }
-      out.push(line);
     }
-    out.push(...carried);
-    try {
-      fs.writeFileSync(file, out.join("\n").replace(/\n*$/, "\n"), "utf8");
-    } catch {
-      /* best effort */
+    return last;
+  }
+
+  /** 回退点是否仍需在下次 resume 时传给 CLI：文件里最后一个链条目还不是回退点
+   *  的后代（CLI 尚未在新分支上写过记录）就仍需要；已接上则回退点功成身退。 */
+  resumePointStillPending(sessionId: string, leaf: string): boolean {
+    const file = this.findFile(sessionId);
+    if (!file) return false;
+    const all = this.readLines(file);
+    const byId = new Map<string, any>();
+    let last: any;
+    for (const o of all) {
+      if (typeof o?.uuid === "string" && "parentUuid" in o) {
+        byId.set(o.uuid, o);
+        last = o;
+      }
     }
-    return userTurns;
+    if (!last || !byId.has(leaf)) return false;
+    const seen = new Set<string>();
+    for (let cur = last; cur && !seen.has(cur.uuid); cur = byId.get(cur.parentUuid)) {
+      if (cur.uuid === leaf) return false;
+      seen.add(cur.uuid);
+    }
+    return true;
+  }
+
+  /** 从叶子沿 parentUuid 走到根，得到这条对话线上的全部 uuid。叶子缺省为文件里最后
+   *  一个链条目；找不到叶子（老格式/异常文件）返回 undefined = 不过滤。 */
+  private chainFrom(all: any[], leafUuid?: string): Set<string> | undefined {
+    const byId = new Map<string, any>();
+    let last: any;
+    for (const o of all) {
+      if (typeof o?.uuid === "string" && "parentUuid" in o) {
+        byId.set(o.uuid, o);
+        last = o;
+      }
+    }
+    const leaf = leafUuid && byId.has(leafUuid) ? byId.get(leafUuid) : last;
+    if (!leaf) return undefined;
+    const keep = new Set<string>();
+    for (let cur = leaf; cur && !keep.has(cur.uuid); cur = byId.get(cur.parentUuid)) keep.add(cur.uuid);
+    return keep;
   }
 
   /**
-   * 从 `keepLines`（非空行数，与 truncateToLines 同一套切片语义）处派生一个新会话：
+   * 从 `keepLines`（非空行数）处派生一个新会话：
    * 把截断点之前的对话前缀复制成 `newId` 的 transcript（各记录的 sessionId 字段
    * 重写为新 id，防止官方索引串台），原会话文件分毫不动。
    * 返回新会话里的真人提问轮数（0 = 没有可用内容，调用方应放弃派生）。

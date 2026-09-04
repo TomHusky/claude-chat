@@ -1472,7 +1472,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
   /** Push a session's full transcript/checkpoints/busy state into a chat panel. */
   private loadSessionInto(ctx: SessionCtx, sid: string): void {
-    const items = this.store.load(sid);
+    const items = this.store.load(sid, this.pendingResumeAt(ctx));
     this.post(ctx, { kind: "load_history", items, sessionId: sid, checkpoints: ctx.checkpoints.list() });
     this.postSessionContext(ctx, sid);
     // 打开会话就后台起进程 + --resume：把本地重读上下文的耗时提前，跟用户读历史/打字重叠，
@@ -1630,14 +1630,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ctx.proc = undefined;
     ctx.starting = undefined;
     if (proc) await proc.disposeAndWait();
-    let remaining = 0;
-    if (ctx.sessionId) {
-      remaining = this.store.truncateToLines(ctx.sessionId, res.truncateLine);
-    }
-    if (remaining === 0) {
+    // 回退对话：不截 transcript，记下截点前最后一个链条目作为回退点，下次拉起
+    // 进程时由 CLI 从该节点接着写（机制见 restoreCheckpoint）。截点前没有链条目
+    // = 回到开头，转为新对话。
+    const leaf = ctx.sessionId ? this.store.lastChainUuidBefore(ctx.sessionId, res.truncateLine) : undefined;
+    if (!leaf) {
       ctx.sessionId = undefined;
       ctx.checkpoints.clear();
-    }
+    } else ctx.checkpoints.setResumeAt(leaf);
     this.refreshChangedFiles(ctx);
     await this.handleSend(ctx, text, undefined, images);
   }
@@ -1874,6 +1874,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     vscode.window.showInformationMessage(`已从该点派生新会话（保留 ${turns} 轮对话），与原会话互不影响。`);
   }
 
+  /** 还原点回退后、CLI 还没在新分支上写出记录时，每次 resume 都要带上回退点；一旦
+   *  新分支接上（文件末尾的链条目已是回退点的后代），回退点用完即清。 */
+  private pendingResumeAt(ctx: SessionCtx): string | undefined {
+    const at = ctx.checkpoints.getResumeAt();
+    if (!at || !ctx.sessionId) return undefined;
+    if (this.store.resumePointStillPending(ctx.sessionId, at)) return at;
+    ctx.checkpoints.setResumeAt(undefined);
+    return undefined;
+  }
+
   private async restoreCheckpoint(ctx: SessionCtx, checkpointId: string): Promise<void> {
     const preview = ctx.checkpoints.preview(checkpointId);
     const confirm = await vscode.window.showWarningMessage(
@@ -1882,7 +1892,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         modal: true,
         detail:
           (preview ? `消息：${preview.userText}\n\n` : "") +
-          "将回滚此后的文件改动，并截断对话 —— Claude 会忘记这条消息及之后的所有轮次。此操作不可撤销。" +
+          "将回滚此后的文件改动，并把对话回退到这里 —— Claude 会忘记这条消息及之后的所有轮次。此操作不可撤销。" +
           (ctx.proc?.isBusy ? "\n\nClaude 正在回复中，还原会先自动停止本轮。" : ""),
       },
       "还原",
@@ -1958,31 +1968,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // 2) Truly rewind the conversation: truncate the transcript so a future
-    //    --resume makes Claude forget everything after this point.
-    let remainingTurns = 0;
-    if (ctx.sessionId) {
-      remainingTurns = this.store.truncateToLines(ctx.sessionId, result.truncateLine);
-    }
+    // 2) 回退对话——不再截 transcript。按行截断有个致命竞态：垂死的 CLI 会在截断
+    //    之后再刷出几条记录（实测 truncateLine=15801，截完文件却是 15803 行），
+    //    若是链记录，其 parentUuid 指向已删掉的条目，链就此断裂：官方读取器沿链
+    //    只剩尾巴，--resume 的上下文也一并丢失。改用 CLI 的官方回退机制（Claude
+    //    Code 自己的 /rewind 就是这么做的）：记下截点前最后一个链条目作为回退点，
+    //    下次拉起进程时传 resumeSessionAt，新消息从该节点接着写，之后的记录成为
+    //    被放弃的分支——文件一行不动，历史渲染沿 parentUuid 链读取，自动隐藏它们。
+    const leaf =
+      ctx.sessionId && result.truncateLine > 0 ? this.store.lastChainUuidBefore(ctx.sessionId, result.truncateLine) : undefined;
 
-    // 3) 只有真的回到「第一条消息之前」（truncateLine=0，文件里什么都没留）才
-    //    算全新对话。绝不能用 remainingTurns==0 判断——它数的是 isRealUserText
-    //    认可的「真人提问」，而斜杠命令、<local-command-*>/中断标记开头的消息
-    //    都不算数；一旦保留区里恰好没有合格提问（但仍有大量对话内容），旧逻辑
-    //    会把 sessionId 直接丢掉 + 清空还原点，整段上下文当场蒸发且不可恢复。
-    const rewoundToStart = result.truncateLine <= 0;
+    // 3) 截点之前连一个链条目都没有，才算回到第一条消息之前、转为全新对话。
+    const rewoundToStart = !leaf;
     this.output.appendLine(
       `[restore] session=${(ctx.sessionId ?? "-").slice(0, 8)} truncateLine=${result.truncateLine} ` +
-        `剩余真人提问=${remainingTurns} 文件剩余行=${ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0} ` +
+        `回退点=${leaf ? leaf.slice(0, 8) : "-"} 文件行数=${ctx.sessionId ? this.store.countLines(ctx.sessionId) : 0} ` +
         `还原文件=${result.restoredFiles} 自动停止=${wasLive ? "是" : "否"} ` +
-        `${rewoundToStart ? "→ 回到开头，转为新对话" : "→ 保留会话并 --resume"}`,
+        `${rewoundToStart ? "→ 回到开头，转为新对话" : "→ 保留会话，resumeSessionAt 接续"}`,
     );
     if (rewoundToStart) {
       ctx.sessionId = undefined;
       ctx.checkpoints.clear();
       this.post(ctx, { kind: "load_history", items: [], checkpoints: [] });
     } else {
-      const items = this.store.load(ctx.sessionId!);
+      ctx.checkpoints.setResumeAt(leaf);
+      const items = this.store.load(ctx.sessionId!, leaf);
       this.post(ctx, { kind: "load_history", items, sessionId: ctx.sessionId, checkpoints: ctx.checkpoints.list() });
       // load_history 会清空上下文环（等下一轮用量再刷新），但还原后进程已被杀、
       // 也不走"打开会话"，环会一直空到用户发下一条消息才回来。截断后的用量可以
@@ -2047,6 +2057,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         effort: this.config().get<string>("effort", "") || undefined,
         permissionMode: this.config().get<string>("permissionMode", "default"),
         resumeSessionId: isResume ? sessionId : undefined,
+        resumeSessionAt: isResume ? this.pendingResumeAt(ctx) : undefined,
         sessionId: isResume ? undefined : sessionId,
         addDirs: this.workspaceDirs(),
         appendSystemPrompt: this.config().get<string>("appendSystemPrompt", "") || undefined,

@@ -908,7 +908,7 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       // 注意不置 userStopped：还原走整页重载收尾，不该给某轮盖「已中断」标记。
       freezeLiveStream();
       setGlow("idle");
-      statusLine.textContent = isBusy ? "正在停止回复并还原…" : "正在还原…";
+      statusLine.textContent = restoringRegen ? "正在重新生成…" : isBusy ? "正在停止回复并还原…" : "正在还原…";
       showRestoring();
       break;
     case "status":
@@ -2614,7 +2614,12 @@ sendBtn.onclick = doSend;
 let userStopped = false; // user hit Stop — append an interrupted marker on finalize
 /** 还原过渡态的遮罩：消息区压暗 + 居中转圈药丸。停进程（忙时 1~5s）和派生复制
  *  transcript 的这几秒里，用户能看到「正在还原」而不是一片死寂。 */
+/** 还原与重新生成共用同一套回退机制，但重新生成不弹居中遮罩、也不压暗消息区——
+ *  它已经把重发的用户气泡和 Brewing 转圈显示出来了，遮罩纯属打扰。submitEdit 按
+ *  动作设置，hideRestoring 复位。 */
+let restoringRegen = false;
 function showRestoring() {
+  if (restoringRegen) return; // 重新生成：无遮罩、不压暗
   messagesEl.classList.add("restoring");
   if (document.querySelector(".restore-overlay")) return;
   const o = el("div", "restore-overlay");
@@ -2624,6 +2629,7 @@ function showRestoring() {
 function hideRestoring() {
   messagesEl.classList.remove("restoring");
   document.querySelector(".restore-overlay")?.remove();
+  restoringRegen = false;
 }
 
 /** 立刻把直播观感「停」下来：吞掉后续流事件、冻结打字机尾巴、收起活动药丸和
@@ -3431,6 +3437,9 @@ function buildReplyActions(aEl: HTMLElement): HTMLElement {
     return b;
   };
   const regen = mk(ICON.update, "重新生成", () => regenerate(aEl));
+  // 重新生成会回退到该轮之前重发——只对最新一条回复开放；旧回复由 CSS 隐藏此按钮
+  // （点旧回复会连带砍掉其后的所有对话并打断进行中的回复，非用户所愿）。
+  regen.classList.add("regen");
   const copy = mk(ICON.copy, "复制", (b) => {
     const text = Array.from(aEl.querySelectorAll(".msg-body .text-seg"))
       .map((e) => (e as HTMLElement).innerText)
@@ -3450,6 +3459,13 @@ function buildReplyActions(aEl: HTMLElement): HTMLElement {
  *  (truncate transcript + revert files) and resend the same text. */
 function regenerate(aEl: HTMLElement) {
   if (isBusy || rateLimited) return;
+  // 只重新生成最新一条回复：其后若还有别的消息（更晚的对话），拒绝——否则会砍掉
+  // 那些对话。CSS 已隐藏旧回复的按钮，这里是兜底。
+  let after = aEl.nextElementSibling;
+  while (after) {
+    if (after.classList.contains("msg")) return;
+    after = after.nextElementSibling;
+  }
   const userMsg = precedingUserMsg(aEl);
   if (!userMsg) return;
   const raw = userMsg.dataset.rawText || "";
@@ -3459,10 +3475,11 @@ function regenerate(aEl: HTMLElement) {
     i.src.startsWith("data:"),
   );
   if (!raw && !hasSendableImage) return;
-  submitEdit(userMsg, userMsg.dataset.checkpointId || "", raw);
+  submitEdit(userMsg, userMsg.dataset.checkpointId || "", raw, true);
 }
 
-function submitEdit(msg: HTMLElement, checkpointId: string, newText: string) {
+function submitEdit(msg: HTMLElement, checkpointId: string, newText: string, regen = false) {
+  restoringRegen = regen;
   // Carry the original message's images through the edit/regenerate. Build the
   // shown list and the sent list in ONE pass: filtering only the sent list let
   // the view display images (e.g. https: or `;charset=` data URIs) that were

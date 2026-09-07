@@ -12,6 +12,92 @@ import { ChangedFile, CheckpointSummary, contextWindowFor, CTX_OPEN, CTX_CLOSE, 
 import { QQBot, QQIncoming, QQState, splitForQQ } from "../qq/bot";
 
 const FILE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/** 去掉 heredoc 正文（`<<EOF … EOF`），只留命令行本身——正文里的文字不是命令，
+ *  否则一段包含 "rm -rf" 字样的文档内容会被当成删除命令去快照。 */
+function stripHeredocs(cmd: string): string {
+  const lines = cmd.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(lines[i]);
+    if (!m) continue;
+    for (i = i + 1; i < lines.length; i++) if (lines[i].replace(/^\t+/, "") === m[2]) break;
+  }
+  return out.join("\n");
+}
+
+/** 从 Bash 命令里启发式抽出会被写入/删除的文件路径。auto 模式下 CLI 会让模型用
+ *  sed/heredoc/重定向改文件而不走 Edit/Write，这些文件此前既进不了「已更改文件」
+ *  也回滚不了。覆盖：> >> 重定向、tee、sed -i、cp/mv 目标、rm/touch/truncate；
+ *  相对路径按工作区解析。含 $ * ? ` {} 的令牌（变量/通配/子命令）静态解析不了，
+ *  跳过；目录跳过（快照只对文件有意义）。启发式，复杂脚本会漏，漏了只是不进列表。 */
+function bashWritePaths(cmd: string, cwd: string): string[] {
+  const toks: string[] = [];
+  let cur = "";
+  let q: string | null = null;
+  const flush = () => { if (cur) toks.push(cur); cur = ""; };
+  const src = stripHeredocs(cmd);
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (q) { if (ch === q) q = null; else cur += ch; continue; }
+    if (ch === "'" || ch === '"') { q = ch; continue; }
+    if (ch === "\\" && i + 1 < src.length) { cur += src[++i]; continue; }
+    if (ch === ">") {
+      if (cur === "2" || cur === "&") cur = ""; else flush(); // 2> / &> 归入重定向符
+      let op = ">";
+      if (src[i + 1] === ">") { op = ">>"; i++; }
+      if (src[i + 1] === "|") i++; // >|
+      toks.push(op);
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "|" || (ch === "&" && src[i + 1] === "&")) {
+      flush(); toks.push(";");
+      if ((ch === "|" && src[i + 1] === "|") || ch === "&") i++;
+      continue;
+    }
+    if (/\s/.test(ch)) { flush(); continue; }
+    cur += ch;
+  }
+  flush();
+  const out = new Set<string>();
+  const bad = (t: string) => !t || t.startsWith("-") || /[$*?`{}]/.test(t) || t.includes("<<") || t === "/dev/null";
+  const add = (t: string) => {
+    if (bad(t)) return;
+    const p = path.isAbsolute(t) ? t : path.resolve(cwd, t);
+    try { if (fs.statSync(p).isDirectory()) return; } catch { /* 不存在：本轮新建，照常快照为 null */ }
+    out.add(p);
+  };
+  const segs: string[][] = [[]];
+  for (const t of toks) { if (t === ";") segs.push([]); else segs[segs.length - 1].push(t); }
+  for (const seg of segs) {
+    if (!seg.length) continue;
+    const words: string[] = [];
+    for (let i = 0; i < seg.length; i++) {
+      if (seg[i] === ">" || seg[i] === ">>") { if (i + 1 < seg.length) add(seg[++i]); continue; }
+      words.push(seg[i]);
+    }
+    let k = 0; // 跳过 sudo/env/VAR= 前缀
+    while (k < words.length && (words[k] === "sudo" || words[k] === "env" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[k]))) k++;
+    const name = path.basename(words[k] ?? "");
+    const args = words.slice(k + 1);
+    const positional = args.filter((a) => !a.startsWith("-"));
+    if (name === "tee") positional.forEach(add);
+    else if (name === "sed" && args.some((a) => /^-[a-zA-Z]*i/.test(a) || a.startsWith("--in-place"))) {
+      // sed -i [ext] [-e expr]… expr file…：无 -e 时首个非旗标令牌是表达式，其余是文件
+      let exprTaken = args.some((a) => a === "-e" || a.startsWith("--expression"));
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === "-e" || a === "--expression" || a === "-f") { i++; continue; }
+        if (a.startsWith("-")) continue;
+        if (!exprTaken) { exprTaken = true; continue; }
+        add(a);
+      }
+    } else if ((name === "cp" || name === "mv") && positional.length >= 2) add(positional[positional.length - 1]);
+    else if (name === "rm" || name === "touch" || name === "truncate") positional.forEach(add);
+  }
+  return [...out];
+}
 /** URI scheme that serves the pre-edit baseline content for the native diff editor. */
 const ORIG_SCHEME = "claude-orig";
 /** workspaceState key: id of the last active session (restored on open). */
@@ -3878,10 +3964,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // 放在最前面，任何 early-return 都不会漏掉刷新。
     if (ctx.lastEventAt !== undefined) ctx.lastEventAt = Date.now();
     ctx.lastEmitAt = Date.now(); // 无条件版（LRU 淘汰的"最近有动静"兜底）
-    if (e.kind === "tool_input" && FILE_TOOLS.has(e.name)) {
+    if (e.kind === "tool_input" && (FILE_TOOLS.has(e.name) || e.name === "Bash")) {
       if (this.config().get<boolean>("snapshotFilesForRestore", true)) {
-        const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
-        if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
+        if (e.name === "Bash") {
+          // auto 模式下模型用 sed/重定向改文件——从命令里抽出目标路径，执行前快照
+          const cmd = e.input.command;
+          if (typeof cmd === "string") for (const p of bashWritePaths(cmd, this.cwd())) ctx.checkpoints.snapshotFile(p);
+        } else {
+          const p = (e.input.file_path ?? e.input.notebook_path) as string | undefined;
+          if (p && path.isAbsolute(p)) ctx.checkpoints.snapshotFile(p);
+        }
       }
     }
     // 用量"警告"横幅被用户关过的话，本重置周期内不再弹（每个新进程都会重报一次，

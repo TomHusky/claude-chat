@@ -325,6 +325,9 @@ body.vscode-dark .question-bar, body.vscode-high-contrast .question-bar { color:
 .msg-act:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.16)); color: var(--vscode-foreground); }
 .msg-act.done { color: #3a9d5d; }
 .msg-act svg { width: 14px; height: 14px; display: block; flex: 0 0 auto; }
+/* 「重新生成」只对最新一条 AI 回复开放：其后还有任何消息的回复即隐藏此按钮，
+   避免点旧回复连带砍掉后面的对话。「复制」仍保留在每条回复上。 */
+.msg.assistant:has(~ .msg) .msg-act.regen { display: none; }
 
 /* Long user prompts fold to ~4 lines with a fade + "展开全部 N 行" — same
    mechanic as a long Bash command, but tinted to the accent bubble. The .md

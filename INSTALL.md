@@ -1,7 +1,7 @@
-# 安装 ClaudeCopilot（一键安装说明）
+# 安装 ClaudeCopilot
 
-> 给 AI 助手的提示：用户希望安装这个 VS Code 插件。请按下面的步骤执行命令即可。
-> 安装包已经随仓库提供，路径是 **`release/claude-chat.vsix`**，无需自己构建。
+> 给 AI 助手的提示：用户希望安装这个 VS Code 插件，按下面的步骤执行命令即可。
+> 安装包已随仓库提供，路径是 **`release/claude-chat.vsix`**，无需自己构建。
 
 ## 前置条件
 
@@ -10,9 +10,7 @@
    ```bash
    claude --version
    ```
-   插件不需要 API Key，它直接复用你本机 `claude` 的登录态。插件通过官方
-   `@anthropic-ai/claude-agent-sdk` 驱动这个本地 CLI，鉴权与计费和你自己在
-   终端里敲 `claude` 完全一致。
+   插件不需要 API Key，它通过官方 `@anthropic-ai/claude-agent-sdk` 驱动这个本地 CLI，鉴权与计费和你在终端里敲 `claude` 完全一致。
 
 ## 一键安装（推荐）
 
@@ -22,42 +20,44 @@
 code --install-extension release/claude-chat.vsix --force
 ```
 
-- 如果提示 `code: command not found`，说明 VS Code 的命令行工具没装：
-  在 VS Code 里按 `Cmd/Ctrl+Shift+P` → 运行 **“Shell Command: Install 'code' command in PATH”**，然后重开终端再执行上面的命令。
-- macOS 上若仍找不到 `code`，可用完整路径：
+- 提示 `code: command not found`：VS Code 的命令行工具没装。在 VS Code 里 `Cmd/Ctrl+Shift+P` → **Shell Command: Install 'code' command in PATH**，重开终端再执行。
+- macOS 仍找不到 `code` 时用完整路径（注意应用名若含空格要加引号）：
   ```bash
   "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" --install-extension release/claude-chat.vsix --force
   ```
-- Cursor 用户把 `code` 换成 `cursor` 即可。
+- Cursor 用户把 `code` 换成 `cursor`。
 
-装完后**重启编辑器窗口**（`Cmd/Ctrl+Shift+P` → “Reload Window”），左侧活动栏会出现 **ClaudeCopilot** 图标。
+装完后**重载窗口**（`Cmd/Ctrl+Shift+P` → **Reload Window**），左侧活动栏出现 **ClaudeCopilot** 图标即成功。
 
-## 备选：用 VS Code 图形界面安装
+## 备选：图形界面安装
 
-1. `Cmd/Ctrl+Shift+P` → **“Extensions: Install from VSIX...”**
+1. `Cmd/Ctrl+Shift+P` → **Extensions: Install from VSIX...**
 2. 选择仓库里的 `release/claude-chat.vsix`
-3. 安装后 Reload Window。
+3. Reload Window
 
-## 备选：从源码自行构建安装
+## 备选：从源码构建
 
 ```bash
 npm install
-node esbuild.js --production
-npx @vscode/vsce package --no-dependencies --allow-missing-repository
+npm run build
+npx @vscode/vsce package --no-dependencies
 code --install-extension claude-chat-*.vsix --force
 ```
 
-## 使用
+## 开始使用
 
-- 左侧活动栏点击 **ClaudeCopilot** 管理会话；聊天面板在编辑器区/侧边栏打开。
-- 首次使用确保 `claude` CLI 已登录（`claude` 命令能正常对话）。
+- 左侧活动栏点 **ClaudeCopilot** 管理会话；聊天面板在编辑器区或侧边栏打开。
+- 首次使用确保 `claude` CLI 已登录（终端里 `claude` 能正常对话）。
+- 功能说明、快捷键、配置项见 [README.md](README.md)。
+
+## 更新
+
+插件每 3 小时自动检测仓库 `main` 分支的新版本，侧边栏亮起「发现新版本 · 点击更新」横幅，点击一键安装；也可命令面板 `Claude: 检查更新`。
 
 ## 出问题时
 
-- 日志固定在 **`~/.claude-chat/logs/`**（按天分文件，保留 7 天）。命令面板运行
-  `Claude: 打开日志文件夹` 可直接打开；反馈问题时把当天的 `.log` 发出来即可。
-- 确认 `claude` CLI 本身正常：终端里跑 `claude --version`、随便对话一句。插件的
-  所有请求都由这个本地 CLI 发出，它不通插件必然不通。
+- 日志固定在 **`~/.claude-chat/logs/`**（按天分文件，保留 7 天）。命令面板 `Claude: 打开日志文件夹` 直接打开；反馈问题时把当天的 `.log` 发出来。
+- 先确认 `claude` CLI 本身正常：终端里 `claude --version`、随便对话一句。插件的所有请求都由这个本地 CLI 发出，它不通插件必然不通。
 
 ## 卸载
 

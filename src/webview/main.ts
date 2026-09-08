@@ -1849,7 +1849,8 @@ function resolvePermission(requestId: string, behavior: "allow" | "deny") {
 // ---------------------------------------------------------------------------
 // History / sessions / checkpoints
 // ---------------------------------------------------------------------------
-const HISTORY_TURN_LIMIT = 3; // only the last N turns render by default; older folds behind a banner
+const HISTORY_TURN_LIMIT = 20; // 打开会话默认只渲染最近 20 轮，更早的折进「加载更多」
+const HISTORY_CHUNK = 30; // 「加载更多」每次只向上渲染 30 轮——一次全展开几百轮会把主线程卡死
 let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: string; userText?: string }[] } | null = null;
 
 function loadHistory(items: TimelineItem[], checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
@@ -1935,24 +1936,7 @@ function renderHistory(showAll: boolean) {
         seen++;
       }
     }
-    const banner = el("div", "history-expand", `▾ 显示更早的 ${target} 条消息`);
-    const cut = cutoff;
-    banner.onclick = () => {
-      // 展开要同步渲染几百轮（markdown+高亮），主线程一卡几百毫秒到数秒，点击
-      // 后毫无反应像没点中。先把横幅原地变成加载态，rAF（本帧提交）+setTimeout
-      // （落到绘制之后）保证加载态真正画出来才开始重活；onclick 置空防连点重入。
-      banner.onclick = null;
-      banner.classList.add("loading");
-      banner.innerHTML = `<span class="hx-spin"></span>正在加载 ${target} 条消息…`;
-      requestAnimationFrame(() =>
-        setTimeout(() => {
-          // 等待的这一帧里整页可能已重载（还原点回退/看门狗重建），横幅不在树上
-          // 说明列表已是新的，此次展开作废。
-          if (banner.isConnected) expandHistory(banner, cut, cpByOrdinal);
-        }, 0),
-      );
-    };
-    messagesEl.appendChild(banner);
+    messagesEl.appendChild(makeExpandBanner(cutoff, cpByOrdinal));
   }
 
   renderItemRange(items, cutoff, items.length, cpByOrdinal);
@@ -1961,12 +1945,42 @@ function renderHistory(showAll: boolean) {
   scrollToBottom();
 }
 
-/** Render the folded (older) portion in place of the banner. The recent/live
- *  DOM is detached into a fragment first — the append-style render helpers and
- *  their finalize sweeps then can't touch it — and re-attached afterwards. */
+/** 折叠横幅：不显示总数，点击每次只加载 HISTORY_CHUNK 轮。cutoff 是当前已渲染
+ *  区间的起点（items 下标，落在某条 user 上）。 */
+function makeExpandBanner(cutoff: number, cpByOrdinal: Map<number, { id: string; synthetic?: boolean }>): HTMLElement {
+  const banner = el("div", "history-expand", "▾ 加载更多消息");
+  banner.onclick = () => {
+    // 渲染几十轮（markdown+高亮）仍会卡主线程几百毫秒，点击后毫无反应像没点中。
+    // 先把横幅原地变成加载态，rAF（本帧提交）+setTimeout（落到绘制之后）保证
+    // 加载态真正画出来才开始重活；onclick 置空防连点重入。
+    banner.onclick = null;
+    banner.classList.add("loading");
+    banner.innerHTML = `<span class="hx-spin"></span>正在加载…`;
+    requestAnimationFrame(() =>
+      setTimeout(() => {
+        // 等待的这一帧里整页可能已重载（还原点回退/看门狗重建），横幅不在树上
+        // 说明列表已是新的，此次展开作废。
+        if (banner.isConnected) expandHistory(banner, cutoff, cpByOrdinal);
+      }, 0),
+    );
+  };
+  return banner;
+}
+
+/** Render the next chunk of the folded (older) portion in place of the banner.
+ *  The recent/live DOM is detached into a fragment first — the append-style
+ *  render helpers and their finalize sweeps then can't touch it — and
+ *  re-attached afterwards. 只渲染紧邻的 HISTORY_CHUNK 轮，再往前的折进新横幅。 */
 function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<number, { id: string; synthetic?: boolean }>) {
   if (!historyState) return;
   const items = historyState.items;
+  // 本次只渲染 [from, cutoff)：cutoff 之前最近的 HISTORY_CHUNK 条 user 轮。
+  let from = 0;
+  {
+    const userIdx: number[] = [];
+    for (let i = 0; i < cutoff; i++) if (items[i].type === "user") userIdx.push(i);
+    if (userIdx.length > HISTORY_CHUNK) from = userIdx[userIdx.length - HISTORY_CHUNK];
+  }
   // The viewport must not MOVE: whatever the user was looking at stays put and
   // the older turns materialize above it. Capture the anchor's on-screen Y
   // BEFORE any DOM change, then correct scrollTop by the drift — and repeat on
@@ -1983,7 +1997,8 @@ function expandHistory(banner: HTMLElement, cutoff: number, cpByOrdinal: Map<num
   liveBlock = null;
   liveThink = null;
   lastUserEl = null;
-  renderItemRange(items, 0, cutoff, cpByOrdinal);
+  if (from > 0) messagesEl.appendChild(makeExpandBanner(from, cpByOrdinal)); // 还有更早的：横幅留在最上面
+  renderItemRange(items, from, cutoff, cpByOrdinal);
   finalizeTurn();
   assistantEl = savedAssistant;
   liveBlock = savedLive;

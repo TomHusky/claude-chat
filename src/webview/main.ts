@@ -1855,6 +1855,7 @@ let historyState: { items: TimelineItem[]; checkpoints: { id: string; label: str
 
 function loadHistory(items: TimelineItem[], checkpoints?: { id: string; label: string; userText?: string }[], sessionId?: string) {
   historyState = { items, checkpoints: checkpoints || [] };
+  seedInputHistory(items); // ↑ 能调回本会话之前发过的消息
   if (sessionId) vscode.setState({ sessionId });
   // 整页重载是从 transcript 权威重建，绝不能带出合成标记：还原过渡那几秒里用
   // 户若又点了停止，残留的 userStopped 会让 renderHistory 收尾的 finalizeTurn
@@ -2390,7 +2391,72 @@ function readComposer(): QueueItem | null {
   };
 }
 
+// ---- 输入历史：↑/↓ 把发过的消息调回输入框（shell 手感）------------------
+// 两个调用点（斜杠命令、正常发送）都经 clearComposer，限额拦截那条不清空也就
+// 不入历史——所以记录挂在 clearComposer 开头（此时 value 还在）。
+const INPUT_HISTORY_MAX = 200;
+const inputHistory: string[] = []; // 旧 → 新
+let historyIdx = -1; // -1 = 没在浏览历史
+let historyDraft = ""; // 进入浏览前输入框里没发出去的内容
+
+function resetInputHistory() {
+  historyIdx = -1;
+  historyDraft = "";
+}
+/** 记一条历史；连续重复只留一条，超上限丢最旧的。 */
+function pushInputHistory(text: string) {
+  const t = text.trim();
+  if (!t) return;
+  if (inputHistory[inputHistory.length - 1] !== t) inputHistory.push(t);
+  if (inputHistory.length > INPUT_HISTORY_MAX) inputHistory.shift();
+  resetInputHistory();
+}
+/** 打开/切换会话时，用该会话已有的提问预填历史——刚打开就能按 ↑ 调回。 */
+function seedInputHistory(items: TimelineItem[]) {
+  inputHistory.length = 0;
+  for (const it of items) {
+    if (it.type !== "user") continue;
+    const t = (it.text || "").trim();
+    if (t && inputHistory[inputHistory.length - 1] !== t) inputHistory.push(t);
+  }
+  if (inputHistory.length > INPUT_HISTORY_MAX) inputHistory.splice(0, inputHistory.length - INPUT_HISTORY_MAX);
+  resetInputHistory();
+}
+/** 程序化改写输入框：不触发 input 事件，所以要自己补 autoResize/草稿同步。 */
+function setComposerText(t: string) {
+  inputEl.value = t;
+  autoResize();
+  refreshComposerHint();
+  send({ type: "draft", text: t }); // 看门狗重建时不丢
+  inputEl.setSelectionRange(t.length, t.length); // 光标落末尾
+  inputEl.scrollTop = inputEl.scrollHeight;
+}
+/** dir=-1 更旧(↑)，dir=+1 更新(↓)。返回 true 表示这次按键被历史吃掉了。 */
+function recallHistory(dir: -1 | 1): boolean {
+  if (!inputHistory.length) return false;
+  if (historyIdx === -1) {
+    if (dir === 1) return false; // 没在浏览时按 ↓ 不管
+    historyDraft = inputEl.value; // 先存住没发出去的内容
+    historyIdx = inputHistory.length - 1;
+  } else {
+    const next = historyIdx + dir;
+    if (next < 0) return true; // 已到最旧，停住（别让光标乱跳）
+    if (next >= inputHistory.length) {
+      // 越过最新一条 → 把草稿还回来
+      historyIdx = -1;
+      const d = historyDraft;
+      historyDraft = "";
+      setComposerText(d);
+      return true;
+    }
+    historyIdx = next;
+  }
+  setComposerText(inputHistory[historyIdx]);
+  return true;
+}
+
 function clearComposer() {
+  pushInputHistory(inputEl.value);
   inputEl.value = "";
   send({ type: "draft", text: "" }); // 已发送/清空——宿主侧草稿同步作废
   autoResize();
@@ -2706,11 +2772,25 @@ inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
     e.preventDefault();
     doSend();
+    return;
+  }
+  // ↑/↓ 调回发过的消息。只在光标位于首行(↑)/末行(↓)且无选区时接管，否则多行
+  // 消息里的上下移动光标就没法用了；带修饰键或输入法组字中一律放行。
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey && !e.isComposing) {
+    if (inputEl.selectionStart !== inputEl.selectionEnd) return;
+    const pos = inputEl.selectionStart ?? 0;
+    const atEdge =
+      e.key === "ArrowUp"
+        ? !inputEl.value.slice(0, pos).includes("\n") // 首行
+        : !inputEl.value.slice(pos).includes("\n"); // 末行
+    if (!atEdge) return;
+    if (recallHistory(e.key === "ArrowUp" ? -1 : 1)) e.preventDefault();
   }
 });
 inputEl.addEventListener("input", () => {
   autoResize();
   refreshComposerHint();
+  resetInputHistory(); // 用户一动手就退出浏览态：下次 ↑ 从最新一条重新开始
 });
 
 /** While a turn is running, hint that typing + Enter queues the message; also

@@ -77,6 +77,7 @@ code --install-extension release/claude-chat.vsix --force
 | `Cmd/Ctrl+Shift+I` | 聚焦聊天输入框 |
 | `Cmd/Ctrl+Shift+L` | 把编辑器选中代码加入聊天上下文 |
 | `Cmd/Ctrl+F`（聊天面板内） | 搜索消息内容；`Enter` / `Shift+Enter` 前后跳，`Esc` 关闭 |
+| `↑` / `↓`（输入框内） | 调回发过的消息（shell 手感）；光标在首行/末行且无选区时才接管，不影响多行编辑 |
 | `Enter` / `Shift+Enter` | 发送 / 换行 |
 
 ### 斜杠命令

@@ -73,6 +73,17 @@ export class ClaudeProcess {
   private initialized = false;
   private sessionId?: string;
   private busy = false;
+  /** 已写给 CLI、还没收到对应 result 的用户轮次数。CLI 对每条 user 消息各回一个
+   *  result（停止期间写入的下一条会排队、随后照常处理），据此分辨一个 result
+   *  收的是哪一轮——否则"停止后立刻发新消息"时，被停那轮的 result 会被当成
+   *  新轮次的收尾：界面变回可发送，新回复流出来却没有停止按钮。 */
+  private inflight = 0;
+  /** 停止之后、被停那轮的 result 到来之前：丢掉它残留的流事件（管道里没刷完的
+   *  delta / 完整消息），别串进下一轮的气泡。 */
+  private draining = false;
+  /** 吞掉旧 result 后的兜底：CLI 若把排队的消息丢了（理论上不会），没有任何
+   *  动静超时就解锁界面，最坏退回旧行为而不是永远转圈。 */
+  private drainTimer?: ReturnType<typeof setTimeout>;
   private currentModel?: string;
   private currentToolId?: string;
   private currentToolName?: string;
@@ -292,6 +303,7 @@ export class ClaudeProcess {
     // 这中间返回 true 的话消息会被 AsyncQueue 静默吞掉，用户的消息凭空消失。
     if (this.disposed || this.exited || !this.initialized) return false;
     const body = context ? `${context}\n\n${text}` : text;
+    this.inflight++;
     this.setBusy(true);
     const content: Array<Record<string, unknown>> = [];
     for (const img of images ?? []) {
@@ -304,6 +316,7 @@ export class ClaudeProcess {
 
   compact(): void {
     if (this.exited || !this.initialized) return;
+    this.inflight++; // 压缩的收尾也是一个普通 result
     this.setBusy(true);
     this.pushUser([{ type: "text", text: "/compact" }]);
   }
@@ -404,6 +417,8 @@ export class ClaudeProcess {
 
   async interrupt(): Promise<void> {
     if (this.exited) return;
+    // 有轮次在跑：它的 result 还会来，在那之前的流事件都是残留。
+    if (this.inflight > 0) this.draining = true;
     // busy 先行复位让 Stop 永远跟手（不等控制请求往返）。
     this.setBusy(false);
     for (const requestId of [...this.pendingPermissions.keys()]) {
@@ -479,6 +494,13 @@ export class ClaudeProcess {
     // 排完（实测能再吐十几个 text_delta/thinking_delta），而此时 ctx 上多半
     // 已经挂了新进程——这些迟到事件会串进新轮次的气泡、打乱 token 计数。
     if (this.disposed) return;
+    // CLI 有任何动静就说明排队的消息没丢，撤掉兜底计时。
+    if (this.drainTimer) {
+      clearTimeout(this.drainTimer);
+      this.drainTimer = undefined;
+    }
+    // 停止后、旧轮 result 前的内容事件全是被停那轮的残留，丢掉。
+    if (this.draining && (m.type === "stream_event" || m.type === "assistant" || m.type === "user")) return;
     // 子 agent 内部事件不渲染（Task 的 tool_result 会汇总）。
     if ((m as any).parent_tool_use_id && (m.type === "stream_event" || m.type === "assistant" || m.type === "user")) return;
     switch (m.type) {
@@ -652,8 +674,27 @@ export class ClaudeProcess {
   private handleResult(ev: any): void {
     this.seenToolIds.clear();
     this.textAccumQueue = [];
+    this.draining = false;
+    this.inflight = Math.max(0, this.inflight - 1);
+    if (this.inflight > 0) {
+      // 这是被停掉那轮的收尾，而更新的消息已经写给 CLI 排队：不能当作新轮次
+      // 结束。保持 busy，等真正属于新轮次的 result。
+      this.hooks.emit({ kind: "diag", message: `[turn] 已停止轮次的 result 到达，仍有 ${this.inflight} 条消息在途，不作收尾` });
+      this.drainTimer = setTimeout(() => this.drainFallback(), 30_000);
+      this.drainTimer.unref?.();
+      return;
+    }
     this.setBusy(false);
     this.hooks.emit({ kind: "result", isError: ev.is_error, costUsd: ev.total_cost_usd, durationMs: ev.duration_ms, numTurns: ev.num_turns });
+  }
+
+  /** 吞掉旧 result 后 30s 内 CLI 毫无动静：排队的消息八成没了，解锁并提示重发。 */
+  private drainFallback(): void {
+    this.drainTimer = undefined;
+    if (this.exited || this.disposed || this.inflight === 0) return;
+    this.inflight = 0;
+    this.hooks.emit({ kind: "error", message: "停止后发出的消息似乎没有被处理，请重新发送。" });
+    this.setBusy(false);
   }
 
   private handleRateLimit(ev: any): void {

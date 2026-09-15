@@ -784,7 +784,18 @@ function stringifyToolResult(content: unknown): string {
   let s: string;
   if (typeof content === "string") s = content;
   else if (Array.isArray(content)) {
-    s = content.map((c) => (typeof c === "string" ? c : (c as { text?: string }).text ?? JSON.stringify(c))).join("\n");
+    s = content
+      .map((c) => {
+        if (typeof c === "string") return c;
+        const b = c as { type?: string; text?: string };
+        if (typeof b.text === "string") return b.text;
+        // 图片块没有 text，JSON.stringify 会把整段 base64 倒进工具卡片（Read 一张图、
+        // 截图类 MCP 工具都会走到），看着是乱码、复制出来就是一大串字符。历史回放那边
+        // 走 session.ts 的 imageDataUri 正常渲染成图，这里给个占位即可。
+        if (b.type === "image") return "[图片]";
+        return JSON.stringify(c);
+      })
+      .join("\n");
   } else if (content == null) s = "";
   else s = JSON.stringify(content, null, 2);
   if (s.length > MAX_TOOL_RESULT_CHARS) {

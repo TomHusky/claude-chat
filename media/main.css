@@ -1163,7 +1163,7 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 /* custom-answer row (numbered input) — dashed, so it reads as "type here"
    rather than as one more thing to pick */
 .askp-custom {
-  cursor: default; margin-top: 2px;
+  cursor: default; margin-top: 2px; align-items: flex-start;
   border: 1px dashed var(--vscode-panel-border, rgba(128,128,128,.4));
   background: rgba(128,128,128,.05);
 }
@@ -1171,6 +1171,7 @@ body.vscode-high-contrast .askq-card .tool-name { color: #c586c0; } /* 1b hue; 6
 .askp-input {
   flex: 1; min-width: 0; background: transparent; border: none; outline: none;
   color: var(--vscode-foreground); font-family: inherit; font-size: 12.5px; padding: 2px 0;
+  resize: none; line-height: 1.5; min-height: 20px; max-height: 132px; overflow-y: auto; display: block;
 }
 .askp-input::placeholder { color: var(--vscode-descriptionForeground); }
 .askp-foot {

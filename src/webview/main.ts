@@ -1740,6 +1740,7 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
           rows.forEach((r) => r.classList.remove("on"));
           row.classList.add("on");
           customInput.value = "";
+          growCustom();
           customRow.classList.remove("on");
           updateFoot();
           // Single-select: auto-advance after a brief beat so the ✓ is visible.
@@ -1752,13 +1753,23 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
 
     const customRow = el("div", "askp-opt askp-custom");
     customRow.append(el("span", "askp-n", String(opts.length + 1)));
-    const customInput = el("input", "askp-input") as HTMLInputElement;
-    customInput.type = "text";
-    customInput.placeholder = "输入自定义答案";
+    // 用 textarea 而不是 input：单行 input 粘贴多行文本会被浏览器把换行吃掉，
+    // 贴一段日志/代码进来就粘成一行。随内容增高，超出上限内部滚动。
+    const customInput = el("textarea", "askp-input") as HTMLTextAreaElement;
+    customInput.rows = 1;
+    customInput.placeholder = "输入自定义答案（⇧↵ 换行）";
     customInput.value = custom[cur];
+    const growCustom = () => {
+      // 没进文档时 scrollHeight 恒为 0，量出来会把输入框压成 0 高——首次 paint()
+      // 正是在 wrap 挂到消息区之前跑的，所以这里必须挡住。
+      if (!customInput.isConnected) return;
+      customInput.style.height = "auto";
+      customInput.style.height = Math.min(customInput.scrollHeight, 132) + "px";
+    };
     if (custom[cur].trim()) customRow.classList.add("on");
     customInput.oninput = () => {
       custom[cur] = customInput.value;
+      growCustom();
       if (!q.multiSelect && customInput.value.trim()) {
         sel[cur].clear();
         rows.forEach((r) => r.classList.remove("on"));
@@ -1767,9 +1778,11 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
       updateFoot();
     };
     customInput.onkeydown = (e) => {
-      // Never let Enter/Escape reach the chat composer behind this picker.
-      e.stopPropagation();
-      if (e.key !== "Enter" || e.isComposing || (e as KeyboardEvent).keyCode === 229) return;
+      // 只挡 Enter/Escape 别漏给后面的聊天输入框。绝不能对所有键 stopPropagation：
+      // VS Code webview 里 Cmd+V/C/X/A 不是浏览器原生动作，是 window 级监听器转给
+      // VS Code 再派发回来的——在这截断，快捷键就全哑了（之前粘不进就是这个原因）。
+      if (e.key === "Enter" || e.key === "Escape") e.stopPropagation();
+      if (e.key !== "Enter" || e.shiftKey || e.isComposing || (e as KeyboardEvent).keyCode === 229) return;
       e.preventDefault();
       if (!customInput.value.trim()) return; // empty answer: nothing to confirm
       // Enter = "I'm done with this question" → next page, or submit on the last.
@@ -1777,6 +1790,7 @@ function renderQuestion(m: Extract<ToWebview, { kind: "permission_request" }>) {
     };
     customRow.append(customInput);
     optsBox.append(customRow);
+    requestAnimationFrame(growCustom); // 首次 paint 时节点还没入文档，量高要等挂载
     updateFoot();
   }
 

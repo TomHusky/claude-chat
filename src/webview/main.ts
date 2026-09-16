@@ -1040,6 +1040,11 @@ window.addEventListener("message", (ev: MessageEvent<ToWebview>) => {
       onCheckpointMarker(m.checkpointId);
       break;
     case "config":
+      if (m.modEnterToSend !== undefined) {
+        modEnterToSend = m.modEnterToSend;
+        const keys = document.querySelector(".foot-keys");
+        if (keys) keys.innerHTML = modEnterToSend ? "<kbd>⌘/Ctrl ↵</kbd>发送<kbd>Enter</kbd>换行" : "<kbd>Enter</kbd>发送<kbd>⇧↵</kbd>换行";
+      }
       currentMode = m.permissionMode || "default";
       currentModel = m.model || "";
       currentEffort = m.effort || "";
@@ -2772,6 +2777,8 @@ stopBtn.onclick = () => {
 };
 /** True from Stop-click until the next turn starts: render nothing new. */
 let stoppingView = false;
+/** 设置 claudeChat.modEnterToSend：Cmd/Ctrl+Enter 发送、Enter 换行。宿主 config 下发。 */
+let modEnterToSend = false;
 // 草稿实时同步到宿主（节流 500ms）：webview 通道看门狗重建是整页重载，
 // 不存宿主侧的话用户打了一半的长消息会瞬间消失。
 let draftTimer = 0;
@@ -2783,10 +2790,14 @@ inputEl.addEventListener("input", () => {
 inputEl.addEventListener("keydown", (e) => {
   // Ignore Enter while an IME composition is active (e.g. confirming a pinyin
   // candidate) — `isComposing`/keyCode 229 means it's not a real "send".
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
-    e.preventDefault();
-    doSend();
-    return;
+  if (e.key === "Enter" && !e.isComposing && (e as KeyboardEvent).keyCode !== 229) {
+    // 默认 Enter 发送 / ⇧Enter 换行；开了 modEnterToSend 就反过来：Cmd/Ctrl+Enter 发送、Enter 换行。
+    const wantSend = modEnterToSend ? e.metaKey || e.ctrlKey : !e.shiftKey;
+    if (wantSend) {
+      e.preventDefault();
+      doSend();
+      return;
+    }
   }
   // ↑/↓ 调回发过的消息。只在光标位于首行(↑)/末行(↓)且无选区时接管，否则多行
   // 消息里的上下移动光标就没法用了；带修饰键或输入法组字中一律放行。

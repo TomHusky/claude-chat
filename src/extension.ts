@@ -87,6 +87,8 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.env.openExternal(vscode.Uri.file(LOG_DIR));
     }),
     vscode.commands.registerCommand("claude-chat.openInEditor", () => provider.openInEditor()),
+    // Cmd+Shift+T（仅聊天面板聚焦时接管）：重开最近关闭的会话标签页，对齐官方插件。
+    vscode.commands.registerCommand("claude-chat.reopenClosedSession", () => provider.reopenClosedSession()),
     // The icon on FILE editors' title bar: always start a FRESH conversation
     // (openInEditor would resurrect the last session).
     vscode.commands.registerCommand("claude-chat.open", () => provider.newSession()),

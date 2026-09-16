@@ -126,7 +126,8 @@ export type ToWebview =
   | { kind: "running"; sessionIds: string[] }
   // A restore point was created for the turn just sent (live).
   | { kind: "checkpoint_marker"; checkpointId: string; userText: string }
-  | { kind: "config"; permissionMode: string; model: string; effort: string; slsConfigured?: boolean }
+  /** modEnterToSend：Cmd/Ctrl+Enter 发送、Enter 换行（默认 Enter 发送）。 */
+  | { kind: "config"; permissionMode: string; model: string; effort: string; slsConfigured?: boolean; modEnterToSend?: boolean }
   | { kind: "context_added"; label: string; text: string }
   | { kind: "active_file"; path: string | null }
   | { kind: "attach_files"; paths: string[] }

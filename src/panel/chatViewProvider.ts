@@ -764,8 +764,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
    *  进程转后台保活并把 ctx 存进 detached，重开时秒级复用（上下文还在进程内存里，
    *  省掉 --resume 全量重读）。超过后台上限就按 LRU 回收空闲的。空白 tab / 进程已死
    *  没什么可复用的，直接清理。 */
+  /** 最近一次关闭的会话标签页（Cmd+Shift+T 重开）。 */
+  private lastClosedSessionId?: string;
+  reopenClosedSession(): void {
+    const id = this.lastClosedSessionId;
+    if (!id) return;
+    // 删除会话也会关面板、也会记进来——记录已不在就别去 resume 一个不存在的 transcript
+    if (!this.store.list().some((s) => s.id === id)) {
+      this.lastClosedSessionId = undefined;
+      return;
+    }
+    void this.openSession(id);
+  }
+
   private onPanelClosed(ctx: SessionCtx): void {
     this.sessions.delete(ctx);
+    if (ctx.sessionId) this.lastClosedSessionId = ctx.sessionId;
     if (this.activeCtx === ctx) this.activeCtx = undefined;
     if (ctx.proc && !ctx.proc.isExited && ctx.sessionId) {
       ctx.lastUsedAt = Date.now();
@@ -1362,6 +1376,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             model: this.config().get<string>("model", ""),
             effort: this.config().get<string>("effort", ""),
             slsConfigured: this.slsConfigured(),
+            modEnterToSend: this.config().get<boolean>("modEnterToSend", false),
           });
           this.loadCtxSession(ctx);
           this.postActiveFile();
@@ -1799,6 +1814,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       model: this.config().get<string>("model", ""),
       effort: this.config().get<string>("effort", ""),
       slsConfigured: this.slsConfigured(),
+      modEnterToSend: this.config().get<boolean>("modEnterToSend", false),
     };
     for (const c of this.sessions) this.post(c, cfg);
     // Apply to every running process, not just this tab's.
@@ -1892,6 +1908,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     ctx.checkpoints.accept(absPath); // stop tracking it (now matches baseline)
     this.origChanged.fire(vscode.Uri.from({ scheme: ORIG_SCHEME, path: absPath }));
+  }
+
+  /** Claude 读写文件前（PreToolUse hook，被 CLI await）把编辑器里同名的脏文档落盘：
+   *  否则它读到的是磁盘上的旧内容，改完又会被编辑器的脏副本盖回去。
+   *  Read/Edit/Write/NotebookEdit 按 file_path 精确匹配；Bash 只保存命令文本里提到
+   *  的文件（绝对或工作区相对路径）以及 bashWritePaths 抽出的写入目标——不是全部
+   *  脏文档，否则 `ls` 一下就把你打到一半的文件存了、format-on-save 跟着响。
+   *  整体 2s 封顶，保存再慢也不拦工具。 */
+  private async autosaveBefore(toolName: string, input: Record<string, unknown>): Promise<void> {
+    if (!this.config().get<boolean>("autosave", true)) return;
+    const cwd = this.cwd();
+    const want = new Set<string>();
+    if (toolName === "Bash") {
+      const cmd = typeof input.command === "string" ? input.command : "";
+      if (!cmd) return;
+      for (const p of bashWritePaths(cmd, cwd)) want.add(p);
+      for (const doc of vscode.workspace.textDocuments) {
+        if (!doc.isDirty || doc.isUntitled) continue;
+        const fp = doc.uri.fsPath;
+        const rel = path.relative(cwd, fp);
+        if (cmd.includes(fp) || (rel && !rel.startsWith("..") && cmd.includes(rel))) want.add(fp);
+      }
+    } else {
+      for (const p of [input.file_path, input.notebook_path]) if (typeof p === "string" && path.isAbsolute(p)) want.add(p);
+    }
+    if (!want.size) return;
+    const saves = vscode.workspace.textDocuments
+      .filter((d) => d.isDirty && !d.isUntitled && want.has(d.uri.fsPath))
+      .map((d) => d.save().then(() => undefined, () => undefined));
+    if (!saves.length) return;
+    await Promise.race([Promise.all(saves), new Promise<void>((r) => setTimeout(r, 2000))]);
   }
 
   private refreshChangedFiles(ctx: SessionCtx): void {
@@ -2253,6 +2300,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       },
       {
         emit: (e) => this.handleEmit(ctx, e),
+        onPreTool: (name, input) => this.autosaveBefore(name, input),
         onPermission: (req) => this.onPermission(ctx, req),
         onSessionId: (id, resumed) => this.onSessionId(ctx, id, resumed),
         onClose: (code) => this.onProcessClose(ctx, code, proc),
@@ -4183,18 +4231,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       // `rate_limit_event` carries the exact five-hour reset timestamp.
       let resultText = "";
       let sessionResetAt: number | undefined;
+      let report: UsageReportLike | undefined;
       for (const line of raw.split("\n")) {
         const t = line.trim();
         if (!t) continue;
         let o: any;
         try { o = JSON.parse(t); } catch { continue; }
         if (o.type === "result" && typeof o.result === "string") resultText = o.result;
+        // SDK 0.3.27x：/usage 结果的那条合成 assistant 消息上带结构化 usage_report
+        // （服务端原样给的行：kind/percent/resets_at/scope），不用再刮英文文案。
+        if (o.type === "assistant" && o.usage_report) report = o.usage_report;
         if (o.type === "rate_limit_event") {
           const info = o.rate_limit_info || {};
           if (info.rateLimitType === "five_hour" && typeof info.resetsAt === "number") sessionResetAt = info.resetsAt;
         }
       }
-      const parsed = parseUsage(resultText);
+      const fromReport = usageFromReport(report);
+      const parsed = fromReport ?? parseUsage(resultText);
+      if (fromReport?.sessionResetAt) sessionResetAt = fromReport.sessionResetAt;
       if (parsed) {
         this.usageFails = 0;
         // Remember it so newly-opened tabs can show it immediately, and push it
@@ -5251,6 +5305,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/** SDK 0.3.27x 的 usage_report 里我们用到的部分（类型未导出，本地照抄最小形状）。 */
+interface UsageReportLike {
+  rate_limits?: {
+    limits?: { kind: string; percent: number; resets_at: string | null; scope?: { model?: { display_name: string } } }[] | null;
+  } | null;
+}
+
+/** 把服务端结构化用量映射成现有 usage 事件的字段。reset 文案生成成 CLI 那种
+ *  "Sep 16 at 3:50pm"，webview 里 parseResetParts 原样能吃，界面零改动。 */
+function usageFromReport(r?: UsageReportLike): (ReturnType<typeof parseUsage> & { sessionResetAt?: number }) | undefined {
+  const rows = r?.rate_limits?.limits;
+  if (!rows?.length) return undefined;
+  const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const prose = (iso: string | null): string | undefined => {
+    if (!iso) return undefined;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return undefined;
+    const h = d.getHours();
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${MON[d.getMonth()]} ${d.getDate()} at ${h12}:${String(d.getMinutes()).padStart(2, "0")}${h < 12 ? "am" : "pm"}`;
+  };
+  const out: ReturnType<typeof usageFromReport> = {};
+  for (const row of rows) {
+    const pct = Math.round(row.percent);
+    if (row.kind === "session") {
+      out.sessionPct = pct;
+      out.sessionReset = prose(row.resets_at);
+      const t = row.resets_at ? Date.parse(row.resets_at) : NaN;
+      if (!isNaN(t)) out.sessionResetAt = t;
+    } else if (row.kind === "weekly_all") {
+      out.weekPct = pct;
+      out.weekReset = prose(row.resets_at);
+    } else if (row.kind === "weekly_scoped" && out.weekModelPct === undefined) {
+      out.weekModelPct = pct;
+      out.weekModelName = row.scope?.model?.display_name;
+    }
+  }
+  return out.sessionPct === undefined && out.weekPct === undefined && out.weekModelPct === undefined ? undefined : out;
 }
 
 /** Parse the CLI `/usage` text into the current-session + weekly quota

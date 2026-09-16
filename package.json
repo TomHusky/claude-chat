@@ -2,7 +2,7 @@
   "name": "claude-chat",
   "displayName": "ClaudeCopilot",
   "description": "Copilot-style chat panel powered by your local Claude Code CLI",
-  "version": "0.1.382",
+  "version": "0.1.384",
   "publisher": "local",
   "icon": "media/icon.png",
   "license": "MIT",
@@ -106,6 +106,10 @@
       {
         "command": "claude-chat.openLogs",
         "title": "Claude: 打开日志文件夹"
+      },
+      {
+        "command": "claude-chat.reopenClosedSession",
+        "title": "Claude: 重新打开刚关闭的会话"
       }
     ],
     "menus": {
@@ -167,6 +171,12 @@
         "key": "ctrl+shift+l",
         "mac": "cmd+shift+l",
         "when": "editorHasSelection"
+      },
+      {
+        "command": "claude-chat.reopenClosedSession",
+        "key": "ctrl+shift+t",
+        "mac": "cmd+shift+t",
+        "when": "activeWebviewPanelId == 'claude-chat.editor' || focusedView == 'claude-chat.chatView'"
       }
     ],
     "configuration": {
@@ -218,6 +228,16 @@
           "type": "boolean",
           "default": true,
           "description": "Before each file edit, snapshot the file so restore points can revert workspace changes."
+        },
+        "claudeChat.autosave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Claude 读写文件前（工具执行前的 hook，会等保存完成），自动保存编辑器里同名的未保存文档；Bash 命令只保存命令文本里提到的文件和它要写入的目标。不开的话 Claude 读到的是磁盘上的旧内容，改完还会被编辑器里的脏副本盖回去。"
+        },
+        "claudeChat.modEnterToSend": {
+          "type": "boolean",
+          "default": false,
+          "description": "用 Cmd/Ctrl+Enter 发送、Enter 换行（默认 Enter 发送、Shift+Enter 换行）。切换后新打开的会话生效。"
         },
         "claudeChat.prewarmCache": {
           "type": "boolean",
@@ -285,7 +305,7 @@
     "package": "vsce package --no-dependencies"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.258",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.273",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.90.0",

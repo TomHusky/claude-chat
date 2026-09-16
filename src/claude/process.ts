@@ -48,6 +48,9 @@ export interface ClaudeProcessHooks {
   onSessionId: (id: string, resumed: boolean) => void;
   /** Process exited. */
   onClose: (code: number | null) => void;
+  /** 工具执行前（SDK PreToolUse hook，被 await）：宿主用来把编辑器里的脏文档落盘。
+   *  可选；抛错/超时都不拦工具。 */
+  onPreTool?: (toolName: string, input: Record<string, unknown>) => Promise<void>;
 }
 
 /**
@@ -153,6 +156,28 @@ export class ClaudeProcess {
       pathToClaudeCodeExecutable: this.resolveCli(),
       cwd: this.opts.cwd,
       includePartialMessages: true,
+      // 工具执行前的同步点。tool_input 事件是 assistant 消息到达时发的、不阻塞，
+      // 在那里做自动保存有竞态（保存落盘可能晚于 Claude 的读写、把它的改动盖掉）；
+      // hook 是 CLI 真正等的。不论权限模式（acceptEdits/auto/bypass）都会触发。
+      hooks: this.hooks.onPreTool
+        ? {
+            PreToolUse: [
+              {
+                hooks: [
+                  async (input) => {
+                    try {
+                      const i = input as { tool_name?: string; tool_input?: unknown };
+                      await this.hooks.onPreTool!(String(i.tool_name ?? ""), (i.tool_input ?? {}) as Record<string, unknown>);
+                    } catch {
+                      /* 自动保存失败不能拦工具 */
+                    }
+                    return { continue: true };
+                  },
+                ],
+              },
+            ],
+          }
+        : undefined,
       permissionMode: (this.opts.permissionMode || "default") as Options["permissionMode"],
       model: this.opts.model || undefined,
       effort: (this.opts.effort || undefined) as Options["effort"],
@@ -556,6 +581,14 @@ export class ClaudeProcess {
       const md = ev.compact_metadata ?? {};
       this.hooks.emit({ kind: "compacted", trigger: md.trigger ?? "manual", preTokens: md.pre_tokens ?? 0, postTokens: md.post_tokens ?? 0 });
     } else if (ev.subtype === "api_retry") {
+      // 用户可见：以前只记 diag，界面上就是干转圈。no_response = API 在首字节窗口内
+      // 连响应头都没给（SDK 0.3.27x 新增字段），这正是"发出去半天没动静"的真身。
+      const secs = (ms: unknown) => Math.round(Number(ms ?? 0) / 1000);
+      const attempt = ev.attempt ?? ev.retry_count;
+      const label = ev.no_response
+        ? `API 无响应，正在重试（已等 ${secs(ev.no_response.waited_ms)}s，再等 ${secs(ev.no_response.retry_wait_ms)}s）`
+        : `API 请求失败（${ev.error ?? ev.error_status ?? "未知"}），${secs(ev.retry_delay_ms ?? ev.delay_ms)}s 后第 ${attempt}/${ev.max_retries ?? "?"} 次重试`;
+      this.hooks.emit({ kind: "status", label });
       this.hooks.emit({
         kind: "diag",
         // 字段名以 sdk.d.ts 的 SDKAPIRetryMessage 为准（retry_delay_ms / error_status）。

@@ -78,7 +78,8 @@ code --install-extension release/claude-chat.vsix --force
 | `Cmd/Ctrl+Shift+L` | 把编辑器选中代码加入聊天上下文 |
 | `Cmd/Ctrl+F`（聊天面板内） | 搜索消息内容；`Enter` / `Shift+Enter` 前后跳，`Esc` 关闭 |
 | `↑` / `↓`（输入框内） | 调回发过的消息（shell 手感）；光标在首行/末行且无选区时才接管，不影响多行编辑 |
-| `Enter` / `Shift+Enter` | 发送 / 换行 |
+| `Enter` / `Shift+Enter` | 发送 / 换行（开了 `modEnterToSend` 则 `Cmd/Ctrl+Enter` 发送、`Enter` 换行） |
+| `Cmd/Ctrl+Shift+T`（聊天面板聚焦时） | 重新打开刚关闭的会话标签页 |
 
 ### 斜杠命令
 
@@ -101,7 +102,7 @@ code --install-extension release/claude-chat.vsix --force
 
 ### 命令面板
 
-`Claude: 打开新会话` · `Claude: 在编辑器右侧打开` · `Claude: 检查更新` · `Claude: SLS 日志配置` · `Claude: QQ 机器人配置` · `Claude: 任务推送配置` · `Claude: 打开日志文件夹`
+`Claude: 打开新会话` · `Claude: 在编辑器右侧打开` · `Claude: 检查更新` · `Claude: SLS 日志配置` · `Claude: QQ 机器人配置` · `Claude: 任务推送配置` · `Claude: 打开日志文件夹` · `Claude: 重新打开刚关闭的会话`
 
 ## 配置项
 
@@ -115,6 +116,8 @@ code --install-extension release/claude-chat.vsix --force
 | `claudeChat.effort` | 推理强度 `low` / `medium` / `high` / `xhigh` / `max` | `""` |
 | `claudeChat.appendSystemPrompt` | 追加到系统提示的全局指令（如强制中文回复） | `""` |
 | `claudeChat.snapshotFilesForRestore` | 文件被修改前先快照，供还原点回滚 | `true` |
+| `claudeChat.autosave` | Claude 读写文件前（工具执行前的 hook，等保存完成）自动保存编辑器里同名的未保存文档；Bash 只保存命令里提到的文件和写入目标。避免读到旧内容、改动被脏副本盖回 | `true` |
+| `claudeChat.modEnterToSend` | `Cmd/Ctrl+Enter` 发送、`Enter` 换行（默认 `Enter` 发送、`Shift+Enter` 换行）；新打开的会话生效 | `false` |
 | `claudeChat.prespawnOnOpen` | 打开会话即后台启动进程 | `true` |
 | `claudeChat.prewarmCache` | 大会话打开时预热 prompt cache（耗 token） | `true` |
 | `claudeChat.prewarmMaxSizeMB` | 超过此大小不再预热，改为建议压缩；`0` 表示不限制 | `12` |

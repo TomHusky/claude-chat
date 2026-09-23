@@ -27,6 +27,15 @@ function stripHeredocs(cmd: string): string {
   return out.join("\n");
 }
 
+/** 权限模式的中文名，和侧栏选择器里的标题保持一致（报错里要说人话）。 */
+const MODE_NAMES: Record<string, string> = {
+  default: "发送前确认",
+  acceptEdits: "自动编辑",
+  plan: "规划模式",
+  auto: "Auto 模式",
+  bypassPermissions: "绕过权限",
+};
+
 /** 从 Bash 命令里启发式抽出会被写入/删除的文件路径。auto 模式下 CLI 会让模型用
  *  sed/heredoc/重定向改文件而不走 Edit/Write，这些文件此前既进不了「已更改文件」
  *  也回滚不了。覆盖：> >> 重定向、tee、sed -i、cp/mv 目标、rm/touch/truncate；
@@ -1805,25 +1814,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     // Two quick picks race: each awaits a CLI round-trip, and the slower one's
     // broadcast used to land last and show the losing mode everywhere.
     const seq = ++this.modeSeq;
+    const prev = this.config().get<string>("permissionMode", "default");
     await this.updateConfig("permissionMode", mode);
     if (seq !== this.modeSeq) return; // superseded — the later pick owns the UI
     // Keep every open picker in sync BEFORE the (possibly slow) round-trips.
-    const cfg: ToWebview = {
-      kind: "config",
-      permissionMode: mode,
-      model: this.config().get<string>("model", ""),
-      effort: this.config().get<string>("effort", ""),
-      slsConfigured: this.slsConfigured(),
-      modEnterToSend: this.config().get<boolean>("modEnterToSend", false),
+    const broadcast = (m: string): void => {
+      const cfg: ToWebview = {
+        kind: "config",
+        permissionMode: m,
+        model: this.config().get<string>("model", ""),
+        effort: this.config().get<string>("effort", ""),
+        slsConfigured: this.slsConfigured(),
+        modEnterToSend: this.config().get<boolean>("modEnterToSend", false),
+      };
+      for (const c of this.sessions) this.post(c, cfg);
     };
-    for (const c of this.sessions) this.post(c, cfg);
+    broadcast(mode);
     // Apply to every running process, not just this tab's.
     const results = await Promise.allSettled(this.allProcs().map((p) => p.setPermissionMode(mode)));
     if (seq !== this.modeSeq) return;
-    const failed = results.filter((r) => r.status === "rejected").length;
-    if (failed) {
-      this.post(_ctx, { kind: "error", message: `有 ${failed} 个会话未能切换到该模式，请重试或新建会话。` });
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (!rejected.length) return;
+    // CLI 拒绝的原因必须原样透出：auto 模式有模型黑名单（claude-3-*、opus-4-0/4-1/4-5、
+    // sonnet-4-0/4-5、haiku-4-5，非直连时还包括全部 haiku 与 opus/sonnet-4-6），
+    // 对这些模型切 auto 永远失败——原来的「请重试或新建会话」会让人白试一万次。
+    const raw = String((rejected[0].reason as Error)?.message ?? rejected[0].reason ?? "").trim();
+    const why = /unavailable for this model|does not support auto mode/i.test(raw)
+      ? `当前模型不支持 ${MODE_NAMES[mode] ?? mode}，换 Sonnet 或 Opus 再试`
+      : raw || "CLI 拒绝了这次切换";
+    // 全都失败 = 这个模式根本用不了：界面和设置不能停在一个没生效的模式上。
+    if (rejected.length === results.length) {
+      await this.updateConfig("permissionMode", prev);
+      if (seq !== this.modeSeq) return;
+      broadcast(prev);
+      this.post(_ctx, { kind: "error", message: `无法切换到「${MODE_NAMES[mode] ?? mode}」：${why}。已切回「${MODE_NAMES[prev] ?? prev}」。` });
+      return;
     }
+    this.post(_ctx, { kind: "error", message: `有 ${rejected.length} 个会话未能切换到「${MODE_NAMES[mode] ?? mode}」：${why}。` });
   }
 
   private async setModel(ctx: SessionCtx, model: string): Promise<void> {

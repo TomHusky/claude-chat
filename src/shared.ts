@@ -184,13 +184,14 @@ export interface CheckpointSummary {
 }
 
 /** Context window (tokens) for a given Claude model, used by the usage gauge.
- *  The CLI doesn't report the window, so map by model id; the 4.x family runs an
- *  extended 1M context in Claude Code. `used` is a safety floor: if the observed
- *  prompt already exceeds the mapped window, lift to 1M so we never show >100%. */
+ *  The CLI doesn't report the window, so map by model id; the 4.x / 5.x families
+ *  (Opus 5.5 / 5 / 4.x、Sonnet 5 / 4.x、Fable) run an extended 1M context in Claude
+ *  Code. `used` is a safety floor: if the observed prompt already exceeds the
+ *  mapped window, lift to 1M so we never show >100%. */
 export function contextWindowFor(model?: string, used = 0): number {
   const m = (model || "").toLowerCase();
   let win = 200_000;
-  if (/(opus|sonnet|haiku)-4|claude-4|fable/.test(m)) win = 1_000_000;
+  if (/(opus|sonnet)-[45]|claude-[45]|fable/.test(m)) win = 1_000_000; // Haiku 4.5 仍是 200K
   if (used > win) win = 1_000_000;
   return win;
 }

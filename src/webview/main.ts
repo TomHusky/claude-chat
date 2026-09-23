@@ -3204,9 +3204,10 @@ const MODELS: { id: string; label: string; short: string; desc: string; versions
     versions: [{ id: "fable", label: "Fable 5.1", date: "" }, { id: "claude-fable-5", label: "Fable 5", date: "2026-06" }],
   },
   {
-    id: "opus", label: "Claude Opus 5", short: "Opus", desc: "复杂编码 · 企业级任务",
+    id: "opus", label: "Claude Opus 5.5", short: "Opus", desc: "长程编码 · 企业级任务",
     versions: [
-      { id: "opus", label: "Opus 5", date: "" },
+      { id: "opus", label: "Opus 5.5", date: "" },
+      { id: "claude-opus-5", label: "Opus 5", date: "2026-07" },
       { id: "claude-opus-4-8", label: "Opus 4.8", date: "2026-05" },
       { id: "claude-opus-4-7", label: "Opus 4.7", date: "2026-04" },
       { id: "claude-opus-4-6", label: "Opus 4.6", date: "2026-02" },

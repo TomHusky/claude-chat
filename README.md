@@ -96,7 +96,7 @@ code --install-extension release/claude-chat.vsix --force
 
 ### 模型与模式
 
-- **模型**：输入框下方选择器可选 Fable 5.1 / Opus 5 / Sonnet 5 / Haiku 4.5，家族行用 CLI 别名跟随最新；Fable / Opus / Sonnet 行右侧「›」弹出历史版本子菜单（如 Opus 4.8 / 4.7 / 4.6 / 4.5），热切换不重启进程
+- **模型**：输入框下方选择器可选 Fable 5.1 / Opus 5.5 / Sonnet 5 / Haiku 4.5，家族行用 CLI 别名跟随最新；Fable / Opus / Sonnet 行右侧「›」弹出历史版本子菜单（如 Opus 5 / 4.8 / 4.7 / 4.6 / 4.5），热切换不重启进程
 - **思考强度**：`low` / `medium` / `high` / `xhigh` / `max`
 - **权限模式**：`default`（逐个确认）/ `acceptEdits`（自动应用文件编辑）/ `plan`（先规划）/ `auto`（CLI 自动判定）/ `bypassPermissions`（全部放行，危险）
 
